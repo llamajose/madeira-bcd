@@ -2556,7 +2556,20 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
      * code buffers (the tail) are refused against. Waiting out the remaining
      * grace (<= 3 s, once, at process start) keeps the grace guarantee intact and
      * gives that space back to the code cache. */
-    if (alloc_size >= 32u * 1024 * 1024)
+    /* madeira-bcd: wait the same way for ANY request the bump cannot serve.
+     * GTA build 364 (2026-10-03 21:00): RockstarService.exe exited, RECLAIM put
+     * 25 MB on the freelist (freelist=20), and for the next 1.4 s every load in
+     * the launcher (uxtheme, gameoverlayrenderer64, socialclub, netprofm,
+     * rpcss.exe, d2d1) failed EXHAUSTED inside the 3 s grace -- the launcher
+     * died at d2d1. pool_limit 0 (the tail's freelist-only take) keeps the old
+     * rule. */
+    int bump_short = 0;
+    if (pool_limit)
+    {
+        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end );
+        bump_short = cand + alloc_size > pool_limit;
+    }
+    if (alloc_size >= 32u * 1024 * 1024 || bump_short)
     {
         int waited = 0;
         for (;;)
@@ -2575,7 +2588,15 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
             waited++;
             pthread_mutex_lock( &ios_pool_lock );
         }
-        if (waited)
+        if (waited && bump_short)
+        {
+            static int pool_wait_n;
+            if (pool_wait_n++ < 32)
+                dprintf(2, "[pool-wait] bump short: waited %d00 ms for a freed range's grace to expire rather than "
+                        "fail 0x%lx bytes (bump=0x%lx limit=0x%lx freelist=%d)\n", waited, (unsigned long)alloc_size,
+                        (unsigned long)jit_pool_offset, (unsigned long)pool_limit, ios_pool_free_count);
+        }
+        else if (waited)
             dprintf(2, "[jit-pool] ml1052 waited %d00 ms for a freed range's grace to expire rather than bump 0x%lx bytes of head\n",
                     waited, (unsigned long)alloc_size);
         now = time( NULL );
@@ -5976,9 +5997,32 @@ NTSTATUS unixcall_ios_get_fex_arena( void *args )
  * rather than by a list of call sites someone has to remember to update. */
 static int fex_arena_covers( const void *limit_low, const void *limit_high )
 {
+    ULONG_PTR lo = (ULONG_PTR)limit_low, hi = (ULONG_PTR)limit_high;
+    static int wow_band = -1, logged;
+
     if (!ios_fex_arena_base_unix || !ios_fex_arena_end_unix) return 0;
-    return (ULONG_PTR)limit_low  >= ios_fex_arena_base_unix &&
-           (ULONG_PTR)limit_high <= ios_fex_arena_end_unix;
+    if (lo >= ios_fex_arena_base_unix && hi <= ios_fex_arena_end_unix) return 1;
+    /* madeira-bcd [wow-band]: the WOW64 CPU module (xtajit.dll) is never handed
+     * the arena (its ios_get_fex_arena unix call is unsupported), so its rpmalloc
+     * band selector asks for the whole hardware FEX band [0x7c00000000,
+     * 0x7fffffffff]. With env.MADEIRA_SC_PA_POOLS = 1/2 the arena starts at
+     * 0x7d00000000, so that request is not contained, [0x7c..,0x7d..) is Social
+     * Club's held cage and 32-63 GB is refused by the kernel: no band, rpmalloc
+     * returns NULL, SEGV at 0x7f0 before any x86 code runs (32-bit vc_redist
+     * started by the Rockstar Games Launcher installer). Serve exactly that
+     * request from the arena; the caller clamps placement to the area, so it
+     * stays inside. MADEIRA_WOW_FEX_BAND=0 turns this off. */
+    if (wow_band < 0) { const char *e = getenv( "MADEIRA_WOW_FEX_BAND" ); wow_band = !(e && e[0] == '0'); }
+    if (wow_band && lo == 0x7c00000000ULL && lo < ios_fex_arena_base_unix &&
+        hi + 1 >= ios_fex_arena_end_unix && hi <= ios_fex_arena_end_unix)
+    {
+        if (logged++ < 4)
+            dprintf( 2, "[wow-band] FEX hardware-band request [%p,%p] served from the FEX arena "
+                        "[0x%lx,0x%lx) (MADEIRA_WOW_FEX_BAND=0 reverts)\n", limit_low, limit_high,
+                     (unsigned long)ios_fex_arena_base_unix, (unsigned long)ios_fex_arena_end_unix );
+        return 1;
+    }
+    return 0;
 }
 
 struct builtin_module
@@ -12468,6 +12512,30 @@ static int ios_resource_only_map( int refused, const void *arbitrary_user_pointe
     return refused == 2 && !arbitrary_user_pointer;
 }
 
+/* madeira-bcd: ANY image view the loader is not mapping and that asks for no
+ * execute access gets no pool copy either -- kernelbase maps
+ * LOAD_LIBRARY_AS_IMAGE_RESOURCE with FILE_MAP_READ (PAGE_READONLY). GTA build
+ * 364 (2026-10-03 21:00): PlayGTAV.exe copied Launcher.exe (32 MB) twice for two
+ * version queries and kept both copies until it exited; the pool ran out 1.4 s
+ * later. Set by virtual_map_section around the map, cleared by
+ * map_image_into_view for an image with a CLR header (CoreCLR maps its R2R
+ * assemblies this way and runs code from them); mprotect_exec then refuses the
+ * copy with 2, so ios_resource_only_map maps the view without exec. A later
+ * NtProtectVirtualMemory(PAGE_EXECUTE*) on the view still copies (the flag is
+ * clear by then). env.MADEIRA_RESOURCE_MAP_COPY = 1 copies as before. */
+static _Thread_local int ios_map_resource_view;
+
+static int ios_resource_map_nocopy(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_RESOURCE_MAP_COPY" );
+        on = !(e && e[0] == '1' && !e[1]);
+    }
+    return on;
+}
+
 /* Social Club's PartitionAlloc pools (env.MADEIRA_SC_PA_POOLS = 1, opt-in).
  *
  * Its chrome_elf.dll reserves PartitionAlloc's core pools GLUED: one 32 GB
@@ -14200,6 +14268,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             cur_teb ? (void *)cur_teb->Peb : NULL);
                 }
                 return 0;
+            }
+
+            /* madeira-bcd: a resource-only view (ios_map_resource_view) never
+             * runs code: no pool copy, refused like a Social Club image below. */
+            if (ios_map_resource_view)
+            {
+                static int resource_view_n;
+                if (resource_view_n++ < 16)
+                    dprintf(2, "[resource-map] %s %p+0x%lx mapped without a pool copy (no loader name, no "
+                            "execute access: a version / resource query; env.MADEIRA_RESOURCE_MAP_COPY=1 copies)\n",
+                            ios_pe_module_name( image_base, image_size ), image_base, (unsigned long)image_size);
+                ios_jit_copy_refused = 2;
+                mprotect( base, size, PROT_READ );
+                errno = ENOMEM;
+                return -1;
             }
 
             /* madeira-bcd: a Social Club client's libcef.dll and DLSS runtimes
@@ -18570,6 +18653,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 #ifdef WINE_IOS
     int ios_noexec_resource = 0;
     ios_jit_copy_refused = 0;
+    /* madeira-bcd: a .NET image keeps its pool copy (see ios_map_resource_view). */
+    if (ios_map_resource_view && get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR ))
+        ios_map_resource_view = 0;
 #endif
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
@@ -19122,8 +19208,19 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
         res = load_builtin( image_info, &nt_name, &exp_name, machine, &info,
                             addr_ptr, size_ptr, limit_low, limit_high, offset.QuadPart );
         if (res == STATUS_IMAGE_ALREADY_LOADED)
+        {
+#ifdef WINE_IOS
+            /* madeira-bcd: no loader name and no execute access = a resource-only
+             * view; it gets no pool copy (ios_map_resource_view). */
+            ios_map_resource_view = !(access & SECTION_MAP_EXECUTE) &&
+                                    !NtCurrentTeb()->Tib.ArbitraryUserPointer && ios_resource_map_nocopy();
+#endif
             res = virtual_map_image( handle, addr_ptr, size_ptr, shared_file, limit_low, limit_high,
                                      alloc_type, machine, image_info, &nt_name, FALSE, offset.QuadPart );
+#ifdef WINE_IOS
+            ios_map_resource_view = 0;
+#endif
+        }
         if (shared_file) NtClose( shared_file );
         free( image_info );
         if (NtCurrentTeb64()) NtCurrentTeb64()->Tib.ArbitraryUserPointer = prev;
@@ -20130,6 +20227,24 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
             ULONG_PTR zbits = user_space_wow_limit;
 
 #ifdef WINE_IOS
+            /* user_space_wow_limit is a SESSION global and outlives the last
+             * 32-bit process (it is cleared only at window teardown, which
+             * waits for the next 32-bit start).  For a process WITHOUT a guest
+             * window nothing translates it into a window, so the session TEB
+             * block was searched for in host [0, 4 GB) -- __PAGEZERO on iOS --
+             * and every new 64-bit thread failed with STATUS_NO_MEMORY once the
+             * 32-TEB session block was used up (2026-10-03 16:07 device log:
+             * services.exe RPC worker could not be created, SCM call hung).
+             * Same rule as ios_section_zero_bits(). */
+            if (!wow && zbits)
+            {
+                static int said;
+
+                if (said++ < 4)
+                    dprintf( 2, "[teb-block] session TEB block for a process without a guest "
+                                "window: dropping foreign WoW ceiling %p\n", (void *)zbits );
+                zbits = 0;
+            }
             /* Once published, user_space_wow_limit already IS the right ceiling
              * (2 GB or 4 GB by the main image's LAA bit).  Only a thread created
              * before init_peb publishes it lands here, and then the answer is
@@ -27392,6 +27507,69 @@ void virtual_fill_image_information( const struct pe_image_info *pe_info, SECTIO
 #endif
 }
 
+/* madeira-bcd [ucrt-shadow]: an x64 program's folder can carry Microsoft's
+ * app-local UCRT (ucrtbase.dll). Wine turns api-ms-win-crt-* imports into the
+ * bare name "ucrtbase.dll" and searches the program's folder first; upstream
+ * Wine then swaps in the builtin in load_builtin(), but the iOS load_builtin()
+ * keeps the file it found. The first importer is the emulator itself
+ * (load_arm64ec_module), so that x64 DllMain runs while
+ * __os_arm64x_check_icall is still the early stub that treats every target as
+ * native: a native branch into x64 bytes, c000001d (RockstarService.exe of the
+ * Rockstar Games Launcher). Windows 10+ never uses an app-local UCRT either.
+ * Report such an image as built for another machine, so open_dll_file ->
+ * is_valid_binary rejects it and the search goes on to system32 / the sysx64
+ * mixed-arch fallback. MADEIRA_APP_UCRT=1 turns this off. */
+static BOOL ios_ucrt_shadow_refused( HANDLE handle, const struct pe_image_info *pi )
+{
+    extern int ios_is_arm64ec_cur(void);
+    static const char ucrt[] = "ucrtbase.dll";
+    static int opt = -1, logged;
+    struct pe_image_info *info = NULL;
+    unsigned int sec_flags;
+    mem_size_t full_size;
+    HANDLE shared_file = 0;
+    UNICODE_STRING nt_name;
+    ANSI_STRING exp_name;
+    const WCHAR *name;
+    USHORT len, i;
+    BOOL ret = FALSE;
+
+    if (pi->machine != IMAGE_FILE_MACHINE_AMD64 || pi->is_hybrid || pi->wine_builtin) return FALSE;
+    if (!ios_is_arm64ec_cur()) return FALSE;
+    if (opt < 0) { const char *e = getenv( "MADEIRA_APP_UCRT" ); opt = (e && e[0] == '1'); }
+    if (opt) return FALSE;
+    memset( &nt_name, 0, sizeof(nt_name) );
+    if (get_mapping_info( handle, SECTION_QUERY, &sec_flags, &full_size, &shared_file,
+                          &info, &nt_name, &exp_name )) return FALSE;
+    if (shared_file) NtClose( shared_file );
+    if (!info) return FALSE;
+    len = nt_name.Length / sizeof(WCHAR);
+    name = nt_name.Buffer;
+    for (i = 0; i < len; i++)
+        if (nt_name.Buffer[i] == '\\' || nt_name.Buffer[i] == '/') name = nt_name.Buffer + i + 1;
+    if (name) len -= name - nt_name.Buffer;
+    if (name && len == sizeof(ucrt) - 1)
+    {
+        for (i = 0; i < len; i++)
+        {
+            WCHAR c = name[i];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)ucrt[i]) break;
+        }
+        if (i == len)
+        {
+            ret = TRUE;
+            if (logged++ < 8)
+                dprintf( 2, "[ucrt-shadow] %s: plain x64 ucrtbase.dll outside the system farm in an "
+                            "x64 (ARM64EC) process -- reported as not loadable so the loader keeps "
+                            "searching and binds the system UCRT, as Windows 10+ does "
+                            "(MADEIRA_APP_UCRT=1 reverts)\n", debugstr_us(&nt_name) );
+        }
+    }
+    free( info );
+    return ret;
+}
+
 /******************************************************************************
  *             NtQuerySection   (NTDLL.@)
  *             ZwQuerySection   (NTDLL.@)
@@ -27401,6 +27579,7 @@ NTSTATUS WINAPI NtQuerySection( HANDLE handle, SECTION_INFORMATION_CLASS class, 
 {
     unsigned int status;
     struct pe_image_info image_info;
+    BOOL is_image = FALSE;
 
     switch (class)
     {
@@ -27436,11 +27615,16 @@ NTSTATUS WINAPI NtQuerySection( HANDLE handle, SECTION_INFORMATION_CLASS class, 
                 SECTION_IMAGE_INFORMATION *info = ptr;
                 virtual_fill_image_information( &image_info, info );
                 if (ret_size) *ret_size = sizeof(*info);
+                is_image = TRUE;
             }
             else status = STATUS_SECTION_NOT_IMAGE;
         }
     }
     SERVER_END_REQ;
+
+    /* outside the request block: the helper makes its own server call */
+    if (!status && is_image && ios_ucrt_shadow_refused( handle, &image_info ))
+        ((SECTION_IMAGE_INFORMATION *)ptr)->Machine = IMAGE_FILE_MACHINE_UNKNOWN;
 
     return status;
 }

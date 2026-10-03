@@ -168,6 +168,9 @@ app/Madeira/arm64ec-windows/nvapi64.dll
 # tools/build-dxgi-dll.sh output (DXMT dxgi.dll from source, IDXGIFactory7), built in CI
 build/dxmt-dxgi/
 app/Madeira/arm64ec-windows/dxgi-src.dll
+# tools/build-d3d11-dll.sh output (DXMT d3d11.dll from source, SwapDeviceContextState), built in CI
+build/dxmt-d3d11/
+app/Madeira/arm64ec-windows/d3d11-src.dll
 __pycache__/
 # The i386 farm (32-bit Wine + DXMT DLLs) is built from the pinned submodules by
 # build/wine-i386/build.sh (docs/WOW64.md section 9); it is not committed.

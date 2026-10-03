@@ -1429,6 +1429,37 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* madeira-bcd: env.MADEIRA_D3D11_SRC = 1 (the game's own file) runs the
+             * 64-bit d3d11.dll built from the dxmt submodule source
+             * (tools/build-d3d11-dll.sh ships it as d3d11-src.dll): upstream's
+             * committed DXMT d3d11.dll -- the CI checks the unpatched source build
+             * against it -- plus ID3D11DeviceContext1::SwapDeviceContextState,
+             * which upstream's aborts in. Wine's d2d1 calls it around every draw:
+             * the Rockstar Games Launcher exited with code 3 there. Off by default,
+             * linked like dxgi-src.dll above (system32 + sysx64, relinked from the
+             * bundle every session, so dropping the line restores upstream's). */
+            {
+                const char *d3d11Src = getenv("MADEIRA_D3D11_SRC");
+                if (d3d11Src && d3d11Src[0] == '1') {
+                    NSString *ecDir = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
+                    NSString *srcDll = madeira_pe_source(ecDir, "arm64ec-windows", @"d3d11-src.dll");
+                    if ([fm fileExistsAtPath:srcDll]) {
+                        NSMutableArray *dirs = [NSMutableArray arrayWithObject:
+                            [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+                        if (use_arm64ec) [dirs addObject:sys32Dir];
+                        for (NSString *dir in dirs) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"d3d11.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:srcDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_D3D11_SRC=1: d3d11.dll -> d3d11-src.dll (DXMT source build with SwapDeviceContextState; %s)\n",
+                                use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                    } else {
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_D3D11_SRC=1 but this build has no d3d11-src.dll -- upstream's d3d11.dll stays\n");
+                    }
+                }
+            }
+
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.
              *

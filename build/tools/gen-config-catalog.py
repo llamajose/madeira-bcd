@@ -139,6 +139,13 @@ OVERLAY = {
                         "upstream's DXMT dxgi plus IDXGIFactory7 and EnumAdapterByLuid (GTA V Enhanced stops with "
                         "ERR_GFX_D3D_NOD3D12 without Factory7). Off (default): upstream's committed dxgi.dll. Set it in "
                         "the game's own file, not for every game; read at session start."},
+    # madeira-bcd: the opt-in source build of DXMT's 64-bit d3d11.dll (tools/build-d3d11-dll.sh).
+    "env.MADEIRA_D3D11_SRC": {"category": "Direct3D 9/10/11 (DXMT)", "title": "D3D11 built from DXMT source (context state swap)",
+                "kind": "bool", "default": "0",
+                "note": "1: the game runs the 64-bit d3d11.dll the CI builds from the dxmt submodule (d3d11-src.dll): "
+                        "upstream's DXMT d3d11 plus SwapDeviceContextState, which Wine's Direct2D (d2d1) calls and "
+                        "upstream's aborts in (Rockstar Games Launcher exited with code 3). Off (default): upstream's "
+                        "committed d3d11.dll. Set it in the game's own file, not for every game; read at session start."},
     # madeira-bcd: the D3D12/DXGI GPU as a D3DKMT adapter (build/win32u-unix/d3dkmt_ios.c).
     "env.MADEIRA_KMT_ADAPTER": {"category": "Windows, display & input", "title": "D3DKMT adapter for the GPU (WDDM 3.1)",
                 "kind": "bool", "default": "0",

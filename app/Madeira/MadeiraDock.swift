@@ -91,6 +91,14 @@ enum MadeiraDock {
                         installed: flags & 4 != 0, customExecutables: !(state["CheckGuid"]?.fields.isEmpty ?? true))
     }
 
+    /// The apps a record's `SharedDepots` names as owners of its shared depots.
+    static func sharedOwners(manifest data: Data) -> Set<Int> {
+        guard data.count <= 1 << 20, var parser = try? SteamKeyValues(data), let root = try? parser.read(),
+              let state = root["AppState"], let appID = state["appid"]?.string.flatMap({ Int($0) }) else { return [] }
+        let ids = (state["SharedDepots"]?.fields ?? [:]).values.prefix(64).compactMap { $0.string.flatMap { Int($0) } }
+        return Set(ids.filter { validAppID($0) && $0 != appID })
+    }
+
     /// Installed games in the client's own library (`<client>/steamapps`) and the other
     /// libraries on C: that its `libraryfolders.vdf` lists. Read-only.
     static func games(drive: URL) -> [DockGame] {
@@ -106,17 +114,22 @@ enum MadeiraDock {
             }
         }
         var result: [DockGame] = []
+        // Apps that only lend depots to another install ("Shared Only", e.g. GTA V
+        // Enhanced's RGL/SC 1899670) have a record but nothing to start.
+        var owners = Set<Int>()
         for library in libraries.prefix(16) {
             let folder = drive.appendingPathComponent(library, isDirectory: true)
             guard folder.resolvingSymlinksInPath().path.hasPrefix(drive.resolvingSymlinksInPath().path + "/"),
                   let names = try? fm.contentsOfDirectory(atPath: folder.path) else { continue }
             for file in names.sorted().prefix(2000) where file.hasPrefix("appmanifest_") && file.hasSuffix(".acf") {
-                guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)),
-                      let game = game(manifest: data, library: library),
+                guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)) else { continue }
+                owners.formUnion(sharedOwners(manifest: data))
+                guard let game = game(manifest: data, library: library),
                       !result.contains(where: { $0.id == game.id }) else { continue }
                 result.append(game)
             }
         }
+        result.removeAll { owners.contains($0.id) }
         return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -288,6 +301,7 @@ enum MadeiraDock {
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
+        "game-scm", "game-scm-timeout",
         "shutdown-begin", "shutdown-complete", "probe-result"]
     /// The host's report rounds (madeira-dock src/main.c).
     static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015"]

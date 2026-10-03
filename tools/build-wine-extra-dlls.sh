@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build Wine PE DLLs that upstream's arm64ec-windows set does not ship but
 # games import (and, since ml2106, xinput1_1-1_4 with host rumble; see below): older VC++ runtimes (Crysis's Bin64\Crysis64.exe needs
-# msvcr80), D3DX9/10/11, d3d10, avifil32, XAudio2, dinput. Configured the way
+# msvcr80), D3DX9/10/11, d3d10, avifil32, XAudio2, dinput, RichEdit (the
+# Rockstar Games SDK / Launcher installers load Msftedit.dll and gdiplus.dll). Configured the way
 # upstream's build/wine-pe/build-ntdll.sh configures wine/build-arm64ec;
 # stripped and padded by 64 KB past SizeOfImage like the shipped builtins.
 # A DLL upstream already ships is never replaced. Run from the repository
@@ -21,7 +22,8 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       vcomp vcomp90 vcomp100 vcomp110 vcomp120 vcomp140
       d3d10 d3d10_1 avifil32 msvfw32 dinput
       wbemprox wbemdisp wmiutils
-      msasn1 wldp hnetcfg msctf xmllite
+      riched20 riched32 msftedit gdiplus mlang usp10 cabinet sspicli msxml3 msxml6
+      msasn1 wldp hnetcfg msctf xmllite netprofm d2d1
       xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9
       x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7
       xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5
@@ -60,6 +62,11 @@ if [ ! -f "$B/Makefile" ]; then
           --without-freetype --without-gnutls ${TOOLS:+--with-wine-tools="$TOOLS"} ) > "$B.cfg.log" 2>&1 \
         || { tail -20 "$B.cfg.log"; echo "::error::wine arm64ec configure failed"; exit 1; }
 fi
+# widl looks for imported typelibs (stdole2.tlb) under aarch64-windows, its
+# arch dir for ARM64EC, but an arm64ec-only tree builds them under
+# arm64ec-windows; without this riched20, hnetcfg and wbemdisp fail with
+# "cannot find stdole2.tlb".
+mkdir -p "$B/dlls/stdole2.tlb" && ln -sfn arm64ec-windows "$B/dlls/stdole2.tlb/aarch64-windows"
 # msvcr*: mirror the data exports into the PE mapping (see the script).
 python3 "$R/tools/patch-wine-msvcrt-datasync.py" "$R/wine/dlls/msvcrt/main.c"
 xi_patched=0
@@ -68,8 +75,31 @@ if [ -n "$XI" ]; then
     # Old objects from an unpatched build must not satisfy make.
     for d in $XI; do rm -f "$B/dlls/$d/arm64ec-windows/$d.dll" "$B/dlls/$d"/arm64ec-windows/*.o; done
 fi
+# Delay imports become plain imports. lld's ARM64EC delay-load stub is x64 code
+# inside .text (`lea rax, __imp_aux_X; jmp __tailMerge`), and the pool copy
+# Madeira runs ARM64EC code from relocates the delay IAT to the stub's POOL
+# address, so the first call executes x64 code outside the emulator's
+# executable ranges: NoExec, then an unhandled c0000005 (Rockstar Games
+# Launcher in d2d1's DWriteCreateFactory stub, 2026-10-03 19:42 log). Only
+# when every delayed DLL ships or is built here; otherwise the module is left
+# as it is.
+undelayed=""
+for d in $todo; do
+    mk="$R/wine/dlls/$d/Makefile.in"
+    delayed="$(sed -n 's/^DELAYIMPORTS[[:space:]]*=[[:space:]]*//p' "$mk")"
+    [ -n "$delayed" ] && grep -q "^IMPORTS" "$mk" || continue
+    ok=1
+    for i in $delayed; do
+        shipped "$i" || case " $todo " in *" $i "*) ;; *) ok=0 ;; esac
+    done
+    [ "$ok" = 1 ] || continue
+    sed -i.bak -e '/^DELAYIMPORTS[[:space:]]*=/d' -e "s/^\(IMPORTS[[:space:]]*=.*\)\$/\1 $delayed/" "$mk" && rm -f "$mk.bak"
+    undelayed="$undelayed $d"
+done
 make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
 git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c
+for d in $undelayed; do git -C "$R/wine" checkout -- "dlls/$d/Makefile.in"; done
+[ -n "$undelayed" ] && echo "::notice::delay imports linked as plain imports:$undelayed"
 xi_built=0; xi_failed=""
 if [ "$xi_patched" = 1 ]; then
     for d in $XI; do
