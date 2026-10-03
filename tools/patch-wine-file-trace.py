@@ -71,6 +71,61 @@ static void madeira_file_trace( const char *what, unsigned int status, const UNI
     dprintf( 2, "[file-trace] #%d %s status=0x%08x disp=%u access=0x%08x name=%s\n",
              i, what, status, disp, access, nb );
 }
+
+/* madeira-bcd: [pipe-trace] (MADEIRA_PIPE_TRACE=1). Social Club's game <-> helper
+ * channel (\\.\pipe\chrome.rgsc_ipc_<pid>_channel_0, Chromium IPC) connects
+ * (OnChannelConnected) but the game never asks the helper for a UI (GTA logs of
+ * 2026-10-02/03). Log every NtWriteFile on a handle whose object name contains
+ * "rgsc_": who writes, how much, and the first bytes, so both directions of the
+ * exchange show up. The name is looked up once per (process, handle). */
+static void madeira_pipe_trace( HANDLE handle, const void *buffer, ULONG length )
+{
+    static int on = -1, limit;
+    static volatile int n;
+    static struct { void *peb; HANDLE h; int rgsc; } cache[64];
+    static int cache_n;
+    void *peb = NtCurrentTeb()->Peb;
+    int i, k, rgsc = -1, line;
+    char hex[3 * 48 + 1], asc[97];
+    const unsigned char *b = buffer;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_PIPE_TRACE" ), *l = getenv( "MADEIRA_PIPE_TRACE_LIMIT" );
+        limit = l ? atoi( l ) : 2000;
+        if (limit <= 0 || limit > 100000) limit = 2000;
+        on = e && e[0] == '1';
+        if (on) dprintf( 2, "[pipe-trace] madeira-bcd on: writes to rgsc_ pipes, %d lines (MADEIRA_PIPE_TRACE)\n", limit );
+    }
+    if (!on || n >= limit) return;
+    for (i = 0; i < cache_n; i++)
+        if (cache[i].peb == peb && cache[i].h == handle) { rgsc = cache[i].rgsc; break; }
+    if (rgsc < 0)
+    {
+        char buf[sizeof(OBJECT_NAME_INFORMATION) + 512];
+        OBJECT_NAME_INFORMATION *oni = (OBJECT_NAME_INFORMATION *)buf;
+        ULONG used = 0;
+        rgsc = 0;
+        if (!NtQueryObject( handle, ObjectNameInformation, oni, sizeof(buf), &used ) && oni->Name.Buffer)
+        {
+            const WCHAR *w = oni->Name.Buffer;
+            unsigned int wl = oni->Name.Length / sizeof(WCHAR), j;
+            for (j = 0; j + 5 <= wl && !rgsc; j++)
+                rgsc = w[j] == 'r' && w[j + 1] == 'g' && w[j + 2] == 's' && w[j + 3] == 'c' && w[j + 4] == '_';
+        }
+        if (cache_n < 64) { cache[cache_n].peb = peb; cache[cache_n].h = handle; cache[cache_n].rgsc = rgsc; cache_n++; }
+    }
+    if (!rgsc || !b) return;
+    for (k = 0; k < 48 && k < (int)length; k++) sprintf( hex + 3 * k, "%02x ", b[k] );
+    hex[3 * k] = 0;
+    for (k = 0; k < 96 && k < (int)length; k++) asc[k] = (b[k] < 32 || b[k] > 126) ? '.' : (char)b[k];
+    asc[k] = 0;
+    line = __atomic_add_fetch( &n, 1, __ATOMIC_RELAXED );
+    if (line > limit) return;
+    dprintf( 2, "[pipe-trace] #%d write peb=%p tid=%04x h=%p len=%u | %s| %s\n", line, peb,
+             (unsigned int)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), handle,
+             (unsigned int)length, hex, asc );
+}
 #endif
 
 '''
@@ -105,5 +160,25 @@ if c != 2:
     sys.exit("patch-wine-file-trace: expected the two attribute queries, found %d" % c)
 src = src.replace(attr_old, attr_new)
 
+write_old = '''    TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\\n",
+           handle, event, apc, apc_user, io, buffer, length, offset, key );
+
+    if (!io) return STATUS_ACCESS_VIOLATION;'''
+write_new = '''    TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\\n",
+           handle, event, apc, apc_user, io, buffer, length, offset, key );
+#ifdef WINE_IOS
+    madeira_pipe_trace( handle, buffer, length );
+#endif
+
+    if (!io) return STATUS_ACCESS_VIOLATION;'''
+c = src.count(write_old)
+if c < 1:
+    sys.exit("patch-wine-file-trace: NtWriteFile anchor not found")
+# NtWriteFile is the first function with this TRACE + io check
+idx = src.index("NTSTATUS WINAPI NtWriteFile( HANDLE handle")
+j = src.index(write_old, idx)
+src = src[:j] + write_new + src[j + len(write_old):]
+
 open(path, "w").write(src)
-print("patch-wine-file-trace: [file-trace] in NtCreateFile and both attribute queries (MADEIRA_FILE_TRACE=1)")
+print("patch-wine-file-trace: [file-trace] in NtCreateFile and both attribute queries (MADEIRA_FILE_TRACE=1), "
+      "[pipe-trace] in NtWriteFile (MADEIRA_PIPE_TRACE=1)")

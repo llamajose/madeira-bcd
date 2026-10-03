@@ -115,8 +115,20 @@ enum StikJITHelper {
         let kr = vm_allocate(mach_task_self_, &a, scLayout2HoldSize, 0 /* VM_FLAGS_FIXED */)
         guard kr == KERN_SUCCESS, a == scLayout2Hold else {
             if kr == KERN_SUCCESS { vm_deallocate(mach_task_self_, a, scLayout2HoldSize) }
-            LogStore.shared.log(String(format: "[sc-cef] layout 2: [0x%lx,+4GB) is not free (kr=%d) -- usual RW alias placement",
-                                       Int(scLayout2Hold), kr), level: .error)
+            // Name the occupant: the first region at or above the hold.
+            var ra = scLayout2Hold
+            var rs: vm_size_t = 0
+            var info = vm_region_basic_info_data_64_t()
+            var cnt = mach_msg_type_number_t(MemoryLayout<vm_region_basic_info_data_64_t>.size / MemoryLayout<Int32>.size)
+            var obj: mach_port_t = 0
+            let rkr = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: Int32.self, capacity: Int(cnt)) {
+                    vm_region_64(mach_task_self_, &ra, &rs, VM_REGION_BASIC_INFO_64, $0, &cnt, &obj)
+                }
+            }
+            LogStore.shared.log(String(format: "[sc-cef] layout 2: [0x%lx,+4GB) is not free (kr=%d; first region 0x%lx+0x%lx prot=%d/%d, region kr=%d) -- usual RW alias placement",
+                                       Int(scLayout2Hold), kr, Int(ra), Int(rs), Int(info.protection), Int(info.max_protection), rkr),
+                                level: .error)
             return 0x7000000000
         }
         _ = vm_protect(mach_task_self_, a, scLayout2HoldSize, 0, VM_PROT_NONE)
@@ -168,6 +180,14 @@ enum StikJITHelper {
         var poolSize = requestedPoolSize      // ml1036: may shrink to fit, see the hole census below
         poolFailure = nil
         LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
+        // madeira-bcd Social Club layout 2: take the [0x7000000000, +4 GB) hold
+        // FIRST. Taken at alias time it lost the race on build 348 (GTA log
+        // 2026-10-03 08:00: "is not free (kr=3)", the RW alias then landed at
+        // 0x7014f68000 and libcef.dll's 32 GB pools had no slot -> int3): the
+        // kernel hands out 0x7000000000 to the first large ANYWHERE request
+        // (the debugger's pool regions, ml78/ml596). rwAliasHint() is
+        // idempotent once the hold is taken; a no-op without layout 2.
+        _ = rwAliasHint()
 
         let debuggerAttached = isDebuggerAttached()
         LogStore.shared.log("[jit-debugger] attached=\(debuggerAttached ? 1 : 0) at the pool request")

@@ -1081,6 +1081,33 @@ static int ec_conhost_refuse( int arm64ec_session, const char *env, const WCHAR 
     return arm64ec_session && !(env && env[0] == '1') && sc_image_is( image, image_len, "conhost.exe" );
 }
 
+/* madeira-bcd: env.MADEIRA_CHILD_ARGS = "<exe name> <arguments>" appends the
+ * arguments to the command line of every started process whose image file is
+ * <exe name> (any directory, ASCII case ignored). GTA V's PlayGTAV.exe starts
+ * GTA5_Enhanced.exe with its own fixed arguments and there is no
+ * commandline.txt to edit easily on the device, so this is how a game file
+ * passes e.g. "GTA5_Enhanced.exe -scDebugLogging". Returns the arguments to
+ * append, or NULL when `spec` does not name this image. */
+static const char *child_extra_args( const char *spec, const WCHAR *image, int image_len )
+{
+    char name[64];
+    int n = 0;
+
+    if (!spec) return NULL;
+    while (*spec == ' ') spec++;
+    while (spec[n] && spec[n] != ' ' && n < (int)sizeof(name) - 1)
+    {
+        char c = spec[n];
+        name[n++] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    }
+    if (!n || (spec[n] && spec[n] != ' ')) return NULL;
+    name[n] = 0;
+    spec += n;
+    while (*spec == ' ') spec++;
+    if (!*spec || !sc_image_is( image, image_len, name )) return NULL;
+    return spec;
+}
+
 /* The browser's new command line, written to `out` (`cap` WCHARs with the
  * NUL): `cl` with PartitionAllocBackupRefPtr put first in its last
  * --disable-features= list (Chromium uses only the last one; a second switch
@@ -1659,6 +1686,29 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                         dprintf(2, "[proc-gate] cmdline-tail(ml428): ...%s\n", tail);
                     }
                 }
+            }
+        }
+    }
+
+    /* madeira-bcd: env.MADEIRA_CHILD_ARGS -- see child_extra_args. */
+    {
+        const char *extra = child_extra_args( getenv( "MADEIRA_CHILD_ARGS" ), params->ImagePathName.Buffer,
+                                              params->ImagePathName.Length / sizeof(WCHAR) );
+        if (extra)
+        {
+            int cl_len = params->CommandLine.Length / sizeof(WCHAR), n = (int)strlen( extra ), k;
+            WCHAR *nbuf = malloc( (cl_len + n + 2) * sizeof(WCHAR) );   /* leaks once per start, as below */
+
+            if (nbuf)
+            {
+                memcpy( nbuf, params->CommandLine.Buffer, cl_len * sizeof(WCHAR) );
+                nbuf[cl_len] = ' ';
+                for (k = 0; k < n; k++) nbuf[cl_len + 1 + k] = (WCHAR)(unsigned char)extra[k];
+                nbuf[cl_len + 1 + n] = 0;
+                params->CommandLine.Buffer = nbuf;
+                params->CommandLine.Length = (cl_len + 1 + n) * sizeof(WCHAR);
+                params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+                dprintf( 2, "[child-args] env.MADEIRA_CHILD_ARGS: appended \"%s\" to the command line\n", extra );
             }
         }
     }

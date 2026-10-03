@@ -188,6 +188,7 @@ static struct ios_proc_socket
 static int ios_proc_socket_count = 0;
 
 extern void *ios_jit_current_peb(void);
+extern ULONG_PTR ios_highest_user_address( BOOL wow64 );
 
 static int ios_proc_socket_index(void)
 {
@@ -2402,12 +2403,11 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         }
         if (call->virtual_alloc_ex.limit_low || call->virtual_alloc_ex.limit_high || call->virtual_alloc_ex.align)
         {
-            SYSTEM_BASIC_INFORMATION sbi;
             SIZE_T limit_low, limit_high, align;
 
-            virtual_get_system_info( &sbi, is_wow64() );
+            /* madeira-bcd: the real limit, not the reported one (see ios_highest_user_address) */
             limit_low = call->virtual_alloc_ex.limit_low;
-            limit_high = min( (ULONG_PTR)sbi.HighestUserAddress, call->virtual_alloc_ex.limit_high );
+            limit_high = min( ios_highest_user_address( is_wow64() ), call->virtual_alloc_ex.limit_high );
             align = call->virtual_alloc_ex.align;
             if (limit_low != call->virtual_alloc_ex.limit_low || align != call->virtual_alloc_ex.align)
             {
@@ -2565,10 +2565,8 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         }
         if (call->map_view_ex.limit_low || call->map_view_ex.limit_high)
         {
-            SYSTEM_BASIC_INFORMATION sbi;
-
-            virtual_get_system_info( &sbi, is_wow64() );
-            limit_high = min( (ULONG_PTR)sbi.HighestUserAddress, call->map_view_ex.limit_high );
+            /* madeira-bcd: the real limit, not the reported one (see ios_highest_user_address) */
+            limit_high = min( ios_highest_user_address( is_wow64() ), call->map_view_ex.limit_high );
             addr_req.LowestStartingAddress = (void *)limit_low;
             addr_req.HighestEndingAddress = (void *)limit_high;
             addr_req.Alignment = 0;

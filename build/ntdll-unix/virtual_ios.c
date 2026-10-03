@@ -12444,10 +12444,29 @@ static int ios_sc_cef_refuse( const char *module, int enabled, int is_helper, in
     return enabled && !is_helper && has_socialclub && ios_sc_refused_name( module );
 }
 
-/* A pool copy refused on this thread (pool exhausted, or a Social Club client's
- * libcef.dll): map_image_into_view then fails the load instead of mapping code
- * that can never run. Thread-local: set and read by the one thread mapping. */
+/* A pool copy refused on this thread: 1 = pool exhausted, 2 = refused by
+ * ios_sc_cef_refuse (a Social Club client's libcef.dll / DLSS runtime).
+ * map_image_into_view then fails the load instead of mapping code that can
+ * never run -- except a resource-only map of a refused image (see
+ * ios_resource_only_map), which succeeds without executable code.
+ * Thread-local: set and read by the one thread mapping. */
 static _Thread_local int ios_jit_copy_refused;
+
+/* madeira-bcd: an image view the loader is not mapping. Wine's loader
+ * (ntdll load_dll) sets TEB ArbitraryUserPointer to the DLL name around the
+ * map; kernelbase's LoadLibraryExW(LOAD_LIBRARY_AS_IMAGE_RESOURCE) -- what
+ * GetFileVersionInfo uses -- maps the image section without it ("[map-notify]
+ * SKIP (no ArbitraryUserPointer)"). GTA log 2026-10-02 23:39: the game's
+ * socialclub.dll checks every Social Club component's version that way
+ * ("Could not get libcef version" in socialclub.dll), and the refused libcef
+ * copy failed that version query; allowed (env.MADEIRA_SC_GAME_CEF = 1) it
+ * cost a 240 MB pool copy that nothing ever executed and left the helper's own
+ * libcef.dll EXHAUSTED. A resource-only map of a policy-refused image now maps
+ * without a pool copy and without exec; the code never runs there. */
+static int ios_resource_only_map( int refused, const void *arbitrary_user_pointer )
+{
+    return refused == 2 && !arbitrary_user_pointer;
+}
 
 /* Social Club's PartitionAlloc pools (env.MADEIRA_SC_PA_POOLS = 1, opt-in).
  *
@@ -12490,8 +12509,9 @@ static int ios_sc_brp_layout;      /* the arena was moved for it at boot */
  *   - chrome_elf.dll's PartitionAlloc (glued pools, jumbo#1 in the 18:24 log),
  *   - libcef.dll's own PartitionAlloc (jumbo#3; it died in FreePages on the
  *     soft grant 0x7400000000, STATUS_FREE_VM_NOT_AT_BASE in R10),
- *   - Oilpan's caged heap (V8 13: CPPGC_POINTER_COMPRESSION + larger cage
- *     reserve 2 x 16 GB aligned to 32 GB and use only [base+16 GB, +4 GB)).
+ *   - Oilpan's caged heap (CPPGC_POINTER_COMPRESSION + larger cage reserve
+ *     2 x 16 GB aligned to 32 GB; the heap is [base+16 GB, +16 GB) (gin's
+ *     kCageSize), handed out from its bottom, and 4 GB of it are real here).
  * Each PartitionAlloc copy then asks for 16 GB more, page-aligned at a random
  * hint (build 340: chrome_elf.dll jumbo#2, libcef.dll jumbo#4-8): its metadata
  * region (PartitionAddressSpace::InitMetadataRegionAndOffsets, Chromium 142+,
@@ -12517,17 +12537,23 @@ static int ios_sc_brp_layout;      /* the arena was moved for it at boot */
  *                                 own memory only
  *   [0x7800000000, 0x7900000000)  chrome_elf.dll's regular pool, 4 GB
  *   [0x7900000000, +pool)         JIT pool RW alias (host-only, never a guest pointer)
- *   [0x7a00000000, 0x7c00000000)  V8 sandbox / cage holdback, 8 GB
+ *   [0x7a00000000, 0x7c00000000)  V8 sandbox (its partially reserved 8 GB) / cage holdback
  *   [0x7c00000000, 0x7d00000000)  Oilpan's cage: its 32 GB block is chrome_elf's,
  *                                 0x7800000000, so it lies in chrome_elf's BRP half
  *   [0x7d00000000, 0x8000000000)  FEX arena, 12 GB (as layout 1)
  * The first 32 GB ask of SocialClubHelper.exe is chrome_elf.dll's (libcef.dll
- * imports it, so it initialises first), the second libcef.dll's; the next one
- * is Oilpan's, served only after the helper got the V8 cage (V8 initialises
- * before Blink), so a 32 GB step of V8's sandbox search is never mistaken for
- * it. A metadata region is asked for right after its pools, before the V8
- * cage, at a hint that is not 4 GB-aligned (V8's sandbox search steps are).
- * Every slot is held natively (PROT_NONE, no view) until its ask. */
+ * imports it, so it initialises first), the second libcef.dll's; the third is
+ * Oilpan's. Blink reserves Oilpan's cage BEFORE V8 initialises (Chromium 142:
+ * InProcessRendererThread::Init -> Platform::InitializeBlink -> ProcessHeap::Init
+ * -> cppgc::InitializeProcess; V8::Initialize runs later in RenderThreadImpl),
+ * and V8 reserves its sandbox through VirtualAlloc2, i.e.
+ * NtAllocateVirtualMemoryEx, which never comes here -- so a 32 GB ask at a 32 GB
+ * boundary after both PartitionAlloc blocks can only be Oilpan's (the old rule
+ * waited for the V8 cage and refused it: report agent-sc-next-walls, wall 1). V8's
+ * 8 GB sandbox step gets the cage in NtAllocateVirtualMemoryEx (ios_sc2_ex_cage).
+ * A metadata region is asked for right after its pools, before the V8 cage, at a
+ * hint that is not 4 GB-aligned. Every slot is held natively (PROT_NONE, no view)
+ * until its ask. */
 #define IOS_SC2_POOL_REAL   0x100000000ULL     /* 4 GB really reserved per PartitionAlloc block */
 #define IOS_SC2_L_BASE      0x7000000000ULL
 #define IOS_SC2_FLOOR       0x7100000000ULL
@@ -12584,16 +12610,18 @@ static int ios_sc_layout(void)
 }
 
 /* Which slot a SocialClubHelper.exe reserve gets in layout 2. `held` has bit k
- * for each slot still held; `e_mine` / `cage_mine`: this helper already got
- * chrome_elf's block / the V8 cage. NONE leaves the request to the generic
- * jumbo path; REFUSE fails it with nothing else tried. */
-static int ios_sc2_classify( uint64_t size, uint64_t hint, unsigned held, int e_mine, int cage_mine )
+ * for each slot still held; `e_mine` / `l_mine` / `cage_mine`: this helper
+ * already got chrome_elf's block / libcef's block / the V8 cage. NONE leaves
+ * the request to the generic jumbo path; REFUSE fails it with nothing else
+ * tried. */
+static int ios_sc2_classify( uint64_t size, uint64_t hint, unsigned held, int e_mine, int l_mine, int cage_mine )
 {
     if (size == 0x800000000ULL && hint && !(hint & (0x800000000ULL - 1)))
     {
         if (held & (1u << IOS_SC2_E)) return IOS_SC2_E;
         if (held & (1u << IOS_SC2_L)) return IOS_SC2_L;
-        if (e_mine && cage_mine && (held & (1u << IOS_SC2_OILPAN))) return IOS_SC2_OILPAN;
+        /* the third: Oilpan, before or after the V8 cage (see the layout comment) */
+        if (e_mine && l_mine && (held & (1u << IOS_SC2_OILPAN))) return IOS_SC2_OILPAN;
         return IOS_SC2_REFUSE;
     }
     /* a metadata region: right after its pools, before the cage, hint not 4 GB-aligned */
@@ -12605,6 +12633,30 @@ static int ios_sc2_classify( uint64_t size, uint64_t hint, unsigned held, int e_
             return IOS_SC2_J2L;
     }
     return IOS_SC2_NONE;
+}
+
+/* Layout 2: the HighestUserAddress SocialClubHelper.exe is told (wall 2 of the
+ * agent-sc-next-walls report). V8 14 (Chromium 142) takes its address-space
+ * limit as min(CPUID's virtual address bits - 1, lpMaximumApplicationAddress + 1
+ * rounded up to a power of two) and CHECKs kSandboxSize (1 TB on Windows x64)
+ * against it before reserving anything (sandbox.cc DetermineAddressSpaceLimit,
+ * Sandbox::Initialize). ml990 clamps user_space_limit to the 512 GB this device
+ * can map, so V8 gets 2^39 and dies on the CHECK. Told 2 TB (FEX's CPUID leaf
+ * 0x80000008 says 48 bits), V8 passes it and goes straight to a partially
+ * reserved sandbox: 512 GB halving to 8 GB, one hinted and one unhinted
+ * VirtualAlloc2 per step. Anything above 512 GB still fails
+ * (allocate_virtual_memory refuses a base past address_space_limit, map_view
+ * finds no room for a size that large), and the 8 GB step gets the cage
+ * (ios_sc2_ex_cage). Only the report changes: user_space_limit and every
+ * placement keep the real limit, as do server_ios.c's remote-allocation limits
+ * (ios_highest_user_address). Not for WoW64 (a guest limit), nor when the limit
+ * is already wider (env.MADEIRA_WIDE_USER_VA). */
+#define IOS_SC2_WIDE_HIGHEST 0x1ffffffffffULL   /* 2 TB - 1 */
+
+static ULONG_PTR ios_sc2_reported_highest( ULONG_PTR real, int wow64, int layout, int helper )
+{
+    if (wow64 || layout != 2 || !helper || real >= IOS_SC2_WIDE_HIGHEST) return real;
+    return IOS_SC2_WIDE_HIGHEST;
 }
 
 /* Hold slot k natively (PROT_NONE, no view). [0x7000000000, +4 GB) may already
@@ -14168,7 +14220,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             ios_sc_name_is( sc_mod, "libcef.dll" ) ? "Chromium runs in the helper"
                                                                    : "DLSS needs NVIDIA's driver, not Metal",
                             (unsigned long)(image_size >> 20));
-                ios_jit_copy_refused = 1;
+                ios_jit_copy_refused = 2;
                 mprotect( base, size, PROT_READ );
                 errno = ENOMEM;
                 return -1;
@@ -18516,6 +18568,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     set_vprot( view, ptr, ROUND_SIZE( 0, header_size, align_mask ), VPROT_COMMITTED | VPROT_READ );
 
 #ifdef WINE_IOS
+    int ios_noexec_resource = 0;
     ios_jit_copy_refused = 0;
 #endif
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
@@ -18543,6 +18596,17 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
              * exec AV (secur32.dll, imm32.dll in the GTA logs of 2026-10-02).
              * Fail the load instead, so the loader reports it. Only this case:
              * every other protection failure keeps the old path. */
+            if (ios_resource_only_map( ios_jit_copy_refused, NtCurrentTeb()->Tib.ArbitraryUserPointer ))
+            {
+                static int resource_maps;
+                if (resource_maps++ < 16)
+                    dprintf( 2, "[jit-pool] %s: resource-only map (no loader name; GetFileVersionInfo / "
+                             "LOAD_LIBRARY_AS_IMAGE_RESOURCE) of a refused image -- mapped without a pool copy "
+                             "and without exec, the code never runs from it\n", debugstr_us(nt_name) );
+                ios_jit_copy_refused = 0;
+                ios_noexec_resource = 1;
+                continue;
+            }
             if (ios_jit_copy_refused)
             {
                 static int refused_loads;
@@ -18568,7 +18632,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
      * through map_image_into_view, regardless of whether it's via
      * virtual_map_image (builtin flag) or any alternate path. */
     ERR("iOS map_image_into_view: view=%p EXEC fixup\n", ptr);
-    for (int si = 0; si < nt->FileHeader.NumberOfSections; si++)
+    for (int si = 0; si < nt->FileHeader.NumberOfSections && !ios_noexec_resource; si++)
     {
         if (!(sec[si].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
         SIZE_T sec_size = sec[si].Misc.VirtualSize
@@ -19539,6 +19603,28 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
     if (wow64) info->HighestUserAddress = (char *)get_wow_user_space_limit() - 1;
     else info->HighestUserAddress = (char *)user_space_limit - 1;
 
+    /* madeira-bcd: Social Club layout 2 -- see ios_sc2_reported_highest */
+    if (!wow64 && ios_sc_layout_mode == 2 && ios_sc_cef_enabled())
+    {
+        ULONG_PTR real = (ULONG_PTR)info->HighestUserAddress;
+        ULONG_PTR told = ios_sc2_reported_highest( real, wow64, ios_sc_layout_mode, ios_sc_current_is_helper() );
+
+        if (told != real)
+        {
+            static void *said;
+            void *peb = ios_jit_current_peb();
+
+            info->HighestUserAddress = (void *)told;
+            if (said != peb)
+            {
+                said = peb;
+                dprintf( 2, "[sc-cef] layout 2: SocialClubHelper.exe (peb=%p) told HighestUserAddress=%p (V8 CHECKs "
+                            "its 1 TB sandbox against lpMaximumApplicationAddress); placement keeps %p\n",
+                         peb, (void *)told, (void *)real );
+            }
+        }
+    }
+
     /* ml991: report, once, exactly what an application is told about memory.
      *
      * rdr59's wall is a 0x700000000 (28,672 MB) MEM_RESERVE that cannot be
@@ -19572,6 +19658,16 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
                      phys, phys >> 20, virt, virt >> 20 );
         }
     }
+}
+
+/* madeira-bcd: the highest user address placement may use -- what
+ * virtual_get_system_info reports before ios_sc2_reported_highest widens it for
+ * SocialClubHelper.exe. server_ios.c caps a remote allocation's or view's
+ * limit_high with it: the widened value would fail get_extended_params' check
+ * against user_space_limit. */
+ULONG_PTR ios_highest_user_address( BOOL wow64 )
+{
+    return wow64 ? get_wow_user_space_limit() - 1 : (ULONG_PTR)user_space_limit - 1;
 }
 
 
@@ -22652,8 +22748,8 @@ static int ios_sc_grant_release( void *base, SIZE_T *size, int *rehold )
 static int ios_sc2_route( void *hint, SIZE_T size, ULONG type, ULONG protect, void **pick, SIZE_T *sz, NTSTATUS *st )
 {
     void *peb = ios_jit_current_peb();
-    int k = ios_sc2_classify( size, (uint64_t)(ULONG_PTR)hint, ios_sc2_held,
-                              ios_sc_grant_has( peb, IOS_SC2_E ), ios_sc_grant_has( peb, IOS_SC_K_CAGE ) );
+    int k = ios_sc2_classify( size, (uint64_t)(ULONG_PTR)hint, ios_sc2_held, ios_sc_grant_has( peb, IOS_SC2_E ),
+                              ios_sc_grant_has( peb, IOS_SC2_L ), ios_sc_grant_has( peb, IOS_SC_K_CAGE ) );
     uint64_t base, report;
     void *p;
     SIZE_T s;
@@ -22664,8 +22760,8 @@ static int ios_sc2_route( void *hint, SIZE_T size, ULONG type, ULONG protect, vo
         static unsigned refused;
         if (refused++ < 8)
             dprintf( 2, "[sc-cef] layout 2: 32 GB at a 32 GB boundary refused (hint %p, held 0x%x): both PartitionAlloc "
-                        "blocks are given, and Oilpan's comes after the V8 cage -- this is a 32 GB step of V8's "
-                        "sandbox search or a third PartitionAlloc\n", hint, ios_sc2_held );
+                        "blocks and Oilpan's are given, or this helper did not get both PartitionAlloc blocks -- "
+                        "a fourth 32 GB block\n", hint, ios_sc2_held );
         *st = STATUS_NO_MEMORY;
         return 1;
     }
@@ -22691,6 +22787,60 @@ static int ios_sc2_route( void *hint, SIZE_T size, ULONG type, ULONG protect, vo
              ios_sc2_slots[k].what, (unsigned long long)report, (unsigned long)size,
              (unsigned long long)base, (unsigned long long)(base + ios_sc2_slots[k].size) );
     return 1;
+}
+
+/* ml433 (#72): map the boot cage holdback for an 8 GB ask -- see IOS_CAGE_BASE.
+ * Shared by NtAllocateVirtualMemory's hinted-failure branch and, for
+ * SocialClubHelper.exe's V8 sandbox in layout 2, NtAllocateVirtualMemoryEx
+ * (ios_sc2_ex_cage). Returns the status; on success *pick / *sz are what the
+ * caller is given: `asked` (the full 8 GB) at IOS_CAGE_BASE, whose real view is
+ * 64 KB short -- an ios_soft tail entry absorbs a stray commit there. */
+static NTSTATUS ios_cage_grant( ULONG type, ULONG protect, SIZE_T asked, void **pick, SIZE_T *sz, const char *rev )
+{
+    SIZE_T csz = IOS_CAGE_REAL_SIZE;
+    NTSTATUS st;
+
+    munmap( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE );
+    ios_cage_holdback_live = 0;
+    *pick = (void *)(uintptr_t)IOS_CAGE_BASE;
+    st = allocate_virtual_memory( pick, &csz, type, protect, 0, 0, 0, 0 );
+    if (!st && (uintptr_t)*pick == IOS_CAGE_BASE)
+    {
+        *sz = asked;   /* report the full 8GB; the real view is 64K short */
+        if (ios_soft_n < IOS_SOFT_MAX)
+        {
+            ios_soft[ios_soft_n].base = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
+            ios_soft[ios_soft_n].size = 0x200000000ULL - IOS_CAGE_REAL_SIZE;
+            ios_soft[ios_soft_n].cage = 1;
+            ios_soft_n++;
+        }
+    }
+    else if (!st) *sz = csz;   /* landed elsewhere: honest grant, no size lie */
+    dprintf(2, "[cage] grant %p real=0x%llx reported=0x%lx st=0x%x rev=%s\n",
+            *pick, (unsigned long long)IOS_CAGE_REAL_SIZE, (unsigned long)(st ? 0 : *sz), (unsigned)st, rev);
+    return st;
+}
+
+/* Layout 2: is this SocialClubHelper.exe NtAllocateVirtualMemoryEx call V8's
+ * 8 GB sandbox step? (wall 3 of the agent-sc-next-walls report.) V8 allocates
+ * through VirtualAlloc2 whenever kernelbase exports it (platform-win32.cc
+ * VirtualAllocWrapper), so its sandbox never reaches NtAllocateVirtualMemory's
+ * hinted-failure branch and the cage holdback there. Told 2 TB
+ * (ios_sc2_reported_highest), V8 builds a partially reserved sandbox:
+ * OS::Allocate(hint, size, 4 GB, kNoAccess) = VirtualAlloc2(hint, size,
+ * MEM_RESERVE, PAGE_NOACCESS, no extended parameters), hinted then unhinted,
+ * 512 GB halving to 8 GB (kSandboxMinimumReservationSize); the larger steps
+ * fail as before. The 8 GB step gets the cage at its first call, hinted or
+ * not: V8 takes any 4 GB-aligned base at or below half its limit
+ * (AllocateInternal, InitializeAsPartiallyReservedSandbox), while its hint is
+ * random below 1 TB and the 8 GB hole the unhinted call needs does not exist
+ * (furniture's largest was 7885 MB in the 22:51 log). Gin's configurable pool
+ * asks the same shape later; by then the holdback is gone. */
+static int ios_sc2_ex_cage( SIZE_T size, ULONG type, ULONG protect, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                            ULONG_PTR align, ULONG attributes, int holdback_live )
+{
+    return holdback_live && size == 0x200000000ULL && type == MEM_RESERVE && protect == PAGE_NOACCESS &&
+           !limit_low && !limit_high && !align && !attributes;
 }
 
 /* Layout 2: what a SocialClubHelper.exe commit [a, a + size) says about the
@@ -23610,28 +23760,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                  * a 16GB overreserve retry loop — serve it from the boot
                  * holdback, the only aligned stretch left. See IOS_CAGE_BASE. */
                 if (st2 && ios_cage_holdback_live && *size_ptr == 0x200000000ULL)
-                {
-                    SIZE_T csz = IOS_CAGE_REAL_SIZE;
-                    munmap( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE );
-                    ios_cage_holdback_live = 0;
-                    pick = (void *)(uintptr_t)IOS_CAGE_BASE;
-                    st2 = allocate_virtual_memory( &pick, &csz, type, protect, 0, 0, 0, 0 );
-                    if (!st2 && (uintptr_t)pick == IOS_CAGE_BASE)
-                    {
-                        sz = *size_ptr;   /* report the full 8GB; the real view is 64K short */
-                        if (ios_soft_n < IOS_SOFT_MAX)
-                        {
-                            ios_soft[ios_soft_n].base = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
-                            ios_soft[ios_soft_n].size = 0x200000000ULL - IOS_CAGE_REAL_SIZE;
-                            ios_soft[ios_soft_n].cage = 1;
-                            ios_soft_n++;
-                        }
-                    }
-                    else if (!st2) sz = csz;   /* landed elsewhere: honest grant, no size lie */
-                    dprintf(2, "[cage] grant %p real=0x%llx reported=0x%lx st=0x%x rev=ml433\n",
-                            pick, (unsigned long long)IOS_CAGE_REAL_SIZE,
-                            (unsigned long)(st2 ? 0 : sz), (unsigned)st2);
-                }
+                    st2 = ios_cage_grant( type, protect, *size_ptr, &pick, &sz, "ml433" );
                 /* ml434 (#72 layer 2): the 4GB ask is the cppgc caged heap and
                  * must come back 4GB-ALIGNED. By the time it arrives (~69s) the
                  * furniture window is 89% full (ml433: free=1701MB, maxhole
@@ -25015,8 +25144,41 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             }
         }
 
-        st = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                      limit_low, limit_high, align, attributes );
+        /* madeira-bcd: Social Club layout 2. SocialClubHelper.exe's V8 reserves
+         * and commits through VirtualAlloc2, so NtAllocateVirtualMemory's helper
+         * bookkeeping is needed here too: its commits judged (ios_sc2_note_commit
+         * says nothing at or above the FEX arena, which keeps the emulator's own
+         * commits cheap), dead helpers' grants released before a large ask, the
+         * V8 sandbox's 8 GB step given the cage (ios_sc2_ex_cage) and its large
+         * grants remembered for ios_sc_reap_dead (ios_sc_grant_note). */
+        {
+            int sc2 = is_jumbo && ios_sc_layout_mode == 2 && ios_sc_cef_enabled() && ios_sc_current_is_helper();
+            int caged = 0;
+
+            if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < IOS_SC_ARENA_BASE)
+                ios_sc2_note_commit( *ret, *size_ptr );
+            if (sc2 && ios_sc_grant_dead_n) ios_sc_reap_dead();
+            if (sc2 && ios_sc2_ex_cage( *size_ptr, type, protect, limit_low, limit_high, align, attributes,
+                                        ios_cage_holdback_live ))
+            {
+                void *hint = *ret, *pick = NULL;
+                SIZE_T sz = 0;
+
+                st = ios_cage_grant( type, protect, *size_ptr, &pick, &sz, "sc2-ex" );
+                dprintf( 2, "[sc-cef] layout 2: V8 sandbox's 8 GB step (VirtualAlloc2, hint %p) for SocialClubHelper.exe: "
+                            "the cage -> %p (st=0x%x)\n", hint, st ? NULL : pick, (unsigned)st );
+                if (!st)
+                {
+                    *ret = pick;
+                    *size_ptr = sz;
+                    caged = 1;
+                }
+            }
+            if (!caged)
+                st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                              limit_low, limit_high, align, attributes );
+            if (sc2 && !st) ios_sc_grant_note( *ret, *size_ptr );
+        }
 
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
