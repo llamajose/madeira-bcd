@@ -93,6 +93,8 @@ var vsync: Int32 = -1
 func madeira_set_vsync_locked(_ mode: Int32) { vsync = mode }
 enum ProMotionIntent { static var has30Cap = true }
 struct TouchControl: Codable, Equatable { var nx = 0.5 }
+enum ControlAction: Codable, Equatable, Hashable { case none }   // LibraryEntry.controllerBinds
+enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry's per-game DirectInput choice
 enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
@@ -403,7 +405,8 @@ last = form[[m.start() for m in re.finditer(r'\bSection\b', form)][-1]:]
 check('header: { Text("Credits") }' in last and form.count('Text("Credits")') == 1,
       'Settings: Credits is the last section')
 for who in ('name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "125hz"',
-            'name: "Jfishin", handle: "Jfishin"'):
+            'name: "Jfishin", handle: "Jfishin"', 'name: "Jesse", handle: "JesseLovelace"',
+            'name: "Dan Perks", handle: "danperks"'):
     check('MadeiraCredit(' + who in last, 'Settings credits: ' + who)
 check('https://github.com/\\(handle)' in block(lib, 'struct MadeiraCredit: View'),
       'a credit links the GitHub account')
