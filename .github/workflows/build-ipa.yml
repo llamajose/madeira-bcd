@@ -1427,6 +1427,14 @@ jobs:
           done
           echo "::notice::native ABI $ABI, shader cache identity ${SCID:-none}"
 
+      # Upstream's built-in StikJIT pairs on the device (iOS 27) through a small
+      # Rust library; the app target links app/Madeira/libmadeira_rppairing.a.
+      - name: Build on-device pairing library (Rust)
+        run: |
+          rustup target add aarch64-apple-ios
+          bash build/rppairing-ios/build.sh
+          ls -la app/Madeira/libmadeira_rppairing.a
+
       - name: Archive (unsigned)
         shell: bash
         run: |
