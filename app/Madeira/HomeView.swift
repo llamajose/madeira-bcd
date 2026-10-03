@@ -793,7 +793,8 @@ struct HomeView: View {
 
     private func enableJIT() {
         enablingJIT = true
-        StikJITHelper.enableJIT { success in
+        StikJITHelper.enableJIT { result in
+            let success = (try? result.get()) != nil
             DispatchQueue.main.async {
                 enablingJIT = false
                 jitOn = success || jit_check_debugged()
