@@ -23,7 +23,7 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       d3d10 d3d10_1 avifil32 msvfw32 dinput
       wbemprox wbemdisp wmiutils
       riched20 riched32 msftedit gdiplus mlang usp10 cabinet sspicli msxml3 msxml6
-      msasn1 wldp hnetcfg msctf xmllite netprofm d2d1
+      msasn1 wldp hnetcfg msctf xmllite netprofm d2d1 wintypes
       xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9
       x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7
       xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5
