@@ -69,6 +69,8 @@ fi
 mkdir -p "$B/dlls/stdole2.tlb" && ln -sfn arm64ec-windows "$B/dlls/stdole2.tlb/aarch64-windows"
 # msvcr*: mirror the data exports into the PE mapping (see the script).
 python3 "$R/tools/patch-wine-msvcrt-datasync.py" "$R/wine/dlls/msvcrt/main.c"
+# d2d1: DC render targets without IDXGISurface1 (DXMT), see the script.
+case " $todo " in *" d2d1 "*) python3 "$R/tools/patch-wine-d2d1-dc-readback.py" "$R/wine/dlls/d2d1/dc_render_target.c" ;; esac
 xi_patched=0
 if [ -n "$XI" ]; then
     python3 "$R/tools/patch-wine-xinput-vibration.py" "$R/wine/dlls/xinput1_3/main.c" && xi_patched=1
@@ -97,7 +99,7 @@ for d in $todo; do
     undelayed="$undelayed $d"
 done
 make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
-git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c
+git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c dlls/d2d1/dc_render_target.c
 for d in $undelayed; do git -C "$R/wine" checkout -- "dlls/$d/Makefile.in"; done
 [ -n "$undelayed" ] && echo "::notice::delay imports linked as plain imports:$undelayed"
 xi_built=0; xi_failed=""

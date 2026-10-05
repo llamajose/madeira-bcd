@@ -3335,6 +3335,16 @@ struct ContentView: View {
                 } else {
                     unsetenv("WINE_IOS_JIT_HOLE")
                 }
+                // madeira-bcd pool-low (pool-low = 1): region C below the executable window,
+                // RW alias at the pool's distance; ntdll carves FEX's code buffers from it
+                // first (StikJITHelper.poolLow).
+                if let low = StikJITHelper.poolLow {
+                    setenv("WINE_IOS_JIT_TAIL_REGION", String(format: "%lx:%lx", low.rx, low.size), 1)
+                    logStore.log(String(format: "[pool-low] WINE_IOS_JIT_TAIL_REGION=%lx:%lx (%ldMB for FEX code buffers)",
+                                        low.rx, low.size, low.size >> 20), level: .success)
+                } else {
+                    unsetenv("WINE_IOS_JIT_TAIL_REGION")
+                }
                 // ml1330: the pool is allocated once per app run and reused, so this is
                 // the actual size, which the unix side records if a session runs it dry.
                 setenv("MADEIRA_POOL_MB", String(pool.size / 1024 / 1024), 1)

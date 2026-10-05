@@ -141,6 +141,9 @@ sc_decl += 'enum { IOS_SC_K_V1 = 8 };\nstatic int ios_sc_layout_mode = -1, grant
 sc_decl += 'static void *ios_jit_current_peb( void ) { return (void *)1; }\n'
 sc_decl += ('static void ios_sc_grant_add( uint64_t v, uint64_t r, uint64_t real, uint64_t asked, int k, void *p ) '
             '{ (void)v; (void)r; (void)real; (void)asked; (void)k; (void)p; grants++; }\n')
+# madeira-bcd pool-low: ios_sc_layout reads the alias reservation's base from region C
+sc_decl += '#define IOS_POOL_LOW_MIN (16u * 1024 * 1024)\n'
+sc_decl += function(native, 'static int ios_pool_low_parse(') + function(native, 'static void ios_pool_alias_extent(')
 sc_decl += function(native, 'static int ios_sc_layout_pick(') + function(native, 'static int ios_sc_layout(void)')
 glued = function(native, 'static ULONG_PTR ios_sc2_reported_highest(') + \
     function(native, 'static int ios_sc_pa_hold_arena(') + \
@@ -499,11 +502,19 @@ with tempfile.TemporaryDirectory() as t:
                     '-fno-sanitize-recover=all', str(c), '-o', str(exe)], check=True)
     base_env = {k: v for k, v in os.environ.items() if not k.startswith('MADEIRA_')}
     for mode, pools in (('gate', None), ('off', None), ('off', '0'), ('move-fails', '1'), ('on', '1'),
-                        ('on2', '2'), ('on', '2-alias-elsewhere')):
+                        ('on2', '2'), ('on', '2-alias-elsewhere'), ('on2', '2-pool-low')):
         env = {k: v for k, v in base_env.items() if not k.startswith('WINE_IOS_JIT_')}
         if pools == '2':
             env['WINE_IOS_JIT_RW'] = '7900000000'
             env['WINE_IOS_JIT_SIZE'] = '38000000'
+        if pools == '2-pool-low':
+            # madeira-bcd pool-low: region C's alias opens the reservation at 0x7900000000,
+            # the pool's own alias sits 0x1a000000 above it
+            pools = '2'
+            env['WINE_IOS_JIT_RX'] = '148000000'
+            env['WINE_IOS_JIT_RW'] = '791a000000'
+            env['WINE_IOS_JIT_SIZE'] = '38000000'
+            env['WINE_IOS_JIT_TAIL_REGION'] = '12e000000:12000000'
         if pools == '2-alias-elsewhere':
             pools = '2'
             env['WINE_IOS_JIT_RW'] = '7000000000'

@@ -114,6 +114,22 @@ OVERLAY = {
                         "second debugger region and both form one pool (about 880 MB instead of 560-630 MB). Costs "
                         "the second region's size in memory. Off by default; read at launch, the game's own file "
                         "wins."},
+    "pool-pair": {"category": "Memory & JIT pool", "title": "Split JIT pool: prefer two runs above the window",
+                "kind": "bool", "default": "1",
+                "note": "With pool-split on: when the largest free run lies below the 0x140000000 executable window "
+                        "(where the pool cannot split), the pool takes two runs above the window instead if together "
+                        "they are larger (GTA V: 368 + 320 MB instead of 464 MB). Falls back to the single run if the "
+                        "placement misses. On by default; 0 turns it off. Read at launch, the game's own file wins."},
+    "pool-low": {"category": "Memory & JIT pool", "title": "JIT code buffers below the executable window",
+                "kind": "bool", "default": "0",
+                "note": "1: the largest free run below the 0x140000000 executable window (less pool-low-margin) "
+                        "becomes a third debugger region for the emulator's code buffers, so the whole JIT pool is "
+                        "left to DLL copies (GTA V: about 300 MB more). Needs the pool above the window; costs the "
+                        "region's size in memory. Off by default; read at launch, the game's own file wins."},
+    "pool-low-margin": {"category": "Memory & JIT pool", "title": "Code-buffer region: MB left free below the window",
+                "kind": "int", "default": "128",
+                "note": "With pool-low on: how much of the free run below the executable window stays free for "
+                        "programs that load there (child processes' main executables). 128 by default."},
     "env.MADEIRA_SC_CEF": {"category": "Wine core (ntdll)", "title": "Social Club's Chromium in one process",
                 "kind": "bool", "default": "1",
                 "note": "On by default; 0 turns it off. SocialClubHelper.exe runs --single-process with "

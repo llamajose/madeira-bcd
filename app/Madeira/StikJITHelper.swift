@@ -124,6 +124,12 @@ enum StikJITHelper {
     /// never hands it out. nil for a pool of one region.
     private(set) static var poolHole: (off: Int, end: Int)?
 
+    /// madeira-bcd pool-low (`pool-low = 1`): region C, a third debugger region below
+    /// the executable window whose RW alias sits at the pool's RX->RW distance. It is
+    /// not part of the pool span; ntdll carves FEX's code buffers from it first.
+    /// ContentView exports it as WINE_IOS_JIT_TAIL_REGION. nil without it.
+    private(set) static var poolLow: (rx: Int, size: Int)?
+
     /// madeira-bcd Social Club layout 2 (`env.MADEIRA_SC_PA_POOLS = 2` in the game's
     /// file or madeira.cfg; virtual_ios.c, ios_sc2_boot_holds): the RW alias goes to
     /// 0x7900000000 and [0x7000000000, +4 GB) is held PROT_NONE before anything can
@@ -417,6 +423,13 @@ enum StikJITHelper {
         // so that nothing of ours could land in it. Release it now -- the very
         // next allocation of this size is the debugger's.
         var plugs: [(vm_address_t, vm_size_t)] = []
+        // madeira-bcd split pool switch (see SPLIT POOL below); the census reads it too.
+        let splitValue = (MadeiraConfig.gameValue("pool-split") ?? MadeiraConfig.get("pool-split") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // madeira-bcd pool-pair (below): region A's run and the size the single-region
+        // pool would have had, for the check after the request.
+        var pairA: (base: vm_address_t, size: vm_address_t)? = nil
+        var pairSingle = 0
         let earlyPoolBase = vm_address_t(madeira_early_pool_base)
         let earlyPoolSize = vm_address_t(madeira_early_pool_size)
         if earlyPoolBase != 0 {
@@ -457,7 +470,75 @@ enum StikJITHelper {
             LogStore.shared.log("ml1036: free holes >=64MB in [0x119000000,0x7000000000) with the window held: "
                 + (desc.isEmpty ? "NONE" : desc))
             let largest = holes.map { $0.size }.max() ?? 0
-            if largest < vm_address_t(poolSize) {
+            // madeira-bcd pool-pair (pool-split only): two runs ABOVE the window, split
+            // only by the main thread's stack, can beat the largest single run when that
+            // one lies BELOW the window, where the pool cannot split ("the gap would
+            // hold the executable window"). GTA V build 364, 21:00 and 23:47: 470MB below
+            // vs 369+331MB / 436+327MB above -> a 464MB pool and "[jit-pool] EXHAUSTED";
+            // the pair gives 688 / 752MB. Region A takes the run above the window (every
+            // lower run that could hold it is plugged, so first-fit lands there) and
+            // takeSecondRegion then takes B exactly as for any split pool. Used only when
+            // the single-region pool would land below the window and the pair is larger;
+            // `pool-pair = 0` in the game's file or madeira.cfg turns it off.
+            let pairOff = ["0", "off", "false", "no"].contains((MadeiraConfig.gameValue("pool-pair")
+                ?? MadeiraConfig.get("pool-pair") ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            let mb16: vm_address_t = 16 << 20
+            let ceiling: vm_address_t = 0x180000000           // SHARED_REGION_BASE_ARM64, as takeSecondRegion
+            let singleFit = largest < vm_address_t(poolSize) ? largest & ~(mb16 - 1) : vm_address_t(poolSize)
+            if ["1", "on", "true", "yes"].contains(splitValue) && windowHeld && !pairOff && singleFit < vm_address_t(poolSize) {
+                // Where the single-region request lands: first-fit, past ml1040's plugs
+                // (holes below the placeholder, only when a hole above it fits).
+                let steered = earlyPoolBase != 0 && holes.contains { $0.base + $0.size > earlyPoolBase && $0.size >= singleFit }
+                let singleAt = holes.first(where: { $0.size >= singleFit && !(steered && $0.base + $0.size <= earlyPoolBase) })
+                if let s = singleAt, s.base + s.size <= exeWinBase {
+                    var best = singleFit
+                    var bestB: (base: vm_address_t, size: vm_address_t) = (base: 0, size: 0)
+                    for run in holes where run.base >= exeWinBase + exeWinSize && run.base < ceiling {
+                        let aFit = min(min(run.size, ceiling - run.base) & ~(mb16 - 1), vm_address_t(poolSize))
+                        guard aFit >= 256 << 20, aFit < vm_address_t(poolSize) else { continue }
+                        // B as takeSecondRegion picks it: the largest run in [A's end, ceiling),
+                        // the rest of A's own run included.
+                        let aEnd = run.base + aFit
+                        var bRun: (base: vm_address_t, size: vm_address_t) = (base: aEnd, size: min(run.base + run.size, ceiling) - aEnd)
+                        for h in holes where h.base > run.base && h.base < ceiling && min(h.base + h.size, ceiling) - h.base > bRun.size {
+                            bRun = (base: h.base, size: min(h.base + h.size, ceiling) - h.base)
+                        }
+                        let want = (vm_address_t(poolSize) - aFit + mb16 - 1) & ~(mb16 - 1)
+                        let bFit = min(bRun.size & ~(mb16 - 1), want)
+                        if bFit >= 64 << 20 && aFit + bFit > best {
+                            best = aFit + bFit
+                            pairA = (base: run.base, size: aFit)
+                            bestB = (base: bRun.base, size: bFit)
+                        }
+                    }
+                    if let pa = pairA {
+                        pairSingle = Int(singleFit)
+                        poolSize = Int(pa.size)
+                        LogStore.shared.log(String(format: "[pool-split] ml1036 pair above the window: A=0x%lx+%luMB B=0x%lx+%luMB "
+                            + "total=%luMB (single best was %luMB at 0x%lx, below the window, where the pool cannot split; "
+                            + "pool-pair = 0 turns this off)",
+                            Int(pa.base), Int(pa.size >> 20), Int(bestB.base), Int(bestB.size >> 20), Int(best >> 20),
+                            Int(singleFit >> 20), Int(s.base)), level: .success)
+                        if best < 500 << 20 {
+                            LogStore.shared.log("⚠️ SMALL JIT POOL (\(best >> 20)MB) on this launch: expect ~1 s freezes in heavy games. "
+                                + "Quit and relaunch the app for a smooth session.", level: .error)
+                        }
+                        // The debugger allocates first-fit: plug every lower run that could
+                        // hold region A (as takeSecondRegion does for B); released after the request.
+                        for h in freeRuns(0x100000000, pa.base, minSize: pa.size) {
+                            var a = h.base
+                            if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* VM_FLAGS_FIXED */) == KERN_SUCCESS {
+                                if a == h.base {
+                                    plugs.append((a, vm_size_t(h.size)))
+                                    LogStore.shared.log(String(format: "[pool-split] ml1036 pair: plugged lower run 0x%lx+%luMB so first-fit lands at 0x%lx",
+                                                               Int(h.base), Int(h.size >> 20), Int(pa.base)))
+                                } else { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
+                            }
+                        }
+                    }
+                }
+            }
+            if pairA == nil && largest < vm_address_t(poolSize) {
                 let fit = Int(largest) & ~((16 << 20) - 1)
                 if fit >= 256 << 20 {
                     LogStore.shared.log("ml1036: no hole fits a \(poolSize >> 20)MB pool — SHRINKING to \(fit >> 20)MB "
@@ -492,10 +573,10 @@ enum StikJITHelper {
             // app killed itself. The hole below ends under 0x140000000, so a
             // pool there is safe; steering only helps if the target fits.
             let aboveFits = holes.contains { $0.base + $0.size > earlyPoolBase && $0.size >= vm_address_t(poolSize) }
-            if earlyPoolBase != 0 && windowHeld && !aboveFits {
+            if pairA == nil && earlyPoolBase != 0 && windowHeld && !aboveFits {
                 LogStore.shared.log("ml1040: no hole above the window fits \(poolSize >> 20)MB — not plugging, the pool takes the hole below it")
             }
-            if earlyPoolBase != 0 && windowHeld && aboveFits {
+            if pairA == nil && earlyPoolBase != 0 && windowHeld && aboveFits {
                 for h in holes where h.base + h.size <= earlyPoolBase && h.size >= vm_address_t(poolSize) {
                     var a = h.base
                     if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* FIXED */) == KERN_SUCCESS && a == h.base {
@@ -537,6 +618,65 @@ enum StikJITHelper {
         }
         // ml1040: the plugs existed only to steer first-fit; give the VA back.
         for (a, sz) in plugs { vm_deallocate(mach_task_self_, a, sz) }
+        // madeira-bcd pool-pair: region A must sit at the run chosen by the census and
+        // region B must be taken now. Otherwise fall back to the single-region pool the
+        // census would have made (pairSingle), as if pool-pair were off.
+        var pairSecond: (base: vm_address_t, size: vm_address_t)? = nil
+        if let pa = pairA, let p = rxPtrOpt {
+            let got = vm_address_t(bitPattern: p)
+            if got == pa.base {
+                pairSecond = takeSecondRegion(above: got + vm_address_t(poolSize), want: requestedPoolSize - poolSize,
+                                              exeWindow: (exeWinBase, exeWinSize))
+            }
+            if let second = pairSecond {
+                LogStore.shared.log(String(format: "[pool-split] ml1036 pair placed: region A 0x%lx+%luMB, region B 0x%lx+%luMB, "
+                    + "%luMB in all (the single-region pool would have been %luMB)",
+                    Int(got), poolSize >> 20, Int(second.base), Int(second.size >> 20),
+                    (poolSize + Int(second.size)) >> 20, pairSingle >> 20), level: .success)
+            } else {
+                let why: String = got == pa.base
+                    ? "region B was not taken"
+                    : String(format: "region A landed at 0x%lx, not 0x%lx", Int(got), Int(pa.base))
+                LogStore.shared.log("[pool-split] ml1036 pair FAILED: \(why) — falling back to the single-region "
+                    + "\(pairSingle >> 20)MB pool", level: .error)
+                if pairSingle > poolSize {
+                    // A region that missed A's run may sit in the hole the single pool
+                    // needs: give it back first. Region A at its run stays held until the
+                    // replacement is good (it cannot be in the way: it is above the window).
+                    if got != pa.base {
+                        let dkr = vm_deallocate(mach_task_self_, got, vm_size_t(poolSize))
+                        LogStore.shared.log("[pool-split] ml1036 pair: region released (kr=\(dkr))")
+                        rxPtrOpt = nil
+                    }
+                    var replaced = false
+                    if let q = jit26_prepare_region(nil, pairSingle), q != UnsafeMutableRawPointer(bitPattern: 0) {
+                        let qa = Int(bitPattern: q)
+                        let qGuest = qa + pairSingle > guestLo && qa < guestHi
+                        if qa >= goodLow && !qGuest && !overlapsExeWindow(vm_address_t(qa), vm_address_t(pairSingle)) {
+                            if let old = rxPtrOpt { vm_deallocate(mach_task_self_, vm_address_t(bitPattern: old), vm_size_t(poolSize)) }
+                            rxPtrOpt = q
+                            poolSize = pairSingle
+                            replaced = true
+                        } else {
+                            let dkr = vm_deallocate(mach_task_self_, vm_address_t(qa), vm_size_t(pairSingle))
+                            LogStore.shared.log(String(format: "BAD POOL placement 0x%lx for the %luMB fallback — released (kr=%d)",
+                                                       qa, pairSingle >> 20, dkr), level: .error)
+                        }
+                    } else {
+                        LogStore.shared.log("Debugger failed to allocate RX memory (pool-pair fallback, \(pairSingle >> 20)MB)", level: .error)
+                    }
+                    if replaced {
+                        LogStore.shared.log("[pool-split] ml1036 pair fallback: the pool is \(poolSize >> 20)MB in one region, "
+                            + "as without pool-pair")
+                    } else if rxPtrOpt != nil {
+                        LogStore.shared.log("[pool-split] ml1036 pair fallback failed: keeping region A alone (\(poolSize >> 20)MB)",
+                                            level: .error)
+                    } else {
+                        LogStore.shared.log("[pool-split] ml1036 pair fallback failed: no pool region", level: .error)
+                    }
+                }
+            }
+        }
         guard let rxPtr = rxPtrOpt else {
             if requestUnanswered && !debuggerAttached {
                 // Nothing answered the BRK: there is no pool and no placement to
@@ -678,6 +818,48 @@ enum StikJITHelper {
                 level: .error)
         }
 
+        // madeira-bcd POOL-LOW: `pool-low = 1` in the game's own file or in madeira.cfg.
+        // Off by default; nothing below runs without it.
+        //
+        // Every GTA V log has a 416-476MB free run BELOW the executable window (the
+        // ml1036 census above), while the pool above it ran its head dry (build 374,
+        // 2026-10-04 09:25: 557 of 560MB below the hole, 112MB of the pool spent on
+        // FEX code buffers). That run cannot join the pool's span -- the window would
+        // then lie inside [RX, RX+size), which ntdll and FEX treat as pool memory --
+        // so it becomes a third debugger region, region C, outside the span, with its
+        // RW alias at the pool's RX->RW distance (one reservation for C and the pool,
+        // mapLowAlias). ntdll carves FEX's code buffers from C first
+        // (WINE_IOS_JIT_TAIL_REGION) and the whole pool span is left to the PE image
+        // copies. `pool-low-margin` MB (128 by default) of the run stay free for the
+        // children's relocatable main exes. Costs C's size in footprint, like region B.
+        poolLow = nil
+        let lowValue = (MadeiraConfig.gameValue("pool-low") ?? MadeiraConfig.get("pool-low") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var lowRegion: (base: vm_address_t, size: vm_address_t)? = nil
+        if ["1", "on", "true", "yes"].contains(lowValue) {
+            lowRegion = takeLowRegion(poolRx: rxAddrV, exeWindow: (exeWinBase, exeWinSize))
+        }
+        // Region C is taken and its alias failed: give it back, the pool works as without it.
+        func dropLowRegion(_ why: String) {
+            guard let low = lowRegion else { return }
+            let dkr = vm_deallocate(mach_task_self_, low.base, vm_size_t(low.size))
+            LogStore.shared.log("[pool-low] \(why) -- region C released (kr=\(dkr)); code buffers stay in the pool",
+                                level: .error)
+            lowRegion = nil
+        }
+        // The pool and C are mapped: say so and keep C for ContentView.
+        func lowReady(_ rwBase: vm_address_t, _ low: (base: vm_address_t, size: vm_address_t), _ rw: vm_address_t) {
+            let exemptC = jit_make_region_no_footprint(UnsafeMutableRawPointer(bitPattern: rwBase)!, Int(low.size),
+                                                       "pool-RW-alias-low")
+            LogStore.shared.log(String(format: "[pool-low] region C RX [0x%lx,0x%lx) %luMB, RW [0x%lx,0x%lx) at the pool's "
+                + "distance 0x%lx (one RW reservation from 0x%lx); FEX code buffers come from C first, the pool span is "
+                + "left to the image copies (no-footprint %@)",
+                Int(low.base), Int(low.base + low.size), Int(low.size >> 20), Int(rwBase), Int(rwBase + low.size),
+                Int(rw) - Int(rxAddrV), Int(rwBase), exemptC ? "applied" : "REFUSED"),
+                level: exemptC ? .success : .error)
+            StikJITHelper.poolLow = (rx: Int(low.base), size: Int(low.size))
+        }
+
         // madeira-bcd SPLIT POOL: `pool-split = 1` in the game's own file or in
         // madeira.cfg. Off by default; nothing below runs without it.
         //
@@ -696,14 +878,42 @@ enum StikJITHelper {
         // WINE_IOS_JIT_HOLE tells ntdll never to hand out the part in between.
         // Costs the second region's size in footprint (debugger-blessed pages are
         // dirty from birth) -- the total stays within the requested pool size.
-        let splitValue = (MadeiraConfig.gameValue("pool-split") ?? MadeiraConfig.get("pool-split") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // (splitValue is read before the hole census, which uses it for pool-pair.)
         poolHole = nil
         if ["1", "on", "true", "yes"].contains(splitValue) {
             if poolSize >= requestedPoolSize {
                 LogStore.shared.log("[pool-split] the pool got its full \(poolSize >> 20)MB in one region — no split needed")
-            } else if let second = takeSecondRegion(above: rxAddrV + vm_address_t(poolSize), want: requestedPoolSize - poolSize,
-                                                    exeWindow: (exeWinBase, exeWinSize)) {
+            } else if let second = pairSecond ?? takeSecondRegion(above: rxAddrV + vm_address_t(poolSize), want: requestedPoolSize - poolSize,
+                                                                  exeWindow: (exeWinBase, exeWinSize)) {
+                // madeira-bcd pool-low: C, A and B in one RW reservation (C first)
+                if let low = lowRegion {
+                    if let rwLow = mapLowAlias([(rx: low.base, size: low.size), (rx: rxAddrV, size: vm_address_t(poolSize)),
+                                                (rx: second.base, size: second.size)]) {
+                        let span = Int(second.base + second.size - rxAddrV)
+                        let holeEnd = Int(second.base - rxAddrV)
+                        let rw = rwLow + (rxAddrV - low.base)
+                        let rwPtr = UnsafeMutableRawPointer(bitPattern: rw)!
+                        LogStore.shared.log("ml977: RX=[\(String(format: "%p", Int(rxAddrV))),\(String(format: "%p", Int(rxAddrV) + span))) "
+                            + "RW=[\(String(format: "%p", Int(rw))),\(String(format: "%p", Int(rw) + span))) "
+                            + "offset=0x\(String(Int(rw) - Int(rxAddrV), radix: 16)) windowHeld=\(windowHeld) rwOverlap=false",
+                            level: .success)
+                        let exemptA = jit_make_region_no_footprint(rwPtr, poolSize, "pool-RW-alias")
+                        let exemptB = jit_make_region_no_footprint(rwPtr + holeEnd, Int(second.size), "pool-RW-alias-2")
+                        LogStore.shared.log("[no-footprint] pool applied=\(exemptA && exemptB)", level: exemptA && exemptB ? .success : .error)
+                        poolHole = holeEnd > poolSize ? (off: poolSize, end: holeEnd) : nil
+                        LogStore.shared.log(String(format: "[pool-split] JIT pool = RX [0x%lx,0x%lx) %luMB + [0x%lx,0x%lx) %luMB as one "
+                            + "%luMB span; pool offsets [0x%lx,0x%lx) (%luMB, the main thread's stack) are never handed out",
+                            Int(rxAddrV), Int(rxAddrV) + poolSize, poolSize >> 20,
+                            Int(second.base), Int(second.base + second.size), Int(second.size >> 20),
+                            (poolSize + Int(second.size)) >> 20, poolSize, holeEnd, (holeEnd - poolSize) >> 20),
+                            level: .success)
+                        lowReady(rwLow, low, rw)
+                        LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
+                        poolTaken = true
+                        return (rx: rxPtr, rw: rwPtr, size: span)
+                    }
+                    dropLowRegion("no RW alias for the split pool with region C")
+                }
                 if let rw = mapSplitAlias(rxA: rxAddrV, sizeA: vm_address_t(poolSize), rxB: second.base, sizeB: second.size) {
                     let span = Int(second.base + second.size - rxAddrV)
                     let holeEnd = Int(second.base - rxAddrV)
@@ -733,6 +943,24 @@ enum StikJITHelper {
             }
         }
 
+        // madeira-bcd pool-low: C and the one-region pool in one RW reservation (C first)
+        if let low = lowRegion {
+            if let rwLow = mapLowAlias([(rx: low.base, size: low.size), (rx: rxAddrV, size: vm_address_t(poolSize))]) {
+                let rw = rwLow + (rxAddrV - low.base)
+                let rwPtr = UnsafeMutableRawPointer(bitPattern: rw)!
+                LogStore.shared.log("ml977: RX=[\(String(format: "%p", Int(rxAddrV))),\(String(format: "%p", Int(rxAddrV) + poolSize))) "
+                    + "RW=[\(String(format: "%p", Int(rw))),\(String(format: "%p", Int(rw) + poolSize))) "
+                    + "offset=0x\(String(Int(rw) - Int(rxAddrV), radix: 16)) windowHeld=\(windowHeld) rwOverlap=false",
+                    level: .success)
+                let exempt = jit_make_region_no_footprint(rwPtr, poolSize, "pool-RW-alias")
+                LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
+                lowReady(rwLow, low, rw)
+                LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
+                poolTaken = true
+                return (rx: rxPtr, rw: rwPtr, size: poolSize)
+            }
+            dropLowRegion("no RW alias for the pool with region C")
+        }
         // ml1037: the hint used to be 0x150000000 ("just above the window"), and
         // the alias duly took the 500MB hole there -- the very hole the RX pool
         // now needs. The alias has no placement requirement of its own (FEX
@@ -928,6 +1156,133 @@ enum StikJITHelper {
             + "between the regions: %luKB, %luKB of it free and now held PROT_NONE",
             Int(b), Int(size >> 20), desc, Int(b - aEnd) >> 10, held >> 10))
         return (b, size)
+    }
+
+    /// madeira-bcd pool-low: region C, the third debugger region. It is the largest free
+    /// run in [0x119000000, the executable window) less `pool-low-margin` MB (128 by
+    /// default) left free at the run's bottom, where Wine maps the children's
+    /// relocatable main exes (PlayGTAV.exe 0x122c20000, Launcher.exe 0x129340000,
+    /// RockstarService.exe 0x12ac20000 in the GTA V logs), in 16MB steps and at least
+    /// 64MB; it takes the run's TOP, next to the window. The debugger allocates
+    /// first-fit, so the margin and every lower run that could take C are plugged for
+    /// the request, as takeSecondRegion does. Only when the pool lies above the
+    /// window: C must never be inside the pool's span. Returns nil, holding nothing,
+    /// when no run qualifies or the region landed anywhere else.
+    private static func takeLowRegion(poolRx: vm_address_t,
+                                      exeWindow: (base: vm_address_t, size: vm_address_t))
+        -> (base: vm_address_t, size: vm_address_t)? {
+        let mb16: vm_address_t = 16 << 20
+        let lowFloor: vm_address_t = 0x119000000            // the pool's own low bound (mode A, see above)
+        let marginText = (MadeiraConfig.gameValue("pool-low-margin") ?? MadeiraConfig.get("pool-low-margin") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let marginMB = max(0, min(Int(marginText) ?? 128, 4096))
+        let margin = vm_address_t(marginMB) << 20
+        guard poolRx >= exeWindow.base + exeWindow.size else {
+            LogStore.shared.log(String(format: "[pool-low] the pool starts at 0x%lx, not above the executable window -- "
+                + "no region C (the free run below the window is the pool's own)", Int(poolRx)), level: .error)
+            return nil
+        }
+        let runs = freeRuns(lowFloor, exeWindow.base, minSize: 64 << 20)
+        let desc = runs.map { String(format: "0x%lx+%luMB", Int($0.base), Int($0.size >> 20)) }.joined(separator: " ")
+        guard let best = runs.max(by: { $0.size < $1.size }), best.size > margin,
+              (best.size - margin) & ~(mb16 - 1) >= 64 << 20 else {
+            LogStore.shared.log("[pool-low] free runs below the window: \(desc.isEmpty ? "none of 64MB" : desc) -- none "
+                + "leaves 64MB after the \(marginMB)MB margin (pool-low-margin); no region C", level: .error)
+            return nil
+        }
+        let size = (best.size - margin) & ~(mb16 - 1)
+        let target = best.base + best.size - size        // the run's top; the margin stays at its bottom
+        var plugs: [(vm_address_t, vm_size_t)] = []
+        var plugRuns = freeRuns(0x100000000, best.base, minSize: size)
+        if target > best.base { plugRuns.append((base: best.base, size: target - best.base)) }
+        for h in plugRuns {
+            var a = h.base
+            if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* VM_FLAGS_FIXED */) == KERN_SUCCESS {
+                if a == h.base { plugs.append((a, vm_size_t(h.size))) } else { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
+            }
+        }
+        let got = jit26_prepare_region(nil, Int(size))
+        for (a, sz) in plugs { vm_deallocate(mach_task_self_, a, sz) }
+        guard let p = got, p != UnsafeMutableRawPointer(bitPattern: 0) else {
+            LogStore.shared.log("[pool-low] the debugger did not allocate region C (\(size >> 20)MB) -- code buffers stay "
+                + "in the pool", level: .error)
+            return nil
+        }
+        let c = vm_address_t(bitPattern: p)
+        if c < lowFloor || c + size > exeWindow.base || c + size > poolRx {
+            let dkr = vm_deallocate(mach_task_self_, c, vm_size_t(size))
+            LogStore.shared.log(String(format: "[pool-low] region C landed at 0x%lx, not below the window in the run at 0x%lx -- "
+                + "released (kr=%d); code buffers stay in the pool", Int(c), Int(best.base), dkr), level: .error)
+            return nil
+        }
+        LogStore.shared.log(String(format: "[pool-low] region C 0x%lx+%luMB (free runs below the window: %@; %luMB of the "
+            + "run left free for the low images, pool-low-margin = %ld)%@",
+            Int(c), Int(size >> 20), desc, Int((best.size - size) >> 20), marginMB,
+            c == target ? "" : String(format: " -- not at the run's top 0x%lx, a plug failed", Int(target))))
+        return (c, size)
+    }
+
+    /// madeira-bcd pool-low: ONE RW reservation from region C's RX base to the pool's
+    /// end, each region aliased at its own RX offset in it, so C and the pool share
+    /// the pool's RX->RW distance (FEX has one DualMap::WriteOffset for every code
+    /// buffer). `regions` ascend by RX address, C first; the parts between them (the
+    /// executable window, the main thread's stack) stay reserved PROT_NONE. Placement
+    /// as mapSplitAlias: 0x7000000000 ANYWHERE, or FIXED at 0x7900000000 for Social
+    /// Club layout 2 (the reservation then starts there; ntdll reads its base from C).
+    /// Returns the reservation's base, or nil with nothing left mapped.
+    private static func mapLowAlias(_ regions: [(rx: vm_address_t, size: vm_address_t)]) -> vm_address_t? {
+        guard let first = regions.first, let last = regions.last, regions.count >= 2 else { return nil }
+        let span = last.rx + last.size - first.rx
+        var rw: vm_address_t = rwAliasHint()
+        let rwFixed = rw == scLayout2Alias
+        var kr = vm_allocate(mach_task_self_, &rw, vm_size_t(span), rwFixed ? 0 /* VM_FLAGS_FIXED */ : VM_FLAGS_ANYWHERE)
+        if rwFixed && kr != KERN_SUCCESS {
+            rwAliasDrop(kr)
+            rw = 0x7000000000
+            kr = vm_allocate(mach_task_self_, &rw, vm_size_t(span), VM_FLAGS_ANYWHERE)
+        } else if kr == KERN_SUCCESS && !rwAliasKeep(rw) {
+            vm_deallocate(mach_task_self_, rw, vm_size_t(span))
+            rw = 0x7000000000
+            kr = vm_allocate(mach_task_self_, &rw, vm_size_t(span), VM_FLAGS_ANYWHERE)
+        }
+        if kr == KERN_NO_SPACE && MadeiraConfig.flag("MADEIRA_RW_ALIAS_RETRY") {
+            rw = 0
+            kr = vm_allocate(mach_task_self_, &rw, vm_size_t(span), VM_FLAGS_ANYWHERE)
+        }
+        guard kr == KERN_SUCCESS else {
+            LogStore.shared.log("[pool-low] could not reserve \(span >> 20)MB for the RW alias (kr=\(kr))", level: .error)
+            return nil
+        }
+        var curProt: vm_prot_t = 0
+        var maxProt: vm_prot_t = 0
+        var failed: String? = nil
+        for r in regions {
+            let want = rw + (r.rx - first.rx)
+            var a = want
+            let krMap = vm_remap(mach_task_self_, &a, vm_size_t(r.size), 0, 0 /* VM_FLAGS_FIXED */ | VM_FLAGS_OVERWRITE,
+                                 mach_task_self_, r.rx, 0, &curProt, &maxProt, VM_INHERIT_NONE)
+            let krRW = krMap == KERN_SUCCESS
+                ? vm_protect(mach_task_self_, a, vm_size_t(r.size), 0, VM_PROT_READ | VM_PROT_WRITE)
+                : krMap
+            if krMap != KERN_SUCCESS || krRW != KERN_SUCCESS || a != want {
+                failed = String(format: "region 0x%lx+%luMB: remap %d, protect %d, at 0x%lx not 0x%lx",
+                                Int(r.rx), Int(r.size >> 20), krMap, krRW, Int(a), Int(want))
+                break
+            }
+        }
+        if let why = failed {
+            vm_deallocate(mach_task_self_, rw, vm_size_t(span))
+            LogStore.shared.log(String(format: "[pool-low] RW alias at 0x%lx failed (%@)", Int(rw), why), level: .error)
+            return nil
+        }
+        // the parts between the regions are not pool memory: reserved, never accessible
+        for i in 1..<regions.count {
+            let gapLo = regions[i - 1].rx + regions[i - 1].size
+            if regions[i].rx > gapLo {
+                _ = vm_protect(mach_task_self_, rw + (gapLo - first.rx), vm_size_t(regions[i].rx - gapLo), 1, VM_PROT_NONE)
+            }
+        }
+        return rw
     }
 
     /// madeira-bcd split pool: ONE RW alias for both regions at the same RX->RW

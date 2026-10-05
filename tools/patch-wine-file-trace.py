@@ -80,22 +80,27 @@ static void madeira_file_trace( const char *what, unsigned int status, const UNI
  * exchange show up. The name is looked up once per (process, handle). */
 static void madeira_pipe_trace( HANDLE handle, const void *buffer, ULONG length )
 {
-    static int on = -1, limit;
+    static int on = -1, limit, bytes = 48;
     static volatile int n;
     static struct { void *peb; HANDLE h; int rgsc; } cache[64];
     static int cache_n;
     void *peb = NtCurrentTeb()->Peb;
     int i, k, rgsc = -1, line;
-    char hex[3 * 48 + 1], asc[97];
+    char hex[3 * 1024 + 1], asc[1024 + 1];
     const unsigned char *b = buffer;
 
     if (on < 0)
     {
         const char *e = getenv( "MADEIRA_PIPE_TRACE" ), *l = getenv( "MADEIRA_PIPE_TRACE_LIMIT" );
+        const char *nb = getenv( "MADEIRA_PIPE_TRACE_BYTES" );
         limit = l ? atoi( l ) : 2000;
         if (limit <= 0 || limit > 100000) limit = 2000;
+        /* bytes shown in hex per write (default 48; 16..1024). The helper's load
+         * events (type 0x10, 58..102 bytes) carry their result past byte 48. */
+        bytes = nb ? atoi( nb ) : 48;
+        if (bytes < 16 || bytes > 1024) bytes = 48;
         on = e && e[0] == '1';
-        if (on) dprintf( 2, "[pipe-trace] madeira-bcd on: writes to rgsc_ pipes, %d lines (MADEIRA_PIPE_TRACE)\n", limit );
+        if (on) dprintf( 2, "[pipe-trace] madeira-bcd on: writes to rgsc_ pipes, %d lines, %d bytes (MADEIRA_PIPE_TRACE)\n", limit, bytes );
     }
     if (!on || n >= limit) return;
     for (i = 0; i < cache_n; i++)
@@ -116,9 +121,9 @@ static void madeira_pipe_trace( HANDLE handle, const void *buffer, ULONG length 
         if (cache_n < 64) { cache[cache_n].peb = peb; cache[cache_n].h = handle; cache[cache_n].rgsc = rgsc; cache_n++; }
     }
     if (!rgsc || !b) return;
-    for (k = 0; k < 48 && k < (int)length; k++) sprintf( hex + 3 * k, "%02x ", b[k] );
+    for (k = 0; k < bytes && k < (int)length; k++) sprintf( hex + 3 * k, "%02x ", b[k] );
     hex[3 * k] = 0;
-    for (k = 0; k < 96 && k < (int)length; k++) asc[k] = (b[k] < 32 || b[k] > 126) ? '.' : (char)b[k];
+    for (k = 0; k < (bytes > 96 ? bytes : 96) && k < (int)length; k++) asc[k] = (b[k] < 32 || b[k] > 126) ? '.' : (char)b[k];
     asc[k] = 0;
     line = __atomic_add_fetch( &n, 1, __ATOMIC_RELAXED );
     if (line > limit) return;

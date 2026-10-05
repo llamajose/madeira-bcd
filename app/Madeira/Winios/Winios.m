@@ -1172,6 +1172,9 @@ static CALayer *winios_layer_for(HWND hwnd, bool create) {
         l.anchorPoint = CGPointMake(0, 0);
         l.magnificationFilter = kCAFilterNearest;
         l.opaque = YES;
+        /* A surface or swapchain can arrive before the window's position.
+         * Stay hidden until Wine delivers the frame and visibility. */
+        l.hidden = YES;
         [g_compositor_view.layer addSublayer:l];
         g_layers[key] = l;
         fprintf(stderr, "[winios] layer created for hwnd=%p (%lu layers)\n",
@@ -1316,8 +1319,52 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
     return result;
 }
 
+/* Parent show/hide: update existing child layers on the same queue as frames.
+ * A hidden child retains its surface and Metal layer for a later parent show. */
+void winios_window_visibility(HWND hwnd, int visible) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CALayer *l = g_layers[@((uintptr_t)hwnd)];
+        if (!l) return;
+        BOOL hidden = !visible || CGRectIsEmpty(l.bounds);
+        if (l.hidden == hidden) return;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        l.hidden = hidden;
+        [CATransaction commit];
+        static unsigned n;
+        if (++n <= 64 || (n % 128) == 0) {
+            fprintf(stderr, "[winios] inherited visibility hwnd=%p visible=%d\n", hwnd, !hidden);
+            fflush(stderr);
+        }
+    });
+}
+
+/* Parent movement does not give every child its own WindowPosChanged. Update
+ * existing layers only; retain their visibility, surface and Metal layer.
+ * All Wine queries happened on the caller's Wine thread, not this queue. */
+void winios_window_geometry(HWND hwnd, int x, int y, int w, int h,
+                            int cx, int cy, int cw, int ch) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSNumber *key = @((uintptr_t)hwnd);
+        CALayer *l = g_layers[key];
+        if (!l) return;
+        g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
+        if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
+        g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        l.frame = winios_layer_rect(x, y, w, h);
+        winios_apply_contents_rect(key, l);
+        winios_place_metal_layer(key);
+        [CATransaction commit];
+        static unsigned n;
+        if (++n <= 64 || (n % 128) == 0)
+            fprintf(stderr, "[winios] inherited frame hwnd=%p screen=(%d,%d %dx%d)\n", hwnd, x, y, w, h);
+    });
+}
+
 /* Called from win32u's pWindowPosChanged wrapper (wine thread).
- * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, desktop pixels. */
+ * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, screen desktop pixels. */
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
     /* Here, not in the block below: the census asks win32u about the window,
@@ -1810,10 +1857,20 @@ static UIImage *winios_cursor_image(void) {
 static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
 static CGPoint g_cursor_pos_px;
 
+/* Both Wine bitmaps and the built-in fallback have a desktop-pixel size.
+ * A fixed 21-point fallback grows relative to a 1080p desktop fitted into a
+ * portrait view. Keep the arrow's shape and use a normal 32-pixel height. */
+static CGSize winios_cursor_pixel_size(void) {
+    if (g_cur_w > 0) return CGSizeMake(g_cur_w, g_cur_h);
+    CGSize shape = winios_cursor_image().size;
+    return CGSizeMake(32.0 * shape.width / shape.height, 32.0);
+}
+
 /* The cursor is a sublayer of the compositor view; a dropped view takes it. */
 static void winios_forget_cursor_layer(void) {
     [g_cursor_layer removeFromSuperlayer];
     g_cursor_layer = nil;
+    g_cur_w = g_cur_h = g_cur_hx = g_cur_hy = 0;
 }
 
 /* main thread only */
@@ -1834,18 +1891,19 @@ static void winios_ensure_cursor_layer(void) {
 static void winios_cursor_place(void) {
     if (!g_cursor_layer) return;
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+    CGSize pixels = winios_cursor_pixel_size();
     CGPoint fitted; CGFloat k = 0;
     if (winios_desktop_fit_map(x, y, &fitted, &k)) {   /* over a fitted window */
+        g_cursor_layer.bounds = CGRectMake(0, 0, pixels.width * k, pixels.height * k);
         if (g_cur_w > 0) {
-            g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * k, g_cur_h * k);
             g_cursor_layer.position = CGPointMake(fitted.x - g_cur_hx * k, fitted.y - g_cur_hy * k);
         } else {
             g_cursor_layer.position = fitted;
         }
         return;
     }
+    g_cursor_layer.bounds = CGRectMake(0, 0, pixels.width * g_px_to_pt, pixels.height * WINIOS_PX_TO_PT_Y);
     if (g_cur_w > 0) {
-        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
         g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
                                               g_desk_origin.y + (y - g_cur_hy) * WINIOS_PX_TO_PT_Y);
     } else {

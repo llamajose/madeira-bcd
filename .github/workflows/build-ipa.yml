@@ -347,6 +347,15 @@ jobs:
       - name: Patch wine with the guest file trace
         run: python3 tools/patch-wine-file-trace.py wine/dlls/ntdll/unix/file.c
 
+      # [dns]: every guest getaddrinfo by name, and MADEIRA_DNS_TIMEOUT_MS to
+      # bound one (Social Club's Chromium sat in three getaddrinfo calls for a
+      # minute, GTA V Enhanced build 378). Patches wine/dlls/ws2_32/unixlib.c.
+      - name: Patch wine with the DNS trace
+        run: python3 tools/patch-wine-dns-trace.py wine/dlls/ws2_32/unixlib.c
+
+      - name: Patch wine with fault-safe waiter diagnostics
+        run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
+
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
@@ -925,6 +934,8 @@ jobs:
         run: |
           # env.MADEIRA_DOCK_GAME_SCM = 1: a service manager in the game session
           python3 tools/patch-dock-game-scm.py madeira-dock/src/launch.c || echo "::warning::Dock game-session service manager patch not applied"
+          # env.MADEIRA_DOCK_KEEP_ALIVE = <exe>;<exe>: hold the session while a self-updating launcher restarts
+          python3 tools/patch-dock-keep-alive.py madeira-dock/src/launch.c || echo "::warning::Dock keep-alive patch not applied"
           bash build/madeira-dock/build.sh
 
       # 30 and 40 FPS caps (pacing modes 3 and 4) for the Session panel.
@@ -1209,6 +1220,15 @@ jobs:
             exit 1
           fi
           echo "::notice::all PE DLLs present"
+          # The ARM64EC source build permits a fallback on failure. This
+          # allocator change requires its rebuilt module before archiving.
+          python3 - <<'PYEOF'
+          from pathlib import Path
+          module = Path('app/Madeira/arm64ec-windows/xtajit64.dll').read_bytes()
+          if b'rpmalloc-span8 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC rpmalloc span8 module was not built; refusing the fallback IPA')
+          print('ARM64EC rpmalloc: span8 build marker verified')
+          PYEOF
           # The opt-in source build of dxgi.dll (tools/build-dxgi-dll.sh) is not
           # required: without it env.MADEIRA_DXGI_SRC = 1 keeps upstream's.
           if [ -f app/Madeira/arm64ec-windows/dxgi-src.dll ]; then

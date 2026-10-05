@@ -20,6 +20,12 @@ IOS_POOL_IN_HOLE, ios_pool_tail_unreserve, ios_pool_execable_runs) and checks:
     64 KB and unmapped gaps are dropped, a nonsense region answer stops the walk;
 and textually: the bump, the warmer, the tail carve, the BIG cap, the pool init and the
 POISONED branch use them; the app sets WINE_IOS_JIT_HOLE only for a split pool.
+The big-image slot (env MADEIRA_POOL_BIG_SLOT_MB, GTA V Enhanced build 373, 2026-10-04
+08:41: 469 MB of per-process DLL copies + 112 MB of FEX code left no 240 MB run for
+libcef.dll in either part): the bump and the tail treat the slot as part of the hole
+(ios_jit_hole_end_eff), the warmer does not, one image of 64 MB or more takes the slot,
+and the reclaim gives it back instead of putting it on the freelist; modelled with the
+build 373 sizes, where libcef.dll fails without the slot and fits with it.
 Needs python3 and a C compiler (AddressSanitizer/UBSan).
 """
 from pathlib import Path
@@ -51,7 +57,26 @@ runs = function(native, 'static int ios_pool_execable_runs(')
 
 # --- call sites ---------------------------------------------------------------
 bump = native[native.index('/* madeira-bcd split pool: never into the hole (ios_jit_hole_off).'):][:2600]
-assert 'ios_pool_hole_head_place( jit_pool_offset, alloc_size,' in bump
+assert 'ios_pool_hole_head_place( jit_pool_offset, alloc_size,\n                                                ios_jit_hole_off, ios_jit_hole_end_eff );' in bump
+assert native.count('ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end_eff );') == 2
+assert 'ios_jit_hole_end );' not in native.replace('ios_jit_hole_end_eff );', ''), 'no placement uses the bare hole end'
+assert '#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)' in native, \
+    'the warmer still warms the slot'
+slot_alloc = native[native.index('/* madeira-bcd: the big-image slot (ios_pool_big_off), once it is free and'):][:1500]
+assert 'pool_limit && ios_pool_big_size && !ios_pool_big_taken && alloc_size >= IOS_POOL_BIG_MIN' in slot_alloc
+assert 'now - ios_pool_big_freed_at >= IOS_POOL_REUSE_GRACE_SEC' in slot_alloc
+assert 'if (pool_limit && off == (size_t)-1)' in native and 'if (off == (size_t)-1 && (alloc_size >= 32u * 1024 * 1024 || bump_short))' in native
+assert 'while (off == (size_t)-1 &&\n           (i = ios_pool_best_fit(' in native, 'the slot skips the freelist'
+reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )')
+slot_free = reclaim[reclaim.index('if (ios_pool_big_size && off < ios_pool_big_off + ios_pool_big_size'):][:700]
+assert 'ios_pool_big_taken = 0;' in slot_free and 'ios_pool_big_freed_at = time( NULL );' in slot_free
+assert 'ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];\n            continue;' in slot_free
+assert reclaim.index('if (ios_pool_big_size && off <') < reclaim.index('ios_pool_free_put( ios_pool_freelist'), \
+    'the slot is given back before the freelist would take it'
+big_init = native[native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );'):][:1400]
+assert 'ios_jit_hole_end > ios_jit_hole_off && want >= IOS_POOL_BIG_MIN' in big_init
+assert 'ios_jit_hole_end + want <= jit_pool_size' in big_init and 'ios_jit_hole_end_eff = ios_jit_hole_end + want;' in big_init
+assert native.index('ios_jit_hole_end_eff = (size_t)h1;') < native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );')
 assert 'jit_pool_offset = cand + alloc_size;' in bump
 assert 'ios_pool_freelist[ios_pool_free_count].off = jit_pool_offset;' in bump
 
@@ -62,7 +87,9 @@ tail = native[native.index('size_t reserve_offset, tail_added, tail_skipped = 0;
 assert 'ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in tail
 assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 2
 assert '__sync_fetch_and_sub(&ios_jit_tail_reserved' not in tail, 'every rollback goes through ios_pool_tail_unreserve'
-assert 'ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end;' in tail
+assert 'ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;' in tail
+assert 'ios_jit_hole_off, ios_jit_hole_end_eff );' in tail, 'the tail jumps the slot with the hole'
+assert 'ios_jit_pool_size_global - cur - ios_jit_hole_end_eff' in tail
 
 cap = native[native.index('enum { TAIL_SMALL = 0x1000000, TAIL_MAX = 0x8000000'):][:900]
 assert 'ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,' in cap
@@ -89,6 +116,20 @@ assert 'setenv("WINE_IOS_JIT_HOLE", String(format: "%lx:%lx", hole.off, hole.end
 assert 'unsetenv("WINE_IOS_JIT_HOLE")' in hole_env
 print('PASS: the app splits only on request and exports WINE_IOS_JIT_HOLE only for a split pool')
 
+# pool-pair (GTA build 364, 21:00 / 23:47): two runs above the window instead of the 464 MB hole below it
+pair = swift[swift.index('let pairOff = '):swift.index('if pairA == nil && largest < vm_address_t(poolSize) {')]
+assert 'MadeiraConfig.gameValue("pool-pair")' in pair and 'MadeiraConfig.get("pool-pair")' in pair
+assert '.contains(splitValue) && windowHeld && !pairOff' in pair, 'pool-pair needs pool-split and the held window'
+assert 's.base + s.size <= exeWinBase' in pair, 'only when the single-region pool would land below the window'
+assert 'aFit + bFit > best' in pair, 'only when the pair beats the single run'
+assert 'freeRuns(0x100000000, pa.base, minSize: pa.size)' in pair and 'plugs.append(' in pair
+assert swift.count('if pairA == nil && earlyPoolBase != 0 && windowHeld') == 2, 'ml1040 steering is off in pair mode'
+check = swift[swift.index('var pairSecond: (base: vm_address_t, size: vm_address_t)? = nil'):swift.index('guard let rxPtr = rxPtrOpt else {')]
+assert 'if got == pa.base {' in check and 'pairSecond = takeSecondRegion(' in check
+assert 'jit26_prepare_region(nil, pairSingle)' in check, 'a missed pair falls back to the single-region size'
+assert 'pairSecond ?? takeSecondRegion(' in swift
+print('PASS: pool-pair takes two runs above the window only with pool-split, and falls back on a miss')
+
 harness = r'''
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +146,10 @@ static struct range live[4096];
 static int nlive;
 static size_t total, head, tail_resv;
 static unsigned long jumps, below;
+static size_t eff_end;                   /* ios_jit_hole_end_eff; 0 = ios_jit_hole_end */
+static size_t big_off, big_size;
+static int big_taken;
+#define HOLE_END_EFF (eff_end ? eff_end : ios_jit_hole_end)
 
 static void check_new( size_t off, size_t size )
 {
@@ -121,7 +166,13 @@ static void check_new( size_t off, size_t size )
 static int head_alloc( size_t size )   /* ios_pool_alloc_range_ex's bump */
 {
     size_t limit = total - tail_resv;
-    size_t cand = ios_pool_hole_head_place( head, size, ios_jit_hole_off, ios_jit_hole_end );
+    size_t cand = ios_pool_hole_head_place( head, size, ios_jit_hole_off, HOLE_END_EFF );
+    if (big_size && size >= 64 * ((size_t)1 << 20) && !big_taken && size <= big_size)
+    {   /* the big-image slot */
+        check_new( big_off, size );
+        big_taken = 1;
+        return 1;
+    }
     if (cand + size > limit) return 0;
     check_new( cand, size );
     if (cand != head) jumps++;
@@ -133,7 +184,7 @@ static int tail_alloc( size_t size )   /* NtAllocateVirtualMemoryEx's EC_CODE ca
 {
     int split = ios_jit_hole_end > ios_jit_hole_off;
     size_t cur = tail_resv, start, added, off;
-    if (split) start = ios_pool_hole_tail_start( total, cur, size, ios_jit_hole_off, ios_jit_hole_end );
+    if (split) start = ios_pool_hole_tail_start( total, cur, size, ios_jit_hole_off, HOLE_END_EFF );
     else start = cur;
     tail_resv = start + size;
     added = start + size - cur;
@@ -182,6 +233,24 @@ static int gta_scenario( size_t pool, size_t h0, size_t h1 )
     if (!head_alloc( 240 * MB )) return 4;                                          /* libcef.dll */
     for (i = 0; i < 30; i += 3) if (!head_alloc( 3 * MB )) return 5;                /* its GPU stack */
     if (!tail_alloc( 16 * MB ) || !tail_alloc( 16 * MB )) return 6;                 /* its code buffers */
+    return 0;
+}
+
+/* GTA V Enhanced build 373 (2026-10-04 08:41): A = 624 MB, stack hole 10 MB, B = 256 MB;
+ * 450 MB of per-process DLL copies and 112 MB of FEX code before libcef.dll (240 MB) */
+static int gta373( size_t slot )
+{
+    size_t i, a = 624 * MB, b = a + 10 * MB;
+    total = b + 256 * MB; head = 0; tail_resv = 0; nlive = 0; big_taken = 0;
+    ios_jit_hole_off = a; ios_jit_hole_end = b;
+    big_off = b; big_size = slot; eff_end = slot ? b + slot : 0;
+    for (i = 0; i < 450; i += 5) if (!head_alloc( 5 * MB )) return 1;
+    for (i = 0; i < 7; i++) if (!tail_alloc( 16 * MB )) return 2;
+    if (!head_alloc( 0xefc0000 )) return 3;                                         /* libcef.dll */
+    for (i = 0; i < 30; i += 3) if (!head_alloc( 3 * MB )) return 4;              /* its GPU stack */
+    if (!tail_alloc( 16 * MB ) || !tail_alloc( 16 * MB )) return 5;
+    /* what is left below the hole is all the session has: the slot moves libcef.dll
+     * out of the way, it does not make the pool bigger */
     return 0;
 }
 
@@ -253,6 +322,19 @@ int main( void )
     printf("PASS: GTA-shaped run: the 592 MB pool refuses libcef.dll, the split pool (592 + 288 MB) serves it all\n");
     model( 592 * MB, 0, 0, 300, &heads, &tails );
     printf("PASS: unsplit model, 300 runs: %zu MB head + %zu MB tail, no overlap\n", heads >> 20, tails >> 20);
+    if ((n = gta373( 0 )) != 3) FAIL("build 373 without the slot failed at step %d, not 3 (libcef.dll)\n", n);
+    if ((n = gta373( 240 * MB )) != 0) FAIL("build 373 with a 240 MB slot failed at step %d\n", n);
+    /* a slot-shaped split model: the slot behaves as part of the hole for the bump and the tail */
+    {
+        size_t a2 = 600 * MB, b2 = a2 + 8 * MB, c2 = b2 + 300 * MB;
+        eff_end = b2 + 240 * MB; big_size = 0;
+        model( c2, a2, b2, 200, &heads, &tails );
+        for (n = 0; n < nlive; n++)
+            if (live[n].off < eff_end && live[n].off + live[n].size > b2) FAIL("a small range in the slot\n");
+        eff_end = 0;
+    }
+    printf("PASS: build 373 sizes: libcef.dll fails without the big-image slot and fits with 240 MB; "
+           "nothing else lands in the slot\n");
     model( c, 64 * MB, 64 * MB + 0x4000, 100, &heads, &tails );
     model( c, c - 0x8000 - 0x4000, c - 0x8000, 100, &heads, &tails );
     printf("PASS: a 16 KB hole near either end is never handed out\n");

@@ -82,9 +82,10 @@ soft = soft[:soft.index('static unsigned ios_soft_n;') + len('static unsigned io
 # --- call sites ---------------------------------------------------------------
 alloc = native[native.index('static size_t ios_pool_alloc_range_ex('):]
 alloc = alloc[:alloc.index('\n}\n')]
-assert 'while ((i = ios_pool_best_fit( ios_pool_freelist, ios_pool_free_count, alloc_size, now,' in alloc
+freelist_loop = 'while (off == (size_t)-1 &&\n           (i = ios_pool_best_fit( ios_pool_freelist, ios_pool_free_count, alloc_size, now,'
+assert freelist_loop in alloc, 'only re-pick freed ranges while no slot has been allocated'
 assert 'i--;' not in alloc[alloc.index('ios_pool_best_fit('):], 'a dropped entry is re-picked, not skipped'
-loop = alloc[alloc.index('while ((i = ios_pool_best_fit('):]
+loop = alloc[alloc.index(freelist_loop):]
 assert loop.index('if (ios_pool_keep_big( ios_pool_freelist[i].size, alloc_size, bump_ok ))') \
     < loop.index('ios_pool_range_execable('), 'a kept range is not salvaged first'
 assert 'bump_ok = bump_cand + alloc_size <= pool_limit && IOS_POOL_IN_REACH(bump_cand);' in alloc
@@ -156,7 +157,10 @@ assert '(uint64_t)(ULONG_PTR)mbi.AllocationBase == view' in reap, 'only a view t
 print('PASS: hooks in the pool allocator, NtAllocateVirtualMemory(Ex), NtFreeVirtualMemory, reclaim and virtual_init')
 
 assert 'static let scLayout2Alias: vm_address_t = 0x7900000000' in swift
-assert swift.count('rwAliasHint()') == 3 and swift.count('!rwAliasKeep(') == 2
+swift_code = re.sub(r'//[^\n]*', '', swift)
+assert swift_code.count('rwAliasHint()') == 5 and swift_code.count('!rwAliasKeep(') == 3, \
+    'hold before pool setup, then protect the ordinary, low and split RW aliases'
+assert '_ = rwAliasHint()' in swift_code
 assert 'MadeiraConfig.gameValue("env.MADEIRA_SC_PA_POOLS") ?? MadeiraConfig.get("env.MADEIRA_SC_PA_POOLS")' in swift
 assert 'guard v.hasPrefix("2") else { return 0x7000000000 }' in swift
 print('PASS: the app moves the RW alias and holds 0x7000000000 only for env.MADEIRA_SC_PA_POOLS = 2')
@@ -496,11 +500,27 @@ int main( void )
             FAIL("a metadata slot after the V8 cage\n");
         held &= ~(1u << IOS_SC2_J2L);
         if (ios_sc2_classify( 16 * GB, 0x2fd6ce670000ull, held, e, l, cage ) != IOS_SC2_NONE) FAIL("a third metadata region\n");
-        /* Chromium 142: Blink's ProcessHeap::Init reserves Oilpan's cage (cppgc caged-heap.cc: 4 tries
-         * of 32 GB at a random 32 GB-aligned hint) BEFORE V8::Initialize -- no V8 cage yet */
+        /* Blink reserves Oilpan before V8. Build 393's random hints are
+         * 16 GB-aligned, not necessarily 32 GB-aligned. Both PA blocks must
+         * already belong to this helper; do not divert another helper's ask. */
+        if (ios_sc2_classify( 32 * GB, 0x2be400000000ull, held, e, l, cage ) != IOS_SC2_OILPAN)
+            FAIL("393 Oilpan 16 GB-aligned hint\n");
+        if (ios_sc2_classify( 32 * GB, 0xa2400000000ull, held, e, l, 1 ) != IOS_SC2_OILPAN)
+            FAIL("393 Oilpan after V8 with a 16 GB-aligned hint\n");
+        if (ios_sc2_classify( 32 * GB, 0x2be400000000ull, held, 0, l, cage ) != IOS_SC2_NONE ||
+            ios_sc2_classify( 32 * GB, 0x2be400000000ull, held, e, 0, cage ) != IOS_SC2_NONE)
+            FAIL("16 GB-aligned Oilpan without this helper's two PA blocks\n");
+        if (ios_sc2_classify( 32 * GB, 0x2be400000000ull, held | (1u << IOS_SC2_E), e, l, cage ) != IOS_SC2_NONE ||
+            ios_sc2_classify( 32 * GB, 0x2be400000000ull, held | (1u << IOS_SC2_L), e, l, cage ) != IOS_SC2_NONE)
+            FAIL("16 GB-aligned ask consumed an unassigned PA block\n");
+        if (ios_sc2_classify( 32 * GB, 0, held, e, l, cage ) != IOS_SC2_NONE ||
+            ios_sc2_classify( 32 * GB, 0x2be200000000ull, held, e, l, cage ) != IOS_SC2_NONE)
+            FAIL("zero/8 GB-aligned hint took Oilpan\n");
         k = ios_sc2_classify( 32 * GB, 0x1000000000ull, held, e, l, cage );
         if (k != IOS_SC2_OILPAN) FAIL("Oilpan before the V8 cage: %d (the old rule refused it)\n", k);
         held &= ~(1u << IOS_SC2_OILPAN);
+        if (ios_sc2_classify( 32 * GB, 0x2be400000000ull, held, e, l, cage ) != IOS_SC2_NONE)
+            FAIL("16 GB-aligned fourth block took Oilpan twice\n");
         /* cppgc's other tries / a fourth block: refused */
         if (ios_sc2_classify( 32 * GB, 0x1000000000ull, held, e, l, cage ) != IOS_SC2_REFUSE) FAIL("a fourth block\n");
         if (ios_sc2_classify( 32 * GB, 0x1000000000ull, held, e, l, 1 ) != IOS_SC2_REFUSE) FAIL("a fourth block, cage\n");
