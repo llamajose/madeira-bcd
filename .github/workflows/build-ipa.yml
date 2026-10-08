@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    # madeira-bcd: runs only in the owner's repository; a fork's run is skipped.
+    # madeira-bcd: runs only in the owner's repository and ultrasetting's fork; other forks skip it.
     if: github.repository == 'llamajose/madeira-bcd' || github.repository == 'ultrasetting/madeira-bcd'
     runs-on: macos-15
     # contents: write only so the token can see DRAFT releases, which is where
