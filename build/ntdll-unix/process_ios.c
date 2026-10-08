@@ -959,6 +959,62 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
 }
 
 #ifdef WINE_IOS
+/* Read a whole file into a malloc'd buffer; returns its size or -1. */
+static long ios_read_whole_file( const char *path, char **data )
+{
+    long size = -1;
+    FILE *f;
+
+    *data = NULL;
+    if (!(f = fopen( path, "rb" ))) return -1;
+    if (!fseek( f, 0, SEEK_END ) && (size = ftell( f )) > 0 && !fseek( f, 0, SEEK_SET ) &&
+        (*data = malloc( size )) && fread( *data, 1, size, f ) != (size_t)size)
+    {
+        free( *data );
+        *data = NULL;
+    }
+    fclose( f );
+    return *data ? size : -1;
+}
+
+/* Madeira: undo the old on-disk LuaJIT swap.
+ *
+ * Builds before the wineserver substitution (build/wineserver/luajit_compat.c)
+ * wrote the bundled GC64 lua51.dll into LOVE game folders and kept the game's
+ * own copy as lua51.dll.madeira-orig. The substitution now happens when the DLL
+ * is mapped, so put the game's file back: only when lua51.dll is byte-for-byte
+ * the bundled build, so a game update that replaced it is left alone.
+ * Remove once no installs carry the old swap. */
+static void ios_luajit_swap_restore( const char *exe_unix_name )
+{
+    char dir[4096], game_dll[4200], orig_dll[4200], ours_path[4200];
+    const char *bundle = getenv( "WINEDLLPATH" ), *slash;
+    char *ours = NULL, *theirs = NULL;
+    long ours_size, theirs_size;
+
+    if (!exe_unix_name || !bundle || !(slash = strrchr( exe_unix_name, '/' ))) return;
+    if ((size_t)(slash - exe_unix_name) >= sizeof(dir)) return;
+    memcpy( dir, exe_unix_name, slash - exe_unix_name );
+    dir[slash - exe_unix_name] = 0;
+
+    snprintf( orig_dll, sizeof(orig_dll), "%s/lua51.dll.madeira-orig", dir );
+    if (access( orig_dll, F_OK )) return;
+    snprintf( game_dll, sizeof(game_dll), "%s/lua51.dll", dir );
+    snprintf( ours_path, sizeof(ours_path), "%s/compat/love/lua51.dll", bundle );
+
+    if ((ours_size = ios_read_whole_file( ours_path, &ours )) >= 0 &&
+        (theirs_size = ios_read_whole_file( game_dll, &theirs )) == ours_size &&
+        !memcmp( ours, theirs, ours_size ))
+    {
+        if (rename( orig_dll, game_dll ))
+            ERR( "[luajit-compat] could not restore %s: %s\n", game_dll, strerror( errno ) );
+        else
+            ERR( "[luajit-compat] %s: restored the game's own lua51.dll\n", dir );
+    }
+    free( ours );
+    free( theirs );
+}
+
 /* Is the file name of `image` (any directory) `name`, a lower-case ASCII name? */
 static int ios_image_name_is( const WCHAR *image, int image_len, const char *name )
 {
@@ -1877,6 +1933,9 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
         goto done;
     }
+#ifdef WINE_IOS
+    if (pe_info.machine == IMAGE_FILE_MACHINE_AMD64) ios_luajit_swap_restore( unix_name );
+#endif
     if (!machine)
     {
         /* Owner-aware (X3): the SPAWNER's identity decides hybrid-image

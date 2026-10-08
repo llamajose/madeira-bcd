@@ -405,6 +405,9 @@ jobs:
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
+      - name: Patch wine with the winios OpenGL driver (c-gow opengl work)
+        run: git -C wine apply ../patches/wine-opengl-winios.patch
+
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
