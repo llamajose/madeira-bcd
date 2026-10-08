@@ -966,6 +966,33 @@ static void *wine_process_thread(void *arg) {
          * so the next log proves it arrived rather than leaving us to infer it. */
         setenv("FNA3D_FORCE_DRIVER", "D3D11", 0);
 
+        /* OpenGL backend for the winios GL driver (build/win32u-unix/opengl_ios.c):
+         *   zink - desktop OpenGL 3.3-4.x: Mesa OSMesa + Zink on MoltenVK, from the
+         *          bundle's gl/ folder (build/mesa-ios, build/moltenvk-ios)
+         *   gles - Apple's OpenGL ES 3.0 (EAGL); desktop-GL-only apps fail
+         * madeira.cfg `gl-backend = zink|gles` chooses; otherwise zink when its
+         * dylibs are bundled. MADEIRA_GL_BACKEND in the environment wins over both.
+         * The driver falls back to gles by itself if Zink cannot start. */
+        {
+            NSString *glDir = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"gl"];
+            BOOL haveZink = [[NSFileManager defaultManager] fileExistsAtPath:
+                                [glDir stringByAppendingPathComponent:@"libOSMesa.dylib"]];
+            char glb[16] = "";
+            if (!madeira_cfg_get("gl-backend", glb, sizeof glb) || !glb[0])
+                strlcpy(glb, haveZink ? "zink" : "gles", sizeof glb);
+            setenv("MADEIRA_GL_BACKEND", glb, 0);
+            setenv("MADEIRA_GL_DIR", glDir.UTF8String, 1);
+            LOG("OpenGL backend: %{public}s (zink bundled: %d)", getenv("MADEIRA_GL_BACKEND"), haveZink);
+
+            /* With the GLES backend there is no desktop GL context, so make LOVE ask
+             * for OpenGL ES first. LOVE 11 checks this SDL hint (read from the
+             * environment) before trying desktop GL; SDL then creates the context
+             * through WGL_EXT_create_context_es2_profile, which that backend
+             * advertises. overwrite=0: an explicit setting still wins. */
+            if (!strcmp(getenv("MADEIRA_GL_BACKEND"), "gles"))
+                setenv("LOVE_GRAPHICS_USE_OPENGLES", "1", 0);
+        }
+
         /* ml720: make Mono report unhandled exceptions and assembly-load failures.
          *
          * DIAGNOSTIC — revisit before shipping; this is chatty and costs startup time.
@@ -1014,11 +1041,34 @@ static void *wine_process_thread(void *arg) {
             if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
             aerr = nil;
+            /* A short I/O buffer. iOS's default hands the render callback about
+             * 1024 frames (~21 ms) a pass. A WASAPI client that refills one period
+             * at a time (SDL's backend writes 10 ms whenever 10 ms or less is
+             * queued) never has that much queued, so every pass came up short and
+             * the game's sound had a gap every pass (a client delivered 93.6% of its
+             * audio). 5 ms passes fit inside one period. env.MADEIRA_AUDIO_IO_MS
+             * (1..40) chooses another length; 0 keeps iOS's default. Bluetooth
+             * outputs may still use longer buffers. */
+            {
+                char iov[16] = "";
+                const char *ioe = getenv("MADEIRA_AUDIO_IO_MS");
+                if (ioe) strlcpy(iov, ioe, sizeof iov);
+                else madeira_cfg_get("env.MADEIRA_AUDIO_IO_MS", iov, sizeof iov);
+                int io_ms = 5;
+                if (iov[0] == '0' && !iov[1]) io_ms = 0;
+                else if (iov[0] && atoi(iov) >= 1 && atoi(iov) <= 40) io_ms = atoi(iov);
+                if (io_ms) {
+                    [session setPreferredIOBufferDuration:io_ms / 1000.0 error:&aerr];
+                    if (aerr) LOG("AVAudioSession setPreferredIOBufferDuration(%d ms) failed: %{public}s",
+                                  io_ms, aerr.localizedDescription.UTF8String);
+                    aerr = nil;
+                }
+            }
             [session setActive:YES error:&aerr];
             if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
-            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
-                     session.sampleRate, session.outputLatency * 1000.0);
+            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms io-buffer=%.1fms",
+                     session.sampleRate, session.outputLatency * 1000.0, session.IOBufferDuration * 1000.0);
         }
 
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
@@ -1195,6 +1245,15 @@ static void *wine_process_thread(void *arg) {
                     }
                 }
             }
+
+            /* SDL2 games: with its raw-input joystick driver on (the default),
+             * SDL skips XInput enumeration and expects every pad to show up as a
+             * HID device. Madeira's pads exist only behind the XInput API (host
+             * snapshots, no HID device), so SDL saw no controller at all --
+             * SuperTuxKart's input.xml listed the keyboard only. Turning the
+             * raw-input driver off makes SDL enumerate through XInputGetCapabilities.
+             * Set before the env file below, which can still override it. */
+            setenv("SDL_JOYSTICK_RAWINPUT", "0", 0);
 
             /* ml1062: Documents/madeira-env.txt -- one KEY=VALUE per line, exported
              * before Wine starts. FEX reads its whole configuration from FEX_*

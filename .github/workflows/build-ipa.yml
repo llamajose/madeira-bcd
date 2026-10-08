@@ -14,8 +14,8 @@ concurrency:
 
 jobs:
   build:
-    # madeira-bcd: runs only in the owner's repository; a fork's run is skipped.
-    if: github.repository == 'llamajose/madeira-bcd'
+    # madeira-bcd: runs only in the owner's repository and ultrasetting's fork; other forks skip it.
+    if: github.repository == 'llamajose/madeira-bcd' || github.repository == 'ultrasetting/madeira-bcd'
     runs-on: macos-15
     # contents: write only so the token can see DRAFT releases, which is where
     # the Metal Shader Converter installer is kept (drafts are not public).
@@ -404,6 +404,9 @@ jobs:
 
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
+
+      - name: Patch wine with the winios OpenGL driver (c-gow opengl work)
+        run: git -C wine apply ../patches/wine-opengl-winios.patch
 
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and

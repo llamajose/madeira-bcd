@@ -47,6 +47,8 @@ def check(cond, what):
 
 def body_of(src, signature):
     start = src.index(signature)
+    while ';' in src[start:src.index('{', start)]:   # skip a forward declaration
+        start = src.index(signature, start + 1)
     brace = src.index('{', start)
     depth = 0
     for i in range(brace, len(src)):

@@ -38,21 +38,21 @@ def function(source, signature):
     return source[start:source.index('\n}', start) + 2] + '\n'
 
 
-defines = native[native.index('#define X18_ROLE_NONE 0'):native.index('static int ios_insn_x18_role(uint32_t insn)')]
+defines = native[native.index('#define X18_ROLE_NONE 0'):native.index('static int ios_insn_x18_role(uint32_t insn, int stores)')]
 code = '#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n' + defines
-code += function(native, 'static int ios_insn_x18_role(uint32_t insn)')
+code += function(native, 'static int ios_insn_x18_role(uint32_t insn, int stores)')
 code += function(native, 'static int ios_x18_arith_dest(uint32_t insn, int role)')
 code += function(native, 'static uint32_t ios_insn_replace_x18(uint32_t insn, int role, int scratch)')
 code += r'''
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)
-static int dest( uint32_t insn ) { return ios_x18_arith_dest( insn, ios_insn_x18_role( insn ) ); }
+static int dest( uint32_t insn ) { return ios_x18_arith_dest( insn, ios_insn_x18_role( insn, 0 ) ); }
 static void expect( uint32_t insn, int rd, uint32_t rewritten, const char *what )
 {
     int got = dest( insn );
     if (got != rd) FAIL("%s (0x%08x): dest %d, want %d\n", what, insn, got, rd);
     if (rd >= 0)
     {
-        uint32_t r = ios_insn_replace_x18( insn, ios_insn_x18_role( insn ), rd );
+        uint32_t r = ios_insn_replace_x18( insn, ios_insn_x18_role( insn, 0 ), rd );
         if (r != rewritten) FAIL("%s: rewritten 0x%08x, want 0x%08x\n", what, r, rewritten);
     }
 }
@@ -81,6 +81,9 @@ int main( void )
     expect( 0xA9000640, -1, 0, "stp x0, x1, [x18]" );
     expect( 0xAA1203E8, -1, 0, "mov x8, x18" );
     expect( 0x91002128, -1, 0, "add x8, x9, #8 (no x18)" );
+    /* opengl32's x18 stores (stores = 1) keep the via-x18 form */
+    if (ios_insn_x18_role( 0xF90007F2, 1 ) != X18_ROLE_RT) FAIL("str x18, [sp, #8]: not X18_ROLE_RT\n");
+    if (ios_x18_arith_dest( 0xF90007F2, X18_ROLE_RT ) != -1) FAIL("str x18, [sp, #8]: taken by the ADD/SUB rule\n");
     puts( "PASS: ADD/SUB off x18 with a free destination use it; the rest keep their forms" );
     return 0;
 }
