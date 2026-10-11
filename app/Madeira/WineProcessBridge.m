@@ -295,6 +295,12 @@ static volatile int g_wine_running = 0;
  * wineserver (build/wineserver/fd_ios.c), which is running before a game's env lines
  * are set. Set after they are applied, cleared when the session ends. */
 volatile int g_madeira_srv_fgetpath = 0;
+/* madeira-bcd: the same for the server's other per-launch switches (fd_ios.c, request_ios.c;
+ * ntdll's server_ios.c reads g_madeira_srv_direct too). All off by default. */
+volatile int g_madeira_srv_eco_follow = 0;   /* env.MADEIRA_SRV_ECO_FOLLOW = 1 */
+volatile int g_madeira_srv_direct = 0;       /* env.MADEIRA_SRV_DIRECT = 1 or 2 */
+volatile int g_madeira_srv_idle_us = 0;      /* env.MADEIRA_SRV_IDLE_US = 100..50000, 0 = 1000 */
+volatile int g_madeira_srv_log_all = 0;      /* env.MADEIRA_SRV_LOG_ALL = 1 */
 
 /* Session exit report for the library front end. The app marks one process as
  * its own: the program it hands to __wine_main below, which is the session's
@@ -1266,6 +1272,21 @@ static void *wine_process_thread(void *arg) {
                     if (g_madeira_srv_fgetpath)
                         fprintf(stderr, "[madeira-env] MADEIRA_SRV_FGETPATH=1: the server names the files it opens with F_GETPATH\n");
                 }
+                {   /* madeira-bcd: the server's other per-launch switches (fd_ios.c, request_ios.c) */
+                    const char *ef = getenv("MADEIRA_SRV_ECO_FOLLOW");   /* 1: the server thread runs at utility QoS while ECO is on */
+                    const char *dr = getenv("MADEIRA_SRV_DIRECT");       /* 1 or 2: listed requests run on the calling thread */
+                    const char *iu = getenv("MADEIRA_SRV_IDLE_US");      /* the server loop's longest sleep, us (default 1000) */
+                    const char *la = getenv("MADEIRA_SRV_LOG_ALL");      /* 1: every per-descriptor server log line, as before */
+                    int idle = iu && *iu ? atoi(iu) : 0;
+                    g_madeira_srv_idle_us = idle > 0 ? idle : 0;
+                    g_madeira_srv_log_all = (la && la[0] == '1') ? 1 : 0;
+                    g_madeira_srv_eco_follow = (ef && ef[0] == '1') ? 1 : 0;
+                    g_madeira_srv_direct = (dr && (dr[0] == '1' || dr[0] == '2') && !dr[1]) ? dr[0] - '0' : 0;
+                    if (g_madeira_srv_eco_follow || g_madeira_srv_direct || g_madeira_srv_idle_us || g_madeira_srv_log_all)
+                        fprintf(stderr, "[madeira-env] server switches: MADEIRA_SRV_ECO_FOLLOW=%d MADEIRA_SRV_DIRECT=%d "
+                                "MADEIRA_SRV_IDLE_US=%d MADEIRA_SRV_LOG_ALL=%d\n", g_madeira_srv_eco_follow,
+                                g_madeira_srv_direct, g_madeira_srv_idle_us, g_madeira_srv_log_all);
+                }
                 /* Fastsync is the default sync engine: with neither inproc-sync nor
                  * env.MADEIRA_FASTSYNC in madeira.cfg, Wine gets MADEIRA_FASTSYNC=auto,
                  * the value Settings > Sync engine > Fastsync writes. Never overrides a
@@ -1927,6 +1948,11 @@ static void *wine_process_thread(void *arg) {
          * of this app run (GTA V Enhanced runs without them). */
         unsetenv("MADEIRA_UCRT_X64_MATH"); unsetenv("MADEIRA_SRV_FGETPATH");
         g_madeira_srv_fgetpath = 0;
+        /* madeira-bcd: the server's per-launch switches end with the session as well */
+        unsetenv("MADEIRA_SRV_ECO_FOLLOW"); unsetenv("MADEIRA_SRV_DIRECT");
+        unsetenv("MADEIRA_SRV_IDLE_US"); unsetenv("MADEIRA_SRV_LOG_ALL");
+        g_madeira_srv_eco_follow = 0; g_madeira_srv_direct = 0;
+        g_madeira_srv_idle_us = 0; g_madeira_srv_log_all = 0;
 
         // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
         dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");

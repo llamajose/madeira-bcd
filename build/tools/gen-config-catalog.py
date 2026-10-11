@@ -597,6 +597,51 @@ OVERLAY = {
                         "games that open many files a second (Horizon Zero Dawn's shader cache in its menu). "
                         "Off (default): realpath as before. Read at each launch; a later game of the same app run does not "
                         "inherit it."},
+    "env.MADEIRA_SRV_DIRECT": {"category": "Wine server", "title": "Run simple server requests on the calling thread",
+                "kind": "text", "default": "0",
+                "choices": [("", "Off (default)"), ("1", "Files, handles, registry, events, semaphores"),
+                            ("2", "Also waits, timers and the cursor")],
+                "sources": ["build/wineserver/request_ios.c", "build/wineserver/fd_ios.c", "build/ntdll-unix/server_ios.c"],
+                "note": "Default off. 1: the Wine server's simplest requests (opening files and their descriptors, "
+                        "closing handles, mappings looked up, registry keys and values, events, semaphores, mutexes, "
+                        "completion ports) run on the thread that asks, under the server's lock, instead of a round "
+                        "trip through a pipe to the server thread: no thread switches, and the work runs on the asking "
+                        "thread's core. 2: waits (select), timers and set_cursor too. Every other request goes through "
+                        "the pipe as before. Horizon Zero Dawn's menu sends ~7000 requests a second. Read at each launch."},
+    "env.MADEIRA_SRV_ECO_FOLLOW": {"category": "Wine server", "title": "Server thread follows ECO",
+                "kind": "bool", "default": "0",
+                "sources": ["build/wineserver/fd_ios.c", "app/Madeira/WineProcessBridge.m"],
+                "note": "Default off. 1: while ECO is on, the Wine server thread runs at utility QoS (ECO's default "
+                        "class) instead of user-interactive, so it moves to the efficiency cores with the game's "
+                        "threads, and back when ECO goes off. In Horizon Zero Dawn's menu with "
+                        "eco = 1 the server was the only thread left on a performance core (0.54 cores at ~3.9 GHz). "
+                        "Server requests may take longer. Read at each launch."},
+    "env.MADEIRA_SRV_IDLE_US": {"category": "Wine server", "title": "Server loop's longest sleep (us)",
+                "kind": "int", "default": "1000",
+                "sources": ["build/wineserver/fd_ios.c", "app/Madeira/WineProcessBridge.m"],
+                "note": "Default 1000 (1 ms, as before); 100 to 50000. Requests and timers wake the Wine server at "
+                        "once; only its socket polls and fd scans wait for this tick, so a longer one means fewer "
+                        "server wake-ups while idle (1000 a second at the default) and slower readiness of network "
+                        "sockets and pipes. Mostly useful with env.MADEIRA_SRV_DIRECT. Read at each launch."},
+    "env.MADEIRA_SRV_FD_SOCKET": {"category": "Wine server", "title": "File descriptors through the process socket",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/server_ios.c", "build/wineserver/fd_ios.c"],
+                "note": "Kill switch, default 0: a file's descriptor comes back in the server's get_handle_fd reply "
+                        "(a copy the server makes; it shares this process's descriptor table), the same descriptor "
+                        "without a sendmsg, a recvmsg, an fcntl and two server log lines per file. 1: through the "
+                        "process socket, as before. Read once per app run."},
+    "env.MADEIRA_FILE_INFO_FULL": {"category": "Wine core (ntdll)", "title": "File size queries read attributes too",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-wine-file-info-fstat.py"],
+                "note": "Kill switch, default 0: a file's size, index or end-of-file query (GetFileSizeEx and the "
+                        "like) is answered from one fstat; the two extended-attribute reads that came after it fed "
+                        "only file attributes, which these queries do not return. 1: as before. Read once per app run."},
+    "env.MADEIRA_SRV_LOG_ALL": {"category": "Wine server", "title": "Every per-descriptor server log line",
+                "kind": "bool", "default": "0",
+                "sources": ["build/wineserver/fd_ios.c", "build/wineserver/request_ios.c"],
+                "note": "Kill switch, default 0: the Wine server's add_poll_user and send_client_fd log lines (one per "
+                        "opened file or descriptor sent, each a formatted write to the log file on the server thread) "
+                        "are written for their first 64 and then every 1000th; a failed send is always written. 1: "
+                        "every line, as before. Read at each launch."},
     # madeira-bcd: ucrtbase-x64math.dll (tools/patch-wine-ucrtbase-x64-math.py, linked by WineProcessBridge.m).
     "env.MADEIRA_UCRT_X64_MATH": {"category": "Wine core (ntdll)", "title": "floor and sqrt as x64 code (ucrtbase)",
                 "kind": "bool", "default": "0",
