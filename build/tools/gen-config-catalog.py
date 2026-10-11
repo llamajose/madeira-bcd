@@ -656,6 +656,20 @@ OVERLAY = {
                         "CPU; e.g. 1500 keeps a 60 fps menu near 30-40 fps. [fps-gov] lines every 10 s. "
                         "env.MADEIRA_FPS_GOV_MIN / _MAX (20 / 60) bound the cap, _BAND_MJ (1500) is the energy the "
                         "average may drift before it moves. Needs the [xp] sampler. Read at session start."},
+    "env.MADEIRA_FPS_GOV_MAX": {"category": "Windows, display & input", "title": "Frame-cap governor: highest cap (fps)",
+                "kind": "int", "default": "60", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: the highest frame cap the governor uses, the largest of "
+                        "60, 40, 30, 24 and 20 at or below this value (20 when lower). Unset: 60. Read at session start."},
+    "env.MADEIRA_FPS_GOV_MIN": {"category": "Windows, display & input", "title": "Frame-cap governor: lowest cap (fps)",
+                "kind": "int", "default": "20", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: the lowest frame cap the governor goes down to, the "
+                        "smallest of 60, 40, 30, 24 and 20 at or above this value, never above the highest cap. "
+                        "Unset: 20. Read at session start."},
+    "env.MADEIRA_FPS_GOV_BAND_MJ": {"category": "Windows, display & input", "title": "Frame-cap governor: energy band (mJ)",
+                "kind": "int", "default": "1500", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: how much energy the running balance may drift above or "
+                        "below the target before the cap moves one step (100-100000; unset or out of range: 1500). "
+                        "Smaller moves the cap sooner and more often. Read at session start."},
     # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],
