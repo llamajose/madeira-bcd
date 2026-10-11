@@ -291,6 +291,16 @@ extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
+/* madeira-bcd: env.MADEIRA_SRV_FGETPATH of the launch in progress, read by the in-app
+ * wineserver (build/wineserver/fd_ios.c), which is running before a game's env lines
+ * are set. Set after they are applied, cleared when the session ends. */
+volatile int g_madeira_srv_fgetpath = 0;
+/* madeira-bcd: the same for the server's other per-launch switches (fd_ios.c, request_ios.c;
+ * ntdll's server_ios.c reads g_madeira_srv_direct too). All off by default. */
+volatile int g_madeira_srv_eco_follow = 0;   /* env.MADEIRA_SRV_ECO_FOLLOW = 1 */
+volatile int g_madeira_srv_direct = 0;       /* env.MADEIRA_SRV_DIRECT = 1 or 2 */
+volatile int g_madeira_srv_idle_us = 0;      /* env.MADEIRA_SRV_IDLE_US = 100..50000, 0 = 1000 */
+volatile int g_madeira_srv_log_all = 0;      /* env.MADEIRA_SRV_LOG_ALL = 1 */
 
 /* Session exit report for the library front end. The app marks one process as
  * its own: the program it hands to __wine_main below, which is the session's
@@ -819,6 +829,17 @@ static void madeira_publish_host_probe(void)
         { "SHA",     "hw.optional.arm.FEAT_SHA256" },
         { "CRC",     "hw.optional.armv8_crc32" },
         { "ATOMICS", "hw.optional.arm.FEAT_LSE" },
+        /* madeira-bcd: reported, not yet used by either module: which of FEX's other
+         * host features this device has (FRINTTS, CSSC, RPRES, MOPS, ECV, WFXT), and
+         * LSE2/LRCPC3 for its TSO code (which unaligned atomics trap; vector imm9). */
+        { "LSE2",    "hw.optional.arm.FEAT_LSE2" },
+        { "LRCPC3",  "hw.optional.arm.FEAT_LRCPC3" },
+        { "FRINTTS", "hw.optional.arm.FEAT_FRINTTS" },
+        { "RPRES",   "hw.optional.arm.FEAT_RPRES" },
+        { "CSSC",    "hw.optional.arm.FEAT_CSSC" },
+        { "MOPS",    "hw.optional.arm.FEAT_MOPS" },
+        { "ECV",     "hw.optional.arm.FEAT_ECV" },
+        { "WFXT",    "hw.optional.arm.FEAT_WFxT" },
     };
     char buf[256];
     size_t len = 0;
@@ -1256,6 +1277,27 @@ static void *wine_process_thread(void *arg) {
                     LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
+                {   /* madeira-bcd: for the wineserver (g_madeira_srv_fgetpath) */
+                    const char *fp = getenv("MADEIRA_SRV_FGETPATH");
+                    g_madeira_srv_fgetpath = (fp && fp[0] == '1') ? 1 : 0;
+                    if (g_madeira_srv_fgetpath)
+                        fprintf(stderr, "[madeira-env] MADEIRA_SRV_FGETPATH=1: the server names the files it opens with F_GETPATH\n");
+                }
+                {   /* madeira-bcd: the server's other per-launch switches (fd_ios.c, request_ios.c) */
+                    const char *ef = getenv("MADEIRA_SRV_ECO_FOLLOW");   /* 1: the server thread runs at utility QoS while ECO is on */
+                    const char *dr = getenv("MADEIRA_SRV_DIRECT");       /* 1 or 2: listed requests run on the calling thread */
+                    const char *iu = getenv("MADEIRA_SRV_IDLE_US");      /* the server loop's longest sleep, us (default 1000) */
+                    const char *la = getenv("MADEIRA_SRV_LOG_ALL");      /* 1: every per-descriptor server log line, as before */
+                    int idle = iu && *iu ? atoi(iu) : 0;
+                    g_madeira_srv_idle_us = idle > 0 ? idle : 0;
+                    g_madeira_srv_log_all = (la && la[0] == '1') ? 1 : 0;
+                    g_madeira_srv_eco_follow = (ef && ef[0] == '1') ? 1 : 0;
+                    g_madeira_srv_direct = (dr && (dr[0] == '1' || dr[0] == '2') && !dr[1]) ? dr[0] - '0' : 0;
+                    if (g_madeira_srv_eco_follow || g_madeira_srv_direct || g_madeira_srv_idle_us || g_madeira_srv_log_all)
+                        fprintf(stderr, "[madeira-env] server switches: MADEIRA_SRV_ECO_FOLLOW=%d MADEIRA_SRV_DIRECT=%d "
+                                "MADEIRA_SRV_IDLE_US=%d MADEIRA_SRV_LOG_ALL=%d\n", g_madeira_srv_eco_follow,
+                                g_madeira_srv_direct, g_madeira_srv_idle_us, g_madeira_srv_log_all);
+                }
                 /* Fastsync is the default sync engine: with neither inproc-sync nor
                  * env.MADEIRA_FASTSYNC in madeira.cfg, Wine gets MADEIRA_FASTSYNC=auto,
                  * the value Settings > Sync engine > Fastsync writes. Never overrides a
@@ -1513,6 +1555,66 @@ static void *wine_process_thread(void *arg) {
                     } else {
                         dprintf(STDERR_FILENO, "[WineProc] MADEIRA_D3D11_SRC=1 but this build has no d3d11-src.dll -- upstream's d3d11.dll stays\n");
                     }
+                }
+            }
+
+            /* madeira-bcd: env.MADEIRA_UCRT_X64_MATH = 1 (the game's own file) runs
+             * ucrtbase-x64math.dll as ucrtbase.dll: Wine's ucrtbase built from the
+             * submodule with tools/patch-wine-ucrtbase-x64-math.py, whose floor and
+             * sqrt exports are x64 code, so an x64 caller stays in the emulator
+             * instead of crossing to the native body and back. Horizon Zero Dawn
+             * (build 492) makes 2-4 million such calls a second, about half of all
+             * its x64->ARM64EC calls. Off by default: every other game keeps the
+             * shipped ucrtbase.dll, and dropping the line restores it at the next
+             * start (the farms above are relinked from the bundle every session).
+             * ARM64EC sessions only, linked like xtajit64-avx.dll. */
+            {
+                const char *ucrtX64 = getenv("MADEIRA_UCRT_X64_MATH");
+                if (use_arm64ec && ucrtX64 && ucrtX64[0] == '1') {
+                    NSString *mathDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
+                                         stringByAppendingPathComponent:@"ucrtbase-x64math.dll"];
+                    if ([fm fileExistsAtPath:mathDll]) {
+                        for (NSString *dir in @[ sys32Dir, [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"] ]) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"ucrtbase.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:mathDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_UCRT_X64_MATH=1: ucrtbase.dll -> ucrtbase-x64math.dll (floor and sqrt as x64 code for x64 callers)\n");
+                    } else {
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_UCRT_X64_MATH=1 but this build has no ucrtbase-x64math.dll -- the shipped ucrtbase.dll stays\n");
+                    }
+                }
+            }
+
+            /* madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py, built by
+             * tools/build-wine-extra-dlls.sh next to the shipped ntdll.dll) is the
+             * ARM64EC ntdll the unix loader maps when env.MADEIRA_NTDLL_SYNC = 1 or
+             * native (build/ntdll-unix/loader_ios.c, ios_ec_ntdll_name): the same
+             * SRW locks and critical sections, cheaper. Off by default since build
+             * 499 (on 498 every 64-bit game died at start; see loader_ios.c). Wine
+             * names it C:\windows\system32\ntdll.dll, so that link (ARM64EC sessions)
+             * and sysx64's (x64 children) name the same file: a program reading
+             * ntdll.dll from disk sees what runs. Unset or 0 keeps the shipped
+             * ntdll.dll for both; the farms above are relinked from the bundle
+             * every session. */
+            {
+                const char *ntSync = getenv("MADEIRA_NTDLL_SYNC");
+                BOOL ntSyncOn = ntSync && ((ntSync[0] == '1' && !ntSync[1]) || !strcmp(ntSync, "native"));
+                NSString *syncDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
+                                     stringByAppendingPathComponent:@"ntdll-sync.dll"];
+                if (ntSyncOn && [fm fileExistsAtPath:syncDll]) {
+                    NSMutableArray *dirs = [NSMutableArray arrayWithObject:
+                        [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+                    if (use_arm64ec) [dirs addObject:sys32Dir];
+                    for (NSString *dir in dirs) {
+                        NSString *dst = [dir stringByAppendingPathComponent:@"ntdll.dll"];
+                        [fm removeItemAtPath:dst error:nil];
+                        [fm createSymbolicLinkAtPath:dst withDestinationPath:syncDll error:nil];
+                    }
+                    dprintf(STDERR_FILENO, "[WineProc] ntdll.dll -> ntdll-sync.dll (opt-in MADEIRA_NTDLL_SYNC=%s; %s)\n",
+                            ntSync, use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                } else if (ntSyncOn) {
+                    dprintf(STDERR_FILENO, "[WineProc] MADEIRA_NTDLL_SYNC=%s but this build has no ntdll-sync.dll: the shipped ntdll.dll\n", ntSync);
                 }
             }
 
@@ -1885,6 +1987,16 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
         unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
         unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
+        /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
+         * of this app run (GTA V Enhanced runs without them). */
+        unsetenv("MADEIRA_UCRT_X64_MATH"); unsetenv("MADEIRA_SRV_FGETPATH");
+        unsetenv("MADEIRA_NTDLL_SYNC");   /* madeira-bcd: a game's switch is its own */
+        g_madeira_srv_fgetpath = 0;
+        /* madeira-bcd: the server's per-launch switches end with the session as well */
+        unsetenv("MADEIRA_SRV_ECO_FOLLOW"); unsetenv("MADEIRA_SRV_DIRECT");
+        unsetenv("MADEIRA_SRV_IDLE_US"); unsetenv("MADEIRA_SRV_LOG_ALL");
+        g_madeira_srv_eco_follow = 0; g_madeira_srv_direct = 0;
+        g_madeira_srv_idle_us = 0; g_madeira_srv_log_all = 0;
 
         // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
         dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");

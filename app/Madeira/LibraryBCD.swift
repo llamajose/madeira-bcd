@@ -18,6 +18,7 @@ import UIKit
 
 extension Notification.Name {
     /// Posted by the developer interface: show madeira-bcd's home screen (RootView).
+    /// madeira-bcd FORK-ONLY (HomeView.swift).
     static let madeiraShowBCDHome = Notification.Name("madeiraShowBCDHome")
 }
 
@@ -243,6 +244,7 @@ struct BCDGameSections: View {
 }
 
 /// Settings › Interface: which screen Madeira starts with.
+/// madeira-bcd FORK-ONLY: upstream has no "madeira-bcd home" choice (HomeView.swift).
 struct BCDInterfacePicker: View {
     @State private var choice = FrontendChoice.preferred
     @State private var restartNotice = false

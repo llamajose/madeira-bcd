@@ -64,6 +64,8 @@ extension GameRecommendations {
     }
 
     /// A madeira-bcd home screen game (its program's path), before its settings or a start.
+    /// madeira-bcd FORK-ONLY: the home screen's entry points here (prepare, libraryLines,
+    /// reset(windowsPath:title:), note's `home`) stay out of a pull request to upstream.
     static func prepare(windowsPath: String, title: String) {
         guard let found = due(windowsPath, steamAppID: nil, ownLines: libraryLines(for: windowsPath), title: title) else { return }
         put(found.rec, to: windowsPath, found.kind, title: title)
@@ -97,7 +99,7 @@ extension GameRecommendations {
     }
 
     /// The madeira-bcd home screen's Reset to Recommended; the library entry for the same
-    /// program takes the list's fields too.
+    /// program takes the list's fields too. madeira-bcd FORK-ONLY (see prepare).
     @discardableResult
     static func reset(windowsPath: String, title: String) -> GameRecommendation? {
         guard let rec = recommendation(windowsPath: windowsPath, steamAppID: nil) else { clear(windowsPath, title: title); return nil }

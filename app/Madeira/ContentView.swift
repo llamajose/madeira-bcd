@@ -1325,6 +1325,7 @@ struct ContentView: View {
 
     /// Set by the library (HomeView): what to start as soon as this view is up.
     /// nil means the developer panel, which starts nothing on its own.
+    /// madeira-bcd FORK-ONLY: the home screen's way in (HomeView.swift).
     let pendingLaunch: LaunchRequest?
 
     init(pendingLaunch: LaunchRequest? = nil) {
@@ -2379,7 +2380,7 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .tint(.indigo)
 
-                // madeira-bcd: this fork's own home screen, right away (RootView).
+                // madeira-bcd FORK-ONLY: this fork's own home screen, right away (RootView).
                 Button("madeira-bcd Home") {
                     NotificationCenter.default.post(name: .madeiraShowBCDHome, object: nil)
                 }

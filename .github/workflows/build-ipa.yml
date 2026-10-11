@@ -362,6 +362,11 @@ jobs:
           python3 tests/host/check-app-local-dll.py
           python3 tools/patch-wine-app-local-dll.py wine/dlls/ntdll/unix/file.c
 
+      # madeira-bcd: GetFileSizeEx and the other size/index/end-of-file queries from one
+      # fstat instead of fstat + two xattr reads (env.MADEIRA_FILE_INFO_FULL=1 undoes it).
+      - name: Patch wine with size queries from one fstat
+        run: python3 tools/patch-wine-file-info-fstat.py wine/dlls/ntdll/unix/file.c
+
       - name: Check opt-in graphics DLL lifetime
         run: python3 tests/host/check-graphics-pin.py
 
@@ -424,6 +429,12 @@ jobs:
         run: |
           python3 tests/host/check-lock-orphan.py
           python3 tools/patch-wine-lock-orphan.py wine/dlls/ntdll/unix/sync.c
+
+      # madeira-bcd: madeira.cfg yield-mode (opt-in): the yield primitive behind
+      # SwitchToThread / Sleep(0) (switch or a bounded depress instead of
+      # swtch_pri). Unset, nothing changes. Checked by "Check yield-mode".
+      - name: Patch wine with the opt-in yield mode
+        run: python3 tools/patch-wine-yield-mode.py wine/dlls/ntdll/unix/sync.c
 
       # madeira.cfg avail-phys = 1 (opt-in): GlobalMemoryStatusEx's available
       # physical memory is what remains before this app's memory limit, so
@@ -1107,6 +1118,15 @@ jobs:
       - name: Patch winemetal pipeline cache warm-up
         run: python3 tools/patch-winemetal-pso-warm.py
 
+      # madeira-d3d12's shader cache files, read and written natively
+      # (MadeiraCtl ops 20-22) instead of through Wine's file API, which cost a
+      # create_file, get_handle_fd and close_handle request and a server
+      # realpath() per entry (Horizon Zero Dawn's menu: ~1,000 a second at
+      # ~3.5 ms each). The same files; madeira.cfg shader-cache-native = 0
+      # keeps Wine's file calls. Native only.
+      - name: Patch winemetal native shader-cache access
+        run: python3 tools/patch-winemetal-sc-native.py
+
       # Metal aborts on a mesh pipeline with rasterization on and no fragment
       # function; D3D allows a pipeline with no pixel shader. Horizon Zero
       # Dawn's vertex + geometry shader pipelines killed its pipeline thread
@@ -1144,6 +1164,29 @@ jobs:
       - name: Patch winemetal GPU trace and render-pass experiment
         run: python3 tools/patch-winemetal-gpu-trace.py
 
+      # A render pass filled all eight colour attachments of its descriptor
+      # (~240 Objective-C messages and 8 allocations a pass); only the slots
+      # with a texture are filled now, the same pass for Metal. madeira.cfg /
+      # a game's config rp-lean = 0 restores the full loop. Native only.
+      - name: Patch winemetal lean render-pass descriptors
+        run: python3 tools/patch-winemetal-rp-lean.py
+
+      # madeira-bcd fps-gov (opt-in, env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW):
+      # DXMT's presents wait for the governor's frame cap (server_ios.c
+      # ios_fps_cap_dxmt_pace); unarmed it returns at once. Native only.
+      - name: Patch winemetal frame cap for the power governor
+        run: python3 tools/patch-winemetal-fps-cap.py
+
+      # On Apple's tile-based GPU every attachment a pass stores is a whole pass
+      # over that surface in memory. With madeira.cfg / a game's config
+      # rp-discard = 1, madeira-d3d12 leaves the store actions of a pass whose
+      # texture the game discards open (Unknown) and sets them when the pass
+      # ends: no store when the next use is a DiscardResource or a whole
+      # clear. MadeiraCtl op 24 sets them; unused unless the switch is on.
+      # Native only.
+      - name: Patch winemetal late render-pass store actions
+        run: python3 tools/patch-winemetal-rp-store.py
+
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
       # commit. Cached per wine/DXMT revision; a failure only leaves 32-bit
@@ -1177,6 +1220,13 @@ jobs:
         with:
           path: app/Madeira/i386-windows
           key: ${{ steps.i386rev.outputs.key }}
+
+      # madeira-bcd FORK-ONLY (owner's decision, 2026-10-11): never part of a pull request to
+      # upstream. The D3D9 (i386, into the farm above, after its cache is saved) and D3D11
+      # (x86-64) smoke tests the home screen's "Test programs" start (bcd-smoke/).
+      - name: Build the fork-only smoke tests (bcd-smoke)
+        if: env.MINGW_OK == '1'
+        run: bash bcd-smoke/build.sh
 
       - name: Build dxmt-ios
         shell: bash
@@ -1283,6 +1333,120 @@ jobs:
       - name: Check static-cbv
         run: python3 tests/host/check-static-cbv.py
 
+      # madeira-bcd: ucrtbase-x64math.dll (env.MADEIRA_UCRT_X64_MATH): floor and sqrt as x64 code.
+      - name: Check ucrt-x64-math
+        run: python3 tests/host/check-ucrt-x64-math.py
+
+      # madeira-bcd: quiet-log (madeira-d3d12) and MADEIRA_SRV_FGETPATH (wineserver).
+      - name: Check quiet-log
+        run: python3 tests/host/check-quiet-log.py
+
+      # madeira-bcd: shader-cache-native (madeira-d3d12 + winemetal): the shader cache's files without Wine's file API.
+      - name: Check sc-native
+        run: python3 tests/host/check-sc-native.py
+
+      # madeira-bcd: encode-batch (one encodeCommands call per encoder), draw-dedup
+      # (no repeated render state) and rp-lean (winemetal fills only used targets).
+      - name: Check encode-batch
+        run: python3 tests/host/check-encode-batch.py
+
+      - name: Check draw-dedup
+        run: python3 tests/host/check-draw-dedup.py
+
+      - name: Check rp-lean
+        run: python3 tests/host/check-rp-lean.py
+
+      # madeira-bcd: addr-scan (GPU-address lookups stop where nothing earlier reaches).
+      - name: Check addr-scan
+        run: python3 tests/host/check-addr-scan.py
+
+      # madeira-bcd: get_handle_fd's descriptor in the reply and sampled per-descriptor
+      # server log lines (on by default; MADEIRA_SRV_FD_SOCKET / MADEIRA_SRV_LOG_ALL undo them).
+      - name: Check srv-fd-reply
+        run: python3 tests/host/check-srv-fd-reply.py
+
+      # madeira-bcd: opt-in direct wineserver requests (env.MADEIRA_SRV_DIRECT).
+      - name: Check srv-direct
+        run: python3 tests/host/check-srv-direct.py
+
+      # madeira-bcd: opt-in server thread QoS following ECO and the server loop's idle tick
+      # (env.MADEIRA_SRV_ECO_FOLLOW, env.MADEIRA_SRV_IDLE_US).
+      - name: Check srv-eco-follow
+        run: python3 tests/host/check-srv-eco-follow.py
+
+      # madeira-bcd: size/index/end-of-file queries from one fstat (patched above, before ntdll-unix).
+      - name: Check file-info-fstat
+        run: python3 tests/host/check-file-info-fstat.py
+
+      # madeira-bcd: env.MADEIRA_LEAN_DIAG (opt-in): no thread-suspending samplers, rare memory walks.
+      - name: Check lean-diag
+        run: python3 tests/host/check-lean-diag.py
+
+      # madeira-bcd: env.MADEIRA_ECO_NATIVE (opt-in): the runtime's helper threads at utility QoS.
+      - name: Check eco-native
+        run: python3 tests/host/check-eco-native.py
+
+      # madeira-bcd: the frame-cap power governor (opt-in: env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW).
+      - name: Check fps-gov
+        run: python3 tests/host/check-fps-gov.py
+
+      # madeira-bcd: env.MADEIRA_POWER_PROBE (opt-in): GPU, SoC and device power next to [xp].
+      - name: Check power-probe
+        run: python3 tests/host/check-power-probe.py
+
+      # madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py), opt-in since build 499
+      # (env.MADEIRA_NTDLL_SYNC = 1 maps it): cheaper SRW locks and critical sections.
+      - name: Check ntdll-sync
+        run: python3 tests/host/check-ntdll-sync.py
+
+      # madeira-bcd: the Mach handler repairs a TEB access whose base an ADD computed from a
+      # zeroed x18, also when the ADD wrote its own index register (HZD build 500).
+      - name: Check x18-derived base
+        run: python3 tests/host/check-x18-derived-base.py
+
+      # madeira-bcd: madeira.cfg yield-mode (tools/patch-wine-yield-mode.py), opt-in.
+      - name: Check yield-mode
+        run: python3 tests/host/check-yield-mode.py
+
+      # madeira-bcd: render-pass traffic (gpu-traffic counters, clear-defer;
+      # opt-in rp-carry, rp-discard and its winemetal op 24, f6-rar).
+      - name: Check render-pass traffic
+        run: python3 tests/host/check-render-pass-traffic.py
+
+      # madeira-bcd: the ARM64EC JIT no longer maintains the call-ret shadow stack nothing reads on iOS
+      # (MADEIRA_FEX_CALLRET_ELIDE=0 keeps it).
+      - name: Check fex-callret-elide
+        run: python3 tests/host/check-fex-callret-elide.py
+
+      # madeira-bcd: guest calls into ARM64EC code leave the JIT with BLR and their returns re-enter it with
+      # RET after an L1 probe (MADEIRA_FEX_EC_RET=0 keeps BR and the loop-top re-entry).
+      - name: Check fex-ec-ret
+        run: python3 tests/host/check-fex-ec-ret.py
+
+      # madeira-bcd: the dispatcher's EC code check loads PEB->EcCodeBitMap from the thread's frame
+      # (MADEIRA_FEX_EC_BITMAP_CACHE=0 keeps the TEB/PEB walk).
+      - name: Check fex-ec-bitmap-cache
+        run: python3 tests/host/check-fex-ec-bitmap-cache.py
+
+      # madeira-bcd: JIT exits into ARM64EC code go through ExitFunctionECJit when AFP is off
+      # (MADEIRA_FEX_EC_EXIT_LEAN=0 keeps ExitFunctionEC).
+      - name: Check fex-ec-exit-lean
+        run: python3 tests/host/check-fex-ec-exit-lean.py
+
+      # madeira-bcd: IosJitReverseTranslate answers addresses outside every JIT copy without walking the table.
+      - name: Check fex-alias-xlate-bounds
+        run: python3 tests/host/check-fex-alias-xlate-bounds.py
+
+      # madeira-bcd: RetToEntryThunk enters the JIT without its own EC code bitmap test
+      # (MADEIRA_FEX_EC_RET_DIRECT=0 keeps it).
+      - name: Check fex-ec-ret-direct
+        run: python3 tests/host/check-fex-ec-ret-direct.py
+
+      # madeira-bcd: FEX_MADEIRA_HOSTPROBE also reports LSE2, LRCPC3, FRINTTS, RPRES, CSSC, MOPS,
+      # ECV and WFXT; FEX's parsers must keep reading every key exactly as published.
+      - name: Check FEX host probe
+        run: python3 tests/host/check-fex-hostprobe.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
@@ -1382,6 +1546,16 @@ jobs:
               raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
           if b'smc-store-fastpath-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC SMC store fast-path module was not built; refusing the fallback IPA')
+          if b'callret-elide-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC call-ret elision module was not built; refusing the fallback IPA')
+          if b'ec-ret-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC EC-return module was not built; refusing the fallback IPA')
+          if b'ec-bitmap-cache-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC EC-bitmap cache module was not built; refusing the fallback IPA')
+          if b'ec-exit-lean-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC lean JIT exit module was not built; refusing the fallback IPA')
+          if b'ec-ret-direct-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC direct return module was not built; refusing the fallback IPA')
           print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
@@ -1394,6 +1568,23 @@ jobs:
             echo "::notice::d3d11-src.dll present ($(wc -c < app/Madeira/arm64ec-windows/d3d11-src.dll | tr -d ' ') bytes): env.MADEIRA_D3D11_SRC = 1 selects it"
           else
             echo "::warning::d3d11-src.dll missing: this IPA has only upstream's d3d11.dll (no SwapDeviceContextState); env.MADEIRA_D3D11_SRC = 1 does nothing"
+          fi
+          # And tools/build-wine-extra-dlls.sh's ucrtbase-x64math.dll
+          # (env.MADEIRA_UCRT_X64_MATH): never ship one whose four exports are
+          # not the x64 bodies.
+          if [ -f app/Madeira/arm64ec-windows/ucrtbase-x64math.dll ]; then
+            python3 tools/patch-wine-ucrtbase-x64-math.py --verify app/Madeira/arm64ec-windows/ucrtbase-x64math.dll
+          else
+            echo "::warning::ucrtbase-x64math.dll missing: env.MADEIRA_UCRT_X64_MATH = 1 does nothing in this IPA"
+          fi
+          # And its ntdll-sync.dll, which the unix loader maps by default: never
+          # ship one whose SRW and critical-section exports are not the x64 bodies
+          # or whose exports are not the shipped ntdll.dll's plus madeira_sync_x64_off.
+          if [ -f app/Madeira/arm64ec-windows/ntdll-sync.dll ]; then
+            python3 tools/patch-wine-ntdll-sync.py --verify app/Madeira/arm64ec-windows/ntdll-sync.dll \
+              app/Madeira/arm64ec-windows/ntdll.dll
+          else
+            echo "::warning::ntdll-sync.dll missing: every game maps the shipped ntdll.dll"
           fi
 
       # tools/fetch-vcruntime.md: the VC++ runtime DLLs (twelve, and since
