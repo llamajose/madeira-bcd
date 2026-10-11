@@ -485,8 +485,9 @@ static void call_req_handler( struct thread *thread )
  * descriptors, mappings looked up, registry keys and values, events, semaphores, mutexes and
  * completion ports. Level 2 adds select (a wait that cannot finish at once returns
  * STATUS_PENDING as before, and its wake-up still arrives on the thread's wait pipe from
- * whoever satisfies it) and the timer requests; a timer due before the sleeping loop wakes
- * has the request wake it (fd_ios.c add_timeout_user). Thread and process lifetime,
+ * whoever satisfies it), the timer requests and set_cursor (GTA V Enhanced sent up to
+ * ~10,000 a second); a timer due before the sleeping loop wakes has the request wake it
+ * (fd_ios.c add_timeout_user). Thread and process lifetime,
  * suspension, contexts, APC queuing, asynchronous I/O and window messages keep the pipe.
  * A request that cannot run here (the switch went off, the loop is not running, the thread
  * is not fully connected or is not the caller) goes through the pipe as before; one that
@@ -541,6 +542,7 @@ static int ios_srv_direct_level( enum request req )
     case REQ_set_timer:
     case REQ_cancel_timer:
     case REQ_get_timer_info:
+    case REQ_set_cursor:
         return 2;
     default:
         return 0;

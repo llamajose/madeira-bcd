@@ -497,8 +497,9 @@ check(not any(n in names for n in never), "no thread/process lifetime, suspensio
 check({"REQ_create_file", "REQ_get_handle_fd", "REQ_close_handle", "REQ_open_mapping", "REQ_remove_completion",
        "REQ_release_semaphore", "REQ_event_op"} <= set(listed1),
       "level 1 covers the requests the HZD census ranks highest (file, descriptor, close, mapping, completion, semaphore, event)")
-check(set(listed2) == {"REQ_select", "REQ_create_timer", "REQ_open_timer", "REQ_set_timer", "REQ_cancel_timer", "REQ_get_timer_info"},
-      "level 2 adds select and the timer requests only")
+check(set(listed2) == {"REQ_select", "REQ_create_timer", "REQ_open_timer", "REQ_set_timer", "REQ_cancel_timer",
+                       "REQ_get_timer_info", "REQ_set_cursor"},
+      "level 2 adds select, the timer requests and set_cursor only")
 check("thread->teb != teb" in call and "thread->req_toread" in call and "thread->reply_towrite" in call,
       "the thread must be the caller (TEB) with no request half read and no reply half written")
 check(call.find("set_current_time();") < call.find("ios_srv_run_direct( thread, &reply, reply_data );"),

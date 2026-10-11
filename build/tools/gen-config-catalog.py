@@ -563,14 +563,14 @@ OVERLAY = {
     "env.MADEIRA_SRV_DIRECT": {"category": "Wine server", "title": "Run simple server requests on the calling thread",
                 "kind": "text", "default": "0",
                 "choices": [("", "Off (default)"), ("1", "Files, handles, registry, events, semaphores"),
-                            ("2", "Also waits and timers")],
+                            ("2", "Also waits, timers and the cursor")],
                 "sources": ["build/wineserver/request_ios.c", "build/wineserver/fd_ios.c", "build/ntdll-unix/server_ios.c"],
                 "note": "Default off. 1: the Wine server's simplest requests (opening files and their descriptors, "
                         "closing handles, mappings looked up, registry keys and values, events, semaphores, mutexes, "
                         "completion ports) run on the thread that asks, under the server's lock, instead of a round "
                         "trip through a pipe to the server thread: no thread switches, and the work runs on the asking "
-                        "thread's core. 2: waits (select) and timers too. Every other request goes through the pipe as "
-                        "before. Horizon Zero Dawn's menu sends ~7000 requests a second. Read at each launch."},
+                        "thread's core. 2: waits (select), timers and set_cursor too. Every other request goes through "
+                        "the pipe as before. Horizon Zero Dawn's menu sends ~7000 requests a second. Read at each launch."},
     "env.MADEIRA_SRV_ECO_FOLLOW": {"category": "Wine server", "title": "Server thread follows ECO",
                 "kind": "bool", "default": "0",
                 "sources": ["build/wineserver/fd_ios.c", "app/Madeira/WineProcessBridge.m"],
