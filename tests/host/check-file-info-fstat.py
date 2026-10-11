@@ -176,6 +176,9 @@ with tempfile.TemporaryDirectory() as t:
     cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
     if real_src and cc:
         pieces = []
+        xe = func_body(real_src, "static BOOL xattr_exists( const char **path, int *filedes, const char *name )")
+        check(bool(xe), "extracted: static BOOL xattr_exists (the Apple pre-check)")
+        pieces.append("#ifdef __APPLE__\n" + xe + "\n#endif")
         for sig in ("static inline ULONG get_file_attributes( const struct stat *st )",
                     "static int parse_samba_dos_attrib_data( char *data, int len )",
                     "static BOOL fd_is_mount_point( int fd, const struct stat *st )",
@@ -197,6 +200,12 @@ with tempfile.TemporaryDirectory() as t:
 #include <unistd.h>
 #define HAVE_SYS_XATTR_H 1
 #define WINE_IOS 1
+#ifdef __APPLE__
+#define XATTR_ADDITIONAL_OPTIONS 1   /* fgetxattr/fsetxattr take position and options here */
+#define FSETX( fd, n, v, s ) fsetxattr( fd, n, v, s, 0, 0 )
+#else
+#define FSETX( fd, n, v, s ) fsetxattr( fd, n, v, s, 0 )
+#endif
 typedef void *HANDLE;
 typedef unsigned int ULONG;
 typedef int BOOL;
@@ -245,7 +254,7 @@ int main( int argc, char **argv )
     snprintf( path, sizeof(path), "%s/empty", dir ); f2 = open( path, O_CREAT | O_RDWR, 0444 );
     snprintf( path, sizeof(path), "%s/sub", dir ); mkdir( path, 0755 ); d1 = open( path, O_RDONLY | O_DIRECTORY );
     d2 = open( dir, O_RDONLY | O_DIRECTORY );
-    xattrs = !fsetxattr( f1, SAMBA_XATTR_DOS_ATTRIB, "0x2", 3, 0 ) && !fsetxattr( d1, XATTR_REPARSE, "\x03\x00\x00\xa0", 4, 0 );
+    xattrs = !FSETX( f1, SAMBA_XATTR_DOS_ATTRIB, "0x2", 3 ) && !FSETX( d1, XATTR_REPARSE, "\x03\x00\x00\xa0", 4 );
     closed = dup( f1 ); close( closed );
     if (argc > 1)   /* MADEIRA_FILE_INFO_FULL=1: it is fd_get_file_info */
     {
