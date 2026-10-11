@@ -1296,6 +1296,11 @@ jobs:
       - name: Check fex-callret-elide
         run: python3 tests/host/check-fex-callret-elide.py
 
+      # madeira-bcd: guest calls into ARM64EC code leave the JIT with BLR and their returns re-enter it with
+      # RET after an L1 probe (MADEIRA_FEX_EC_RET=0 keeps BR and the loop-top re-entry).
+      - name: Check fex-ec-ret
+        run: python3 tests/host/check-fex-ec-ret.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
@@ -1397,6 +1402,8 @@ jobs:
               raise SystemExit('Required ARM64EC SMC store fast-path module was not built; refusing the fallback IPA')
           if b'callret-elide-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC call-ret elision module was not built; refusing the fallback IPA')
+          if b'ec-ret-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC EC-return module was not built; refusing the fallback IPA')
           print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
