@@ -212,7 +212,7 @@ PY
            ntdll_ship "$SHIP/ntdll-sync.dll.tmp" &&
            python3 "$R/tools/patch-wine-ntdll-sync.py" --verify "$SHIP/ntdll-sync.dll.tmp" "$SHIP/ntdll.dll"; then
             mv "$SHIP/ntdll-sync.dll.tmp" "$SHIP/ntdll-sync.dll"
-            echo "::notice::ntdll-sync.dll (cheaper SRW locks and critical sections, mapped unless env.MADEIRA_NTDLL_SYNC = 0): built next to the shipped ntdll.dll"
+            echo "::notice::ntdll-sync.dll (cheaper SRW locks and critical sections; opt-in, mapped only with env.MADEIRA_NTDLL_SYNC = 1 or native): built next to the shipped ntdll.dll"
         else
             rm -f "$SHIP/ntdll-sync.dll.tmp"
             echo "::warning::ntdll-sync.dll did not build or failed its check; not shipped (games map the shipped ntdll.dll)"
