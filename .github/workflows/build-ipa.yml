@@ -1390,6 +1390,8 @@ jobs:
               raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
           if b'smc-store-fastpath-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC SMC store fast-path module was not built; refusing the fallback IPA')
+          if b'callret-elide-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC call-ret elision module was not built; refusing the fallback IPA')
           print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
