@@ -211,13 +211,21 @@ static int ios_current_fd_socket(void)
     return (i >= 0) ? ios_proc_sockets[i].fd : fd_socket;
 }
 
+int ios_peb_is_dead( const void *peb );
+
 /* Per-process process_exiting flag (used by NtTerminateProcess). A global
  * flag poisons every OTHER pseudo-process's exit path once the first one
- * dies (they skip their self-terminate and the server never hears). */
+ * dies (they skip their self-terminate and the server never hears).
+ * madeira-bcd: a thread of a child that has already exited (slot gone, PEB in
+ * ios_dead_pebs) is exiting too; without this it read the session's flag and
+ * asked the server again about a process the server had already ended. */
 BOOL *ios_process_exiting_ptr(void)
 {
+    static BOOL dead_child_exiting = TRUE;
     int i = ios_proc_socket_index();
-    return (i >= 0) ? &ios_proc_sockets[i].exiting : &process_exiting;
+    if (i >= 0) return &ios_proc_sockets[i].exiting;
+    if (ios_peb_is_dead( ios_jit_current_peb() )) return &dead_child_exiting;
+    return &process_exiting;
 }
 
 /* ─── ml586 fd-ownership trace ────────────────────────────────────────────
@@ -4885,6 +4893,26 @@ void process_exit_wrapper( int status )
             ios_exe_win_mark_ready( dead_peb );
         }
     }
+    else if (ios_peb_is_dead( ios_jit_current_peb() ))
+    {
+        /* madeira-bcd: no slot because this child already exited: its first exit
+         * closed its own socket and cleared the slot above, and the thread came
+         * back here (CATIA V5's installer, build 501: a 32-bit console helper's
+         * NtTerminateProcess returned and its loop called it again). The branch
+         * below belongs to the session's initial process, and closing fd_socket
+         * there ended that process: setup.exe, or the desktop's explorer. */
+        static _Thread_local int dead_exits;
+        wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): tid=%04x peb=%p already exited; "
+                       "the session's socket stays open", status, (unsigned int)GetCurrentThreadId(),
+                       ios_jit_current_peb());
+        /* exit() returning again must not become an endless NtTerminateProcess loop */
+        if (++dead_exits > 2)
+        {
+            wine_log_write("[Wine ntdll/server] tid=%04x: exit came back %d times; ending the thread",
+                           (unsigned int)GetCurrentThreadId(), dead_exits);
+            pthread_exit( NULL );
+        }
+    }
     else
     {
         /* No slot: this is the session's initial process, the program the app
@@ -4899,7 +4927,17 @@ void process_exit_wrapper( int status )
 #else
     close( fd_socket );
 #endif
+#ifdef WINE_IOS
+    /* madeira-bcd: which way exit() leaves (shims/wine_ios_exit.h). In build 501
+     * the first exit of such a helper returned to its caller instead; this says
+     * whether it was on its own process thread (longjmp) or not (pthread_exit). */
+    wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d) tid=%04x leaves by %s", status,
+                   (unsigned int)GetCurrentThreadId(),
+                   (wine_ios_exit_initialized && pthread_equal( pthread_self(), wine_ios_main_thread ))
+                   ? "longjmp" : "pthread_exit");
+#else
     wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d)", status );
+#endif
     exit( status );  /* on iOS, wine_ios_exit shim longjmps back to wine_process_thread */
 }
 
