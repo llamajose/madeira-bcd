@@ -74,7 +74,19 @@ UCX=""
 if [ "${MADEIRA_UCRT_X64_MATH_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/ucrtbase/Makefile.in" ]; then
     UCX=ucrtbase
 fi
-[ -n "$todo$XI$WGI$UCX" ] || { echo "nothing to build"; exit 0; }
+# madeira-bcd: not an exception either, a new file. ntdll-sync.dll is Wine's ntdll
+# built with tools/patch-wine-ntdll-sync.py (cheaper SRW locks: a release wakes
+# only a waiter the lock word records, no shared ring; x64 bodies for the SRW
+# and critical-section exports) and ships NEXT TO the shipped ntdll.dll, which stays. The unix loader
+# maps it unless env.MADEIRA_NTDLL_SYNC = 0. It is built only when this tree,
+# unpatched, first rebuilds the shipped ntdll.dll byte for byte apart from its
+# time stamps (__FILE__ paths mapped to the ../ upstream's build/wine-pe/
+# build-ntdll.sh tree has). MADEIRA_NTDLL_SYNC_BUILD=0 skips it.
+NTS=""
+if [ "${MADEIRA_NTDLL_SYNC_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/ntdll/sync.c" ] && [ -f "$SHIP/ntdll.dll" ]; then
+    NTS=ntdll
+fi
+[ -n "$todo$XI$WGI$UCX$NTS" ] || { echo "nothing to build"; exit 0; }
 
 # The cached tree may have disabled winegstreamer because macOS has no
 # GStreamer headers. Only its real PE frontend is needed here; the iOS unix
@@ -166,6 +178,52 @@ PY
     fi
     git -C "$R/wine" checkout -- dlls/ucrtbase/Makefile.in
     rm -f "$R/wine/dlls/ucrtbase/x64math.c"
+fi
+# madeira-bcd: ntdll-sync.dll (see NTS above), from the restored tree. First the
+# unpatched ntdll.dll, which must equal the shipped one apart from its time
+# stamps; then the patched one, verified before it ships. The tree and the
+# ntdll objects are restored afterwards (wine/build-arm64ec is cached).
+if [ -n "$NTS" ]; then
+    nt="$B/dlls/ntdll/arm64ec-windows/ntdll.dll"
+    ntflags="-g -O2"
+    ntsrc="$(sed -n 's/^srcdir = //p' "$B/Makefile")"
+    case "$ntsrc" in /*) ntflags="$ntflags -ffile-prefix-map=$ntsrc=.. -fno-file-reproducible" ;; esac
+    ntdll_make() {
+        rm -f "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o
+        make -C "$B" -j"$JOBS" arm64ec_CFLAGS="$ntflags" x86_64_CFLAGS="$ntflags" \
+            dlls/ntdll/arm64ec-windows/ntdll.dll >> "$B.ntdll.log" 2>&1 && [ -f "$nt" ]
+    }
+    # stripped and padded to SizeOfImage + 0x50000, as build/wine-pe/build-ntdll.sh does
+    ntdll_ship() {
+        cp "$nt" "$1" && "$MINGW/arm64ec-w64-mingw32-strip" "$1" && python3 - "$1" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + 0x50000
+if len(d) > target:
+    raise SystemExit("ntdll is larger than SizeOfImage + 0x50000")
+open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+    }
+    : > "$B.ntdll.log"
+    if ntdll_make && ntdll_ship "$B/ntdll-stock.dll" &&
+       python3 "$R/tools/patch-wine-ntdll-sync.py" --same-as "$B/ntdll-stock.dll" "$SHIP/ntdll.dll"; then
+        if python3 "$R/tools/patch-wine-ntdll-sync.py" "$R/wine" && ntdll_make &&
+           ntdll_ship "$SHIP/ntdll-sync.dll.tmp" &&
+           python3 "$R/tools/patch-wine-ntdll-sync.py" --verify "$SHIP/ntdll-sync.dll.tmp" "$SHIP/ntdll.dll"; then
+            mv "$SHIP/ntdll-sync.dll.tmp" "$SHIP/ntdll-sync.dll"
+            echo "::notice::ntdll-sync.dll (cheaper SRW locks and critical sections, mapped unless env.MADEIRA_NTDLL_SYNC = 0): built next to the shipped ntdll.dll"
+        else
+            rm -f "$SHIP/ntdll-sync.dll.tmp"
+            echo "::warning::ntdll-sync.dll did not build or failed its check; not shipped (games map the shipped ntdll.dll)"
+            grep -m 10 "error" "$B.ntdll.log"
+        fi
+    else
+        echo "::warning::this tree does not rebuild the shipped ntdll.dll apart from time stamps; ntdll-sync.dll not shipped"
+        grep -m 10 "error" "$B.ntdll.log"
+    fi
+    git -C "$R/wine" checkout -- dlls/ntdll/sync.c dlls/ntdll/ntdll.spec dlls/ntdll/Makefile.in
+    rm -f "$R/wine/dlls/ntdll/sync_x64.c" "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o "$B/ntdll-stock.dll"
 fi
 xi_built=0; xi_failed=""
 if [ "$xi_patched" = 1 ]; then

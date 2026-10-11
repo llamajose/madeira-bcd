@@ -1291,6 +1291,12 @@ jobs:
       - name: Check quiet-log
         run: python3 tests/host/check-quiet-log.py
 
+      # madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py), the default ARM64EC
+      # ntdll (env.MADEIRA_NTDLL_SYNC = 0 keeps ntdll.dll): cheaper SRW locks and
+      # critical sections.
+      - name: Check ntdll-sync
+        run: python3 tests/host/check-ntdll-sync.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
@@ -1410,6 +1416,15 @@ jobs:
             python3 tools/patch-wine-ucrtbase-x64-math.py --verify app/Madeira/arm64ec-windows/ucrtbase-x64math.dll
           else
             echo "::warning::ucrtbase-x64math.dll missing: env.MADEIRA_UCRT_X64_MATH = 1 does nothing in this IPA"
+          fi
+          # And its ntdll-sync.dll, which the unix loader maps by default: never
+          # ship one whose SRW and critical-section exports are not the x64 bodies
+          # or whose exports are not the shipped ntdll.dll's plus madeira_sync_x64_off.
+          if [ -f app/Madeira/arm64ec-windows/ntdll-sync.dll ]; then
+            python3 tools/patch-wine-ntdll-sync.py --verify app/Madeira/arm64ec-windows/ntdll-sync.dll \
+              app/Madeira/arm64ec-windows/ntdll.dll
+          else
+            echo "::warning::ntdll-sync.dll missing: every game maps the shipped ntdll.dll"
           fi
 
       # tools/fetch-vcruntime.md: the VC++ runtime DLLs (twelve, and since

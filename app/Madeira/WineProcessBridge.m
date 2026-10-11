@@ -1554,6 +1554,37 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py, built by
+             * tools/build-wine-extra-dlls.sh next to the shipped ntdll.dll) is the
+             * ARM64EC ntdll the unix loader maps by default (build/ntdll-unix/
+             * loader_ios.c, ios_ec_ntdll_name): the same SRW locks and critical
+             * sections, cheaper. Wine
+             * names it C:\windows\system32\ntdll.dll, so that link (ARM64EC sessions)
+             * and sysx64's (x64 children) name the same file: a program reading
+             * ntdll.dll from disk sees what runs. env.MADEIRA_NTDLL_SYNC = 0 keeps
+             * the shipped ntdll.dll for both; the farms above are relinked from the
+             * bundle every session. */
+            {
+                const char *ntSync = getenv("MADEIRA_NTDLL_SYNC");
+                BOOL ntSyncOff = ntSync && ntSync[0] == '0' && !ntSync[1];
+                NSString *syncDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
+                                     stringByAppendingPathComponent:@"ntdll-sync.dll"];
+                if (!ntSyncOff && [fm fileExistsAtPath:syncDll]) {
+                    NSMutableArray *dirs = [NSMutableArray arrayWithObject:
+                        [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+                    if (use_arm64ec) [dirs addObject:sys32Dir];
+                    for (NSString *dir in dirs) {
+                        NSString *dst = [dir stringByAppendingPathComponent:@"ntdll.dll"];
+                        [fm removeItemAtPath:dst error:nil];
+                        [fm createSymbolicLinkAtPath:dst withDestinationPath:syncDll error:nil];
+                    }
+                    dprintf(STDERR_FILENO, "[WineProc] ntdll.dll -> ntdll-sync.dll (cheaper SRW locks and critical sections; env.MADEIRA_NTDLL_SYNC = 0 keeps the shipped ntdll.dll; %s)\n",
+                            use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                } else if (ntSyncOff) {
+                    dprintf(STDERR_FILENO, "[WineProc] MADEIRA_NTDLL_SYNC=0: the shipped ntdll.dll\n");
+                }
+            }
+
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.
              *
@@ -1926,6 +1957,7 @@ static void *wine_process_thread(void *arg) {
         /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
          * of this app run (GTA V Enhanced runs without them). */
         unsetenv("MADEIRA_UCRT_X64_MATH"); unsetenv("MADEIRA_SRV_FGETPATH");
+        unsetenv("MADEIRA_NTDLL_SYNC");   /* madeira-bcd: a game's kill switch is its own */
         g_madeira_srv_fgetpath = 0;
 
         // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
