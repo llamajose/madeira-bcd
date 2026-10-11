@@ -205,7 +205,7 @@ for name in nts.X64_BODIES:
                 hits.append('%s+%#x %08x' % (name, w, insn))
 check(not hits, 'no word of the x64 bodies looks like an x18 access to the x18 patcher %s' % hits[:4])
 native = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
-role_c = native[native.index('static int ios_insn_x18_role(uint32_t insn)'):]
+role_c = native[native.index('static int ios_insn_x18_role(uint32_t insn, int stores)'):]
 role_c = role_c[:role_c.index('\n}\n') + 3]
 check('if ((top8 & 0x1F) == 0x11)' in role_c and '((insn >> 10) & 3) == 2' in role_c and
       '(top11 & 0x3E7) == 0x1C0' in role_c,

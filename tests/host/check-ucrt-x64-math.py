@@ -136,9 +136,9 @@ def function(source, signature):
     return source[start:source.index('\n}', start) + 2] + '\n'
 
 
-defines = native[native.index('#define X18_ROLE_NONE 0'):native.index('static int ios_insn_x18_role(uint32_t insn)')]
+defines = native[native.index('#define X18_ROLE_NONE 0'):native.index('static int ios_insn_x18_role(uint32_t insn, int stores)')]
 code = '#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n' + defines
-code += function(native, 'static int ios_insn_x18_role(uint32_t insn)')
+code += function(native, 'static int ios_insn_x18_role(uint32_t insn, int stores)')
 bodies = []
 for pad in (b'\0', b'\xcc', b'\x90'):
     floor_fn = ucrtx64.FLOOR_BYTES + pad * (16 - len(ucrtx64.FLOOR_BYTES))
@@ -157,7 +157,7 @@ int main( void )
     {
         uint32_t w;
         memcpy( &w, blob + i, 4 );
-        if (ios_insn_x18_role( w ) != X18_ROLE_NONE) { fprintf( stderr, "word at %zu (0x%08x) looks like an x18 access\n", i, w ); return 1; }
+        if (ios_insn_x18_role( w, 0 ) != X18_ROLE_NONE) { fprintf( stderr, "word at %zu (0x%08x) looks like an x18 access\n", i, w ); return 1; }
     }
     puts( "PASS: no word of the x64 bodies looks like an x18 access to the x18 patcher" );
     return 0;
