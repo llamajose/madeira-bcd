@@ -1326,6 +1326,11 @@ jobs:
       - name: Check addr-scan
         run: python3 tests/host/check-addr-scan.py
 
+      # madeira-bcd: render-pass traffic (gpu-traffic counters, clear-defer;
+      # opt-in rp-carry, rp-discard and its winemetal op 24, f6-rar).
+      - name: Check render-pass traffic
+        run: python3 tests/host/check-render-pass-traffic.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked

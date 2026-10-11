@@ -233,6 +233,31 @@ OVERLAY = {
                         "before. 1: only the rectangles are cleared, in a small pass of their own (as DXMT's D3D11 "
                         "ClearView does); a rectangle that covers the view still clears it the fast way. Horizon Zero "
                         "Dawn passes rectangles from its first gameplay frames."},
+    # madeira-bcd: render-pass memory traffic (Horizon Zero Dawn ~1.9 GB a frame through attachments, build 493).
+    "clear-defer": {"category": "Direct3D 12", "title": "Clears wait for the pass that draws to their target",
+                "kind": "bool", "default": "1",
+                "note": "On by default. A whole render-target or depth-stencil clear becomes the clear the next "
+                        "render pass that draws to that target starts with: a clear no longer ends the pass in "
+                        "progress unless it is one of that pass's own targets, and needs no pass of its own (which "
+                        "wrote the whole target to memory and read it back later). A barrier or copy that names the "
+                        "cleared texture applies the clear first, so nothing sees it uncleared. 0: every clear ends "
+                        "the open pass and goes before the next pass on its own, as before. Read once per game start."},
+    "rp-carry": {"category": "Direct3D 12", "title": "Experiment: render passes go on into the next command list",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: when a command list ends inside a render pass and the next list of the same "
+                        "submission draws to the same targets first, with only state between the two draws, the pass "
+                        "stays open: its targets are not written to memory and read back. Horizon Zero Dawn records "
+                        "its depth and G-buffer passes in ~20 lists (0.3-0.6 GB a frame of such writes and reads), "
+                        "GTA V Enhanced its G-buffer in ~12. Opt-in: the second list's draws no longer wait for the "
+                        "whole first pass, an ordering Direct3D 12 does not promise but a game might rely on. Read "
+                        "once per game start; [perf] gpu-traffic lines show what it saves."},
+    "rp-discard": {"category": "Direct3D 12", "title": "Experiment: no load after DiscardResource",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: after a game discards a whole render target or depth buffer "
+                        "(DiscardResource), the next render pass that draws to it does not read its old contents "
+                        "from memory, as tile-based GPUs do on Windows. Opt-in: a game that still reads what it "
+                        "discarded (desktop GPUs ignore discards) would show garbage there. Read once per game "
+                        "start; [perf] gpu-traffic lines show the bytes."},
     "skin-check": {"category": "Direct3D 12", "title": "Diagnostic: check meshes skinned on the GPU",
                 "kind": "int", "default": "0",
                 "note": "Default 0 (off). N: windows of N frames (1 = 8) log every draw that reads a vertex buffer a "

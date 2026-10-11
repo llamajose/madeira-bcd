@@ -230,7 +230,8 @@ static volatile LONG64 g_pass_attach_bytes;
  * list boundaries leave on the table (counted whether or not a switch acts). */
 static volatile LONG64 g_tr_load, g_tr_clear, g_tr_noload, g_tr_store, g_tr_nostore;
 static volatile LONG g_tr_passes, g_tr_clear_only, g_tr_deferred, g_tr_def_flushed;
-static volatile LONG g_rp_carried, g_rp_miss[4]; static volatile LONG64 g_rp_carried_b, g_rp_miss_b[4];
+enum { RPM_OFF, RPM_PREFIX, RPM_STATE, RPM_CALL, RPM_COMMIT, RPM_N };   /* why a pass the next list goes on with was not carried */
+static volatile LONG g_rp_carried, g_rp_miss[RPM_N]; static volatile LONG64 g_rp_carried_b, g_rp_miss_b[RPM_N];
 static volatile LONG64 g_rp_disc_load_b; static volatile LONG g_rp_disc_whole;
 static int g_census_on;   /* ml899: one frame at presents 1500,1700,...,2800 */
 static int g_skin_check = -1;      /* madeira-bcd skin-check: frames per window, 0 = off (mad_skin_load) */
@@ -3479,7 +3480,6 @@ struct mad_rp_carry {
     unsigned npend; unsigned char pend[sizeof(((struct mad_exec *)0)->pend)];
     LONG64 bytes;
 };
-enum { RPM_OFF, RPM_PREFIX, RPM_STATE, RPM_CALL, RPM_COMMIT, RPM_N };
 static int mad_rp_carry_on(void) {
     if (g_rp_carry < 0) {
         g_rp_carry = mad_cfg_int_pe("rp-carry", 0) ? 1 : 0;   /* experiment: a render pass stays open into the next command list of the same submission when it draws to the same targets */
