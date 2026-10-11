@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """ntdll-sync.dll: Wine's PE ntdll with cheaper SRW locks and critical sections,
-the default ARM64EC ntdll.
+an opt-in ARM64EC ntdll (off by default since build 499).
 
 tools/patch-wine-ntdll-sync.py changes dlls/ntdll/sync.c (a release wakes only
 a waiter the lock word records: bit 15 of exclusive_waiters marks parked shared
@@ -10,7 +10,9 @@ RtlEnterCriticalSection, RtlTryEnterCriticalSection and RtlLeaveCriticalSection
 madeira_sync_x64_off. tools/build-wine-extra-dlls.sh builds
 it as ntdll-sync.dll after checking that the unpatched tree rebuilds the
 shipped ntdll.dll apart from its time stamps; build/ntdll-unix/loader_ios.c
-maps it unless env.MADEIRA_NTDLL_SYNC = 0.
+maps it only with env.MADEIRA_NTDLL_SYNC = 1 or native. On build 498, where it
+was the default, every 64-bit game died at start: ARM64EC code reached the x64
+RtlEnterCriticalSection body through kernel32's forwarder.
 
 Checks:
   1. the patch: exactly the five sync.c edits, one spec line, sync_x64.c and a
@@ -1213,8 +1215,9 @@ check('ntdll-sync.dll' in fn and '!strcmp( pe_dir, "/arm64ec-windows" )' in fn a
       'the loader maps arm64ec-windows/ntdll-sync.dll when the bundle has it, else ntdll.dll')
 mode = loader[loader.index('static int ios_ntdll_sync_mode( void )'):]
 mode = mode[:mode.index('\n}\n')]
-check('getenv( "MADEIRA_NTDLL_SYNC" )' in mode and "e[0] == '0' && !e[1]" in mode and '"native"' in mode,
-      'env.MADEIRA_NTDLL_SYNC = 0 maps the shipped ntdll.dll; native keeps the variant without x64 bodies')
+check('getenv( "MADEIRA_NTDLL_SYNC" )' in mode and "e[0] == '1' && !e[1]" in mode and '"native"' in mode and
+      mode.rstrip().endswith('return 0;'),
+      'off by default: only env.MADEIRA_NTDLL_SYNC = 1 or native maps ntdll-sync.dll (native: no x64 bodies)')
 ld = loader[loader.index('static void load_ntdll(void)'):]
 ld = ld[:ld.index('\n}\n')]
 check('else name = ios_ec_ntdll_name( dll_dir, pe_dir );' in ld, 'load_ntdll (the session ntdll) uses it')
@@ -1233,8 +1236,8 @@ bridge = (root / 'app/Madeira/WineProcessBridge.m').read_text()
 blk = bridge[bridge.index('const char *ntSync = getenv("MADEIRA_NTDLL_SYNC");'):]
 blk = blk[:blk.index('\n            }\n')]
 check('@"ntdll-sync.dll"' in blk and '@"ntdll.dll"' in blk and 'if (use_arm64ec) [dirs addObject:sys32Dir];' in blk and
-      'drive_c/windows/sysx64' in blk and "ntSync[0] == '0' && !ntSync[1]" in blk,
-      'system32 (ARM64EC sessions) and sysx64 ntdll.dll link to the variant the loader maps, unless = 0')
+      'drive_c/windows/sysx64' in blk and "ntSync[0] == '1' && !ntSync[1]" in blk and '!strcmp(ntSync, "native")' in blk,
+      'system32 (ARM64EC sessions) and sysx64 ntdll.dll link to the variant the loader maps, only when = 1 or native')
 check(bridge.index('LOG("Symlinked %d DLLs from %{public}s to %{public}s"') < bridge.index('const char *ntSync = getenv("MADEIRA_NTDLL_SYNC");'),
       'relinked after the farm')
 check('unsetenv("MADEIRA_NTDLL_SYNC");' in bridge, 'a game\'s MADEIRA_NTDLL_SYNC does not reach a later game of the app run')
@@ -1264,7 +1267,8 @@ check('python3 tools/patch-wine-ntdll-sync.py --verify app/Madeira/arm64ec-windo
 cat = (root / 'build/tools/gen-config-catalog.py').read_text()
 gen = (root / 'app/Madeira/ConfigCatalog.generated.swift').read_text()
 check('"env.MADEIRA_NTDLL_SYNC"' in cat and 'key: "env.MADEIRA_NTDLL_SYNC"' in gen and
-      '("0", "Off")' in cat, 'the catalog documents the switch (on by default, 0 off, native)')
+      '("", "Off (default)")' in cat and '("1", "On")' in cat,
+      'the catalog documents the switch (off by default, 1 on, native)')
 rec = (root / 'app/Madeira/GameRecommendations.swift').read_text()
 check('MADEIRA_NTDLL_SYNC' not in rec, 'no game list sets it')
 

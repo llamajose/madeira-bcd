@@ -698,16 +698,18 @@ OVERLAY = {
                 "kind": "choice", "default": "",
                 "sources": ["build/ntdll-unix/loader_ios.c", "app/Madeira/WineProcessBridge.m",
                             "tools/patch-wine-ntdll-sync.py"],
-                "choices": [("", "On (default)"), ("native", "On, native lock code only"), ("0", "Off")],
-                "note": "On by default: 64-bit sessions run ntdll-sync.dll, Wine's ntdll from the same source as the "
-                        "shipped ntdll.dll (the build checks that it rebuilds it byte for byte) with cheaper SRW "
-                        "locks and critical sections: same lock word and rules, but a release wakes only a waiter "
-                        "the word records, no shared bookkeeping on every lock call, and a 64-bit game's "
-                        "uncontended lock calls stay in the emulator (Horizon Zero Dawn: about a million SRW and "
-                        "0.13 million critical-section calls a second). native keeps the 64-bit callers on the "
-                        "native lock code (one switch out of the emulator per call, as before). 0: the shipped "
-                        "ntdll.dll, as before. Read at session start; a later game of the same app run does not "
-                        "inherit it."},
+                "choices": [("", "Off (default)"), ("1", "On"), ("native", "On, native lock code only")],
+                "note": "Off by default since build 499: on build 498, where it was on, every 64-bit game died at "
+                        "start (ARM64EC code reached the x64 lock bodies through kernel32's forwarders, and their "
+                        "exit thunk had no dispatcher yet). Kept for that fix; do not turn it on for a game yet. "
+                        "1: 64-bit sessions run ntdll-sync.dll, Wine's ntdll from the same source as the shipped "
+                        "ntdll.dll (the build checks that it rebuilds it byte for byte) with cheaper SRW locks and "
+                        "critical sections: same lock word and rules, but a release wakes only a waiter the word "
+                        "records, no shared bookkeeping on every lock call, and a 64-bit game's uncontended lock "
+                        "calls stay in the emulator (Horizon Zero Dawn: about a million SRW and 0.13 million "
+                        "critical-section calls a second). native keeps the 64-bit callers on the native lock code "
+                        "(one switch out of the emulator per call, as before). Unset or 0: the shipped ntdll.dll. "
+                        "Read at session start; a later game of the same app run does not inherit it."},
     # madeira-bcd: ucrtbase-x64math.dll (tools/patch-wine-ucrtbase-x64-math.py, linked by WineProcessBridge.m).
     "env.MADEIRA_UCRT_X64_MATH": {"category": "Wine core (ntdll)", "title": "floor and sqrt as x64 code (ucrtbase)",
                 "kind": "bool", "default": "0",

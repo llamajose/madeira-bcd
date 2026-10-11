@@ -2120,7 +2120,7 @@ unixlib_handle_t *ios_ntdll_unixlib_handle_ptr = NULL;
 #endif
 
 #ifdef WINE_IOS
-/* madeira-bcd: ntdll-sync.dll, the ARM64EC ntdll this session maps by default.
+/* madeira-bcd: ntdll-sync.dll, an opt-in ARM64EC ntdll (off by default since build 499).
  * tools/build-wine-extra-dlls.sh builds it next to the shipped ntdll.dll from
  * the same wine source with tools/patch-wine-ntdll-sync.py, after checking that
  * the unpatched tree rebuilds ntdll.dll byte for byte: the same SRW lock word
@@ -2129,17 +2129,21 @@ unixlib_handle_t *ios_ntdll_unixlib_handle_ptr = NULL;
  * for entering and leaving a critical section, so a 64-bit game's uncontended
  * lock calls stay in the emulator. Same semantics, fewer instructions, atomics
  * and emulator exits.
- *   env.MADEIRA_NTDLL_SYNC unset or 1  ntdll-sync.dll (when the bundle has it)
+ *   env.MADEIRA_NTDLL_SYNC 1           ntdll-sync.dll (when the bundle has it)
  *                          native      ntdll-sync.dll, x64 callers go straight
  *                                      to the native bodies (as with ntdll.dll)
- *                          0           ntdll.dll, the shipped binary
+ *                          unset or 0  ntdll.dll, the shipped binary
+ * Off by default: on build 498 every 64-bit game died at start. ARM64EC code
+ * (ucrtbase's _lock) reached the x64 RtlEnterCriticalSection body through
+ * kernel32's forwarder, which the loader does not redirect to the native body,
+ * and its exit thunk had no dispatcher yet (blr x16 = 0).
  * app/Madeira/WineProcessBridge.m links system32\ntdll.dll to the same file. */
 static int ios_ntdll_sync_mode( void )
 {
     const char *e = getenv( "MADEIRA_NTDLL_SYNC" );
-    if (e && e[0] == '0' && !e[1]) return 0;
     if (e && !strcmp( e, "native" )) return 2;
-    return 1;
+    if (e && e[0] == '1' && !e[1]) return 1;
+    return 0;
 }
 
 static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
@@ -2154,7 +2158,7 @@ static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
         if (name && !access( name, R_OK ))
         {
             if (!said++)
-                dprintf( 2, "[ntdll-sync] %s%s (env.MADEIRA_NTDLL_SYNC = 0 maps the shipped ntdll.dll)\n", name,
+                dprintf( 2, "[ntdll-sync] %s%s (opt-in; unset or 0 maps the shipped ntdll.dll)\n", name,
                          mode == 2 ? "; x64 lock bodies off (native)" : "" );
             return name;
         }
@@ -2163,7 +2167,7 @@ static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
         name = NULL;
     }
     else if (!mode && !strcmp( pe_dir, "/arm64ec-windows" ) && !said++)
-        dprintf( 2, "[ntdll-sync] off (env.MADEIRA_NTDLL_SYNC = 0): the shipped ntdll.dll is mapped\n" );
+        dprintf( 2, "[ntdll-sync] off (the default; env.MADEIRA_NTDLL_SYNC = 1 maps ntdll-sync.dll): the shipped ntdll.dll is mapped\n" );
     if (asprintf( &name, "%s%s/ntdll.dll", dir, pe_dir ) < 0) name = NULL;
     return name;
 }
