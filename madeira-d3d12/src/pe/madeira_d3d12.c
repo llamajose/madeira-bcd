@@ -475,6 +475,7 @@ static LONG g_srv_clamped; static float g_srv_clamp_max;   /* ml1089 */
 static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
 static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */
+static LONG g_f6_rar_passed; static int g_f6_rar = -1;   /* madeira-bcd f6-rar */
 /* ml1137: GPU census, counts only. Barrier entries by the states they move
  * between, and what a state-aware wait rule would have needed at each
  * barrier-caused sync of mode 6; attachment bytes loaded / cleared / stored in
@@ -2289,8 +2290,9 @@ static void f6_drain(struct mad_exec *e, int kind, obj_handle_t enc) {
  * the encoders pending now and the one still open (counted, not applied):
  *   read -> read: nothing;  render target / depth -> read: the passes that had
  *   it attached;  copy dest -> read: pending blits;  UAV -> read and UAV
- *   barriers: pending compute and render encoders;  anything -> write, COMMON,
- *   aliasing: everything (as mode 6 does). */
+ *   barriers: pending compute, render and blit encoders (madeira-bcd: blits too,
+ *   ClearUnorderedAccessView* runs as a blit fill here);  anything -> write,
+ *   COMMON, aliasing: everything (as mode 6 does). */
 static int f7_has_att(const struct mad_f6_pend *p, const struct mad_resource *r) {
     unsigned j;
     for (j = 0; j < p->natt; j++) if (p->att[j] == r) return 1;
@@ -2305,7 +2307,7 @@ static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r)
         const struct mad_f6_pend *p = &q->f6_pend[i];
         if ((cls == BC_RAW_ATT && p->kind == F6_RENDER && r && f7_has_att(p, r)) ||
             (cls == BC_RAW_COPY && p->kind == F6_BLIT) ||
-            (cls == BC_RAW_UAV && p->kind != F6_BLIT)) e->f7_mask |= 1ull << i;
+            cls == BC_RAW_UAV) e->f7_mask |= 1ull << i;
     }
     if (cls == BC_RAW_ATT && e->renc && r) {
         unsigned k;
@@ -2313,7 +2315,26 @@ static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r)
         if (e->enc_depth == r) e->f7_open = 1;
     }
     if (cls == BC_RAW_COPY && e->benc) e->f7_open = 1;
-    if (cls == BC_RAW_UAV && (e->cenc || e->renc)) e->f7_open = 1;
+    if (cls == BC_RAW_UAV && (e->cenc || e->renc || e->benc)) e->f7_open = 1;
+}
+/* madeira-bcd f6-rar (default 0; opt-in, a fence relaxation): with fence-chain
+ * 6, a ResourceBarrier batch whose every entry moves a resource from read
+ * states to read states, or is the BEGIN half of a split barrier, is not a
+ * sync point. D3D12 orders nothing across such a barrier (reads after reads;
+ * the END half of a split barrier carries the transition's sync), but mode 6
+ * made the next encoder wait for every pending one and closed an overlapped
+ * render pass there, which costs a store and a reload of its attachments.
+ * A batch with any other entry, COMMON on either side, an aliasing or UAV
+ * barrier, or more entries than were recorded keeps the mode-6 sync. */
+static int f6_rar_only(const struct mad_cmd *c) {
+    unsigned k;
+    if (g_f6_rar < 0) {
+        g_f6_rar = mad_cfg_int_pe("f6-rar", 0) ? 1 : 0;   /* experiment: fence-chain 6 does not sync at read-to-read barriers */
+        if (g_f6_rar) d3d12_log("[madeira-d3d12] f6-rar = 1: with fence-chain 6, read-to-read ResourceBarriers are not sync points\n");
+    }
+    if (!g_f6_rar || c->u.barrier.all || !c->u.barrier.n) return 0;
+    for (k = 0; k < c->u.barrier.n && k < 8; k++) if (c->u.barrier.cls[k] != BC_RAR) return 0;
+    return 1;
 }
 static void f7_census_barrier(struct mad_exec *e, const struct mad_cmd *c) {
     unsigned k;
@@ -9657,6 +9678,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
             if (e.mode == 6) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
+                if (f6_rar_only(c)) { InterlockedIncrement(&g_f6_rar_passed); break; }   /* madeira-bcd f6-rar */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
                 if (e.cenc && e.f6_enc_synced && g_f6_compute_open) InterlockedIncrement(&g_f6_kept_open);
@@ -10065,6 +10087,9 @@ static void mad_perf_present(void) {
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
                           "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
                           b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                if (g_f6_rar > 0)   /* madeira-bcd f6-rar */
+                    d3d12_log("[perf] f6-rar per frame: %.1f read-to-read barrier batches passed without a sync\n",
+                              InterlockedExchange(&g_f6_rar_passed, 0) / np);
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;

@@ -129,6 +129,14 @@ check("late stores: only with rp-discard, no capture, a discarded texture attach
           "        MTLCommandEncoder_endEncoding(e->renc);" in func("static void exec_end(struct mad_exec *e) {")
       and "if (c->u.discard.whole && mad_rp_discard_on()) mad_rp_dset_add(r);" in disc
       and "q->rp_lists = lists; q->rp_nlists = count;" in run and "rp_want = q->rp_next; q->rp_idx = i;" in run)
+rar = func("static int f6_rar_only(const struct mad_cmd *c) {")
+check("f6-rar: off by default, read once; mode 6 skips the sync only for read-to-read batches, after the census",
+      'g_f6_rar = mad_cfg_int_pe("f6-rar", 0) ? 1 : 0;' in rar
+      and "                f7_census_barrier(&e, c);   /* ml1137: counts only */\n"
+          "                if (f6_rar_only(c)) { InterlockedIncrement(&g_f6_rar_passed); break; }   /* madeira-bcd f6-rar */" in loop)
+need = func("static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r) {")
+check("ml1137 state-aware census: a UAV barrier needs pending blits too (ClearUnorderedAccessView is a blit fill)",
+      "cls == BC_RAW_UAV) e->f7_mask |= 1ull << i;" in need and "(cls == BC_RAW_UAV && (e->cenc || e->renc || e->benc))" in need)
 patch = root / "tools/patch-winemetal-rp-store.py"
 wm_src = root / "dxmt/src/winemetal/unix/winemetal_unix.c"
 check("the winemetal patch is applied by CI", "- name: Patch winemetal late render-pass store actions\n        run: python3 tools/patch-winemetal-rp-store.py" in
@@ -263,8 +271,9 @@ void MadeiraCtl(struct madeira_ctl_args *a) {
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 static LONG64 InterlockedExchange64(volatile LONG64 *p, LONG64 v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
-static int cfg_defer = -1, cfg_carry = -1, cfg_discard = -1, nlogs;
+static int cfg_defer = -1, cfg_carry = -1, cfg_discard = -1, cfg_rar = -1, nlogs;
 static long long mad_cfg_int_pe(const char *k, long long d) {
+    if (!strcmp(k, "f6-rar") && cfg_rar >= 0) return cfg_rar;
     if (!strcmp(k, "clear-defer") && cfg_defer >= 0) return cfg_defer;
     if (!strcmp(k, "rp-carry") && cfg_carry >= 0) return cfg_carry;
     if (!strcmp(k, "rp-discard") && cfg_discard >= 0) return cfg_discard;
@@ -310,7 +319,8 @@ static LONG64 f7_att_bytes(const struct mad_resource *r, UINT level) { (void)r; 
 static void mad_label(obj_handle_t enc, const char *fmt, ...) { (void)enc; (void)fmt; }
 static void exec_rp_late_store(struct mad_exec *e);
 ''' + func("static void exec_end(struct mad_exec *e) {") + helpers + block + flush_add + \
-    func("static void exec_attachless_area(") + func("static int exec_same_targets(struct mad_exec *e) {") + begin + r'''
+    func("static void exec_attachless_area(") + func("static int exec_same_targets(struct mad_exec *e) {") + begin + \
+    "static int g_f6_rar = -1;\n" + rar + r'''
 /* ---- a replay with the real loop's hooks (mode 1: barriers end compute and blit encoders) ---- */
 static void replay(struct mad_queue *q, struct mad_list *l) {
     struct mad_exec *ep = calloc(1, sizeof *ep), e; unsigned i;
@@ -649,6 +659,15 @@ int main(void) {
     ls[0] = l1; ls[1] = l2; ecl(&Q, 2, ls);
     EXPECT(g_rp_carried == 1 && count('R') == 1 && n24 == 1 && late_color(0, 0) == WMTStoreActionDontCare && all_ended_once(),
            "carried pass: decided once, at its end in the next list"); }
+    /* f6-rar: only batches of read-to-read entries, only with the switch */
+    { struct mad_cmd c; memset(&c, 0, sizeof c); c.kind = MC_BARRIER; c.u.barrier.cls_noref = BC_NONE;
+      c.u.barrier.n = 2; c.u.barrier.res[0] = &A; c.u.barrier.res[1] = &B; c.u.barrier.cls[0] = BC_RAR; c.u.barrier.cls[1] = BC_RAR;
+      cfg_rar = -1; g_f6_rar = -1; EXPECT(!f6_rar_only(&c), "f6-rar off by default");
+      cfg_rar = 1; g_f6_rar = -1; EXPECT(f6_rar_only(&c), "f6-rar: read-to-read batch passes");
+      c.u.barrier.cls[1] = BC_RAW_ATT; EXPECT(!f6_rar_only(&c), "f6-rar: a render-target-to-read entry syncs");
+      c.u.barrier.cls[1] = BC_RAR; c.u.barrier.all = 1; c.u.barrier.cls_noref = BC_RAW_UAV; EXPECT(!f6_rar_only(&c), "f6-rar: a UAV barrier syncs");
+      c.u.barrier.all = 0; c.u.barrier.n = 0; EXPECT(!f6_rar_only(&c), "f6-rar: an empty batch is not passed");
+      cfg_rar = -1; g_f6_rar = -1; }
     /* the prefix test itself */
     reset(-1, 1, -1, 1);
     l1 = L(); rts(l1, 4, GB, &D); vpsc(l1); push(l1, MC_DISCARD)->u.discard.res = &X; clear_rt(l1, &X, 0); draw(l1);

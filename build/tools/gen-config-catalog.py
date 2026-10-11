@@ -259,6 +259,14 @@ OVERLAY = {
                         "use in the same submission, does not write it back -- as tile-based GPUs do on Windows. "
                         "Opt-in: a game that still reads what it discarded (desktop GPUs ignore discards) would show "
                         "garbage there. Read once per game start; [perf] gpu-traffic lines show the bytes."},
+    "f6-rar": {"category": "Direct3D 12", "title": "Experiment: fence-chain 6 ignores read-to-read barriers",
+                "kind": "bool", "default": "0",
+                "note": "Default off; only with fence-chain = 6. 1: a ResourceBarrier whose every transition goes "
+                        "from read states to read states (or is the first half of a split barrier) no longer makes "
+                        "the next GPU pass wait for all earlier ones, and no longer ends an overlapping render pass "
+                        "(which writes its targets to memory and reads them back). Direct3D 12 orders nothing at "
+                        "such a barrier; a game that relied on it anyway would show flicker. Read once per game "
+                        "start; [perf] f6-rar lines count them."},
     "skin-check": {"category": "Direct3D 12", "title": "Diagnostic: check meshes skinned on the GPU",
                 "kind": "int", "default": "0",
                 "note": "Default 0 (off). N: windows of N frames (1 = 8) log every draw that reads a vertex buffer a "
