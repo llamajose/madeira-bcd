@@ -625,6 +625,28 @@ OVERLAY = {
                         "healer run at utility QoS, on the efficiency cores, ECO on or off; neither does work a frame "
                         "waits for. The wineserver thread, the exception thread, audio and the interface keep their "
                         "QoS. Off (default): they keep the QoS they were created with. Read at session start."},
+    # madeira-bcd: the frame-cap power governor (build/ntdll-unix/server_ios.c ios_fps_gov_step,
+    # madeira-d3d12 Present, tools/patch-winemetal-fps-cap.py).
+    "env.MADEIRA_FPS_CAP": {"category": "Windows, display & input", "title": "Fixed frame cap (fps)",
+                "kind": "int", "default": "",
+                "sources": ["build/ntdll-unix/server_ios.c", "madeira-d3d12/src/pe/madeira_d3d12.c",
+                            "tools/patch-winemetal-fps-cap.py"],
+                "note": "Unset (default): no cap beyond the FPS limit. 10-120: frames start at most N times a second for "
+                        "the whole session: a Direct3D 12 game's thread waits after each Present, a DXMT game's encode "
+                        "thread before each present (a timed kernel wait, not a spin). Any value, e.g. 20 or 24, unlike "
+                        "the FPS limit's 30/40/60; the lower of the two applies. Needs the [xp] sampler (MADEIRA_PROBES "
+                        "not 0). Read at session start."},
+    "env.MADEIRA_FPS_GOV_MW": {"category": "Windows, display & input", "title": "Hold CPU power with a frame cap (mW)",
+                "kind": "int", "default": "",
+                "sources": ["build/ntdll-unix/server_ios.c", "madeira-d3d12/src/pe/madeira_d3d12.c",
+                            "tools/patch-winemetal-fps-cap.py"],
+                "note": "Unset (default): off. N: while the game presents, the process's CPU power ([xp]'s energy) is "
+                        "held at N mW on average by moving a frame cap between 60, 40, 30, 24 and 20 fps (at most one "
+                        "step per 3 s; held while nothing presents). Unlike env.MADEIRA_POWER_GOV_MW it moves no thread "
+                        "to the efficiency cores. Menus and loading at 3-4 W fill the budget after which iOS clamps the "
+                        "CPU; e.g. 1500 keeps a 60 fps menu near 30-40 fps. [fps-gov] lines every 10 s. "
+                        "env.MADEIRA_FPS_GOV_MIN / _MAX (20 / 60) bound the cap, _BAND_MJ (1500) is the energy the "
+                        "average may drift before it moves. Needs the [xp] sampler. Read at session start."},
     # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],
