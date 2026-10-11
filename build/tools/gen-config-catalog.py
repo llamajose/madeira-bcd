@@ -642,6 +642,37 @@ OVERLAY = {
                         "opened file or descriptor sent, each a formatted write to the log file on the server thread) "
                         "are written for their first 64 and then every 1000th; a failed send is always written. 1: "
                         "every line, as before. Read at each launch."},
+    # madeira-bcd: the yield primitive (tools/patch-wine-yield-mode.py, wine/dlls/ntdll/unix/sync.c).
+    "yield-mode": {"category": "Synchronisation", "title": "Yield primitive (SwitchToThread, Sleep(0))",
+                "kind": "choice", "default": "", "sources": ["tools/patch-wine-yield-mode.py"],
+                "choices": [("", "sched_yield (default)"), ("switch", "Switch, no priority drop"),
+                            ("depress", "Bounded priority drop")],
+                "note": "What a game thread's yield does. Default: sched_yield, which on iOS drops the thread to the "
+                        "lowest priority until it runs again or 10 ms pass. switch hands the core to another "
+                        "runnable thread and keeps the yielder's priority; depress keeps the drop but ends it after "
+                        "yield-depress-ms. An experiment for games whose threads wait in yield loops (Horizon Zero "
+                        "Dawn: 1-2.6 thousand yields a second, 14-18 % of runnable-thread samples in the yield "
+                        "trap under the power clamp). The adaptive sleep (yield-streak, yield-sleep-us) still "
+                        "comes first. Read once per app run."},
+    "yield-depress-ms": {"category": "Synchronisation", "title": "Yield priority drop (ms)",
+                "kind": "int", "default": "1", "sources": ["tools/patch-wine-yield-mode.py"],
+                "note": "yield-mode = depress only: how long a yielding thread stays at the lowest priority at "
+                        "most, 1-10 ms (default 1; sched_yield's drop lasts up to 10 ms)."},
+    # madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py), mapped by build/ntdll-unix/loader_ios.c.
+    "env.MADEIRA_NTDLL_SYNC": {"category": "Wine core (ntdll)", "title": "Cheaper locks (ntdll-sync.dll)",
+                "kind": "choice", "default": "",
+                "sources": ["build/ntdll-unix/loader_ios.c", "app/Madeira/WineProcessBridge.m",
+                            "tools/patch-wine-ntdll-sync.py"],
+                "choices": [("", "On (default)"), ("native", "On, native lock code only"), ("0", "Off")],
+                "note": "On by default: 64-bit sessions run ntdll-sync.dll, Wine's ntdll from the same source as the "
+                        "shipped ntdll.dll (the build checks that it rebuilds it byte for byte) with cheaper SRW "
+                        "locks and critical sections: same lock word and rules, but a release wakes only a waiter "
+                        "the word records, no shared bookkeeping on every lock call, and a 64-bit game's "
+                        "uncontended lock calls stay in the emulator (Horizon Zero Dawn: about a million SRW and "
+                        "0.13 million critical-section calls a second). native keeps the 64-bit callers on the "
+                        "native lock code (one switch out of the emulator per call, as before). 0: the shipped "
+                        "ntdll.dll, as before. Read at session start; a later game of the same app run does not "
+                        "inherit it."},
     # madeira-bcd: ucrtbase-x64math.dll (tools/patch-wine-ucrtbase-x64-math.py, linked by WineProcessBridge.m).
     "env.MADEIRA_UCRT_X64_MATH": {"category": "Wine core (ntdll)", "title": "floor and sqrt as x64 code (ucrtbase)",
                 "kind": "bool", "default": "0",

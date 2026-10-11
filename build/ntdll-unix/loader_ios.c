@@ -2119,6 +2119,69 @@ void **ios_ntdll_unix_call_dispatcher_ptr = NULL;
 unixlib_handle_t *ios_ntdll_unixlib_handle_ptr = NULL;
 #endif
 
+#ifdef WINE_IOS
+/* madeira-bcd: ntdll-sync.dll, the ARM64EC ntdll this session maps by default.
+ * tools/build-wine-extra-dlls.sh builds it next to the shipped ntdll.dll from
+ * the same wine source with tools/patch-wine-ntdll-sync.py, after checking that
+ * the unpatched tree rebuilds ntdll.dll byte for byte: the same SRW lock word
+ * and algorithm, but a release wakes only when the word says somebody waits,
+ * no shared acquire/release ring, and x64 bodies for the six SRW exports and
+ * for entering and leaving a critical section, so a 64-bit game's uncontended
+ * lock calls stay in the emulator. Same semantics, fewer instructions, atomics
+ * and emulator exits.
+ *   env.MADEIRA_NTDLL_SYNC unset or 1  ntdll-sync.dll (when the bundle has it)
+ *                          native      ntdll-sync.dll, x64 callers go straight
+ *                                      to the native bodies (as with ntdll.dll)
+ *                          0           ntdll.dll, the shipped binary
+ * app/Madeira/WineProcessBridge.m links system32\ntdll.dll to the same file. */
+static int ios_ntdll_sync_mode( void )
+{
+    const char *e = getenv( "MADEIRA_NTDLL_SYNC" );
+    if (e && e[0] == '0' && !e[1]) return 0;
+    if (e && !strcmp( e, "native" )) return 2;
+    return 1;
+}
+
+static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
+{
+    static int said;
+    char *name = NULL;
+    int mode = ios_ntdll_sync_mode();
+
+    if (mode && !strcmp( pe_dir, "/arm64ec-windows" ))
+    {
+        if (asprintf( &name, "%s%s/ntdll-sync.dll", dir, pe_dir ) < 0) name = NULL;
+        if (name && !access( name, R_OK ))
+        {
+            if (!said++)
+                dprintf( 2, "[ntdll-sync] %s%s (env.MADEIRA_NTDLL_SYNC = 0 maps the shipped ntdll.dll)\n", name,
+                         mode == 2 ? "; x64 lock bodies off (native)" : "" );
+            return name;
+        }
+        if (!said++) dprintf( 2, "[ntdll-sync] this build has no ntdll-sync.dll -- the shipped ntdll.dll is mapped\n" );
+        free( name );
+        name = NULL;
+    }
+    else if (!mode && !strcmp( pe_dir, "/arm64ec-windows" ) && !said++)
+        dprintf( 2, "[ntdll-sync] off (env.MADEIRA_NTDLL_SYNC = 0): the shipped ntdll.dll is mapped\n" );
+    if (asprintf( &name, "%s%s/ntdll.dll", dir, pe_dir ) < 0) name = NULL;
+    return name;
+}
+
+/* ntdll-sync.dll's x64 bodies read madeira_sync_x64_off from the image's .data
+ * (the copy x64 code sees); 1 sends every call to the native body. The shipped
+ * ntdll.dll has no such export, and nothing is written. */
+static void ios_ntdll_sync_publish( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports )
+{
+    extern void ios_jit_sync_write( void *addr, size_t size );
+    LONG *off = (LONG *)find_named_export( module, exports, "madeira_sync_x64_off" );
+
+    if (!off) return;
+    *off = ios_ntdll_sync_mode() == 2;
+    ios_jit_sync_write( off, sizeof(*off) );
+}
+#endif
+
 static void load_ntdll_functions( HMODULE module )
 {
     void **p__wine_syscall_dispatcher;
@@ -2169,6 +2232,7 @@ static void load_ntdll_functions( HMODULE module )
                 *pios_teb_tsd_offset, pios_teb_tsd_offset);
         }
     }
+    ios_ntdll_sync_publish( module, exports );   /* madeira-bcd: ntdll-sync.dll only */
     /* ml797: hand the FEX arena to the PE side as plain data. It cannot travel
      * as an environment variable -- its consumer runs before any CRT or TEB
      * exists. Publishing zero is normal and means "no arena"; the emulator then
@@ -2504,7 +2568,7 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
     if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
-    else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+    else name = ios_ec_ntdll_name( dll_dir, pe_dir );   /* madeira-bcd: ntdll-sync.dll */
 
     dprintf(2, "[ec-child-ntdll] loading %s for peb=%p\n", name, (void *)child_peb);
     status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0,
@@ -2568,6 +2632,7 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
             }
             else dprintf(2, "[teb-tsd] ec-child export ios_teb_tsd_offset NOT FOUND\n");
         }
+        ios_ntdll_sync_publish( module, exports );   /* madeira-bcd: ntdll-sync.dll only */
         {
             /* ml797: same arena hand-off for a pseudo-process's own ntdll. */
             extern ULONG_PTR ios_fex_arena_base_unix, ios_fex_arena_end_unix;
@@ -2698,7 +2763,11 @@ static void load_ntdll(void)
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
     if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
+#ifdef WINE_IOS
+    else name = ios_ec_ntdll_name( dll_dir, pe_dir );   /* madeira-bcd: ntdll-sync.dll */
+#else
     else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+#endif
 
     if (is_arm64ec()) machine = main_image_info.Machine;
     status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0, machine, FALSE, 0 );
