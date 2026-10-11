@@ -606,6 +606,16 @@ OVERLAY = {
                         "crossing to the native code and back (Horizon Zero Dawn: 2-4 million such calls a second). "
                         "Same results; a negative or NaN sqrt still goes to Wine's native sqrt. Off (default): the "
                         "shipped ucrtbase.dll. Set it in the game's own file; read at session start."},
+    # madeira-bcd: lean periodic diagnostics (build/ntdll-unix/server_ios.c, virtual_ios.c).
+    "env.MADEIRA_LEAN_DIAG": {"category": "Debugging / logs", "title": "Lean diagnostics (no thread-suspending samplers)",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/server_ios.c", "build/ntdll-unix/virtual_ios.c"],
+                "note": "1: the samplers that suspend threads stop ([thread-sample] bursts every 20 s, the guest RIP "
+                        "profile behind [rip-profile] and [cpu-split], [wprof]); the warmer's address-space walks "
+                        "([phys-map], slot and window inventory) run every ~10 min instead of every minute, its zone "
+                        "check and allocation probe every minute instead of every 2 s; mprotect_exec's per-call ERR "
+                        "line is kept for the first 200 calls, then every 1000th. [xp], [xp-t], [xp-api] and "
+                        "[sync-census] keep their rates. Off (default): every diagnostic as before. Read at session start."},
     # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],
