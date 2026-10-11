@@ -651,6 +651,70 @@ OVERLAY = {
                         "crossing to the native code and back (Horizon Zero Dawn: 2-4 million such calls a second). "
                         "Same results; a negative or NaN sqrt still goes to Wine's native sqrt. Off (default): the "
                         "shipped ucrtbase.dll. Set it in the game's own file; read at session start."},
+    # madeira-bcd: lean periodic diagnostics (build/ntdll-unix/server_ios.c, virtual_ios.c).
+    "env.MADEIRA_LEAN_DIAG": {"category": "Debugging / logs", "title": "Lean diagnostics (no thread-suspending samplers)",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/server_ios.c", "build/ntdll-unix/virtual_ios.c"],
+                "note": "1: the samplers that suspend threads stop ([thread-sample] bursts every 20 s, the guest RIP "
+                        "profile behind [rip-profile] and [cpu-split], [wprof]); the warmer's address-space walks "
+                        "([phys-map], slot and window inventory) run every ~10 min instead of every minute, its zone "
+                        "check and allocation probe every minute instead of every 2 s; mprotect_exec's per-call ERR "
+                        "line is kept for the first 200 calls, then every 1000th. [xp], [xp-t], [xp-api] and "
+                        "[sync-census] keep their rates. Off (default): every diagnostic as before. Read at session start."},
+    # madeira-bcd: the runtime's native helper threads at utility QoS (build/ntdll-unix/thread_ios.c).
+    "env.MADEIRA_ECO_NATIVE": {"category": "Wine core (ntdll)", "title": "Runtime helper threads on efficiency cores",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/thread_ios.c", "build/ntdll-unix/virtual_ios.c",
+                            "build/ntdll-unix/signal_arm64_ios.c"],
+                "note": "1: the JIT-pool warmer (page warming and the periodic memory walks) and the stale-pointer "
+                        "healer run at utility QoS, on the efficiency cores, ECO on or off; neither does work a frame "
+                        "waits for. The wineserver thread, the exception thread, audio and the interface keep their "
+                        "QoS. Off (default): they keep the QoS they were created with. Read at session start."},
+    # madeira-bcd: the power probe (build/ntdll-unix/server_ios.c ios_power_probe_tick).
+    "env.MADEIRA_POWER_PROBE": {"category": "Debugging / logs", "title": "Log GPU and device power every 5 s",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "1: every 5 s a [power] line next to [xp]'s CPU energy: the GPU energy and time the driver "
+                        "charged to the app's coalition, the SoC's Energy Model counters (IOReport) and the battery's "
+                        "voltage and current (the whole device while unplugged), each source named unavailable once "
+                        "when the system gives nothing; and [power-t], the threads that used the most energy. Off "
+                        "(default): nothing is read. Needs the [xp] sampler. Read at session start."},
+    # madeira-bcd: the frame-cap power governor (build/ntdll-unix/server_ios.c ios_fps_gov_step,
+    # madeira-d3d12 Present, tools/patch-winemetal-fps-cap.py).
+    "env.MADEIRA_FPS_CAP": {"category": "Windows, display & input", "title": "Fixed frame cap (fps)",
+                "kind": "int", "default": "",
+                "sources": ["build/ntdll-unix/server_ios.c", "madeira-d3d12/src/pe/madeira_d3d12.c",
+                            "tools/patch-winemetal-fps-cap.py"],
+                "note": "Unset (default): no cap beyond the FPS limit. 10-120: frames start at most N times a second for "
+                        "the whole session: a Direct3D 12 game's thread waits after each Present, a DXMT game's encode "
+                        "thread before each present (a timed kernel wait, not a spin). Any value, e.g. 20 or 24, unlike "
+                        "the FPS limit's 30/40/60; the lower of the two applies. While it is set, env.MADEIRA_FPS_GOV_MW "
+                        "is ignored. Needs the [xp] sampler (MADEIRA_PROBES not 0). Read at session start."},
+    "env.MADEIRA_FPS_GOV_MW": {"category": "Windows, display & input", "title": "Hold CPU power with a frame cap (mW)",
+                "kind": "int", "default": "",
+                "sources": ["build/ntdll-unix/server_ios.c", "madeira-d3d12/src/pe/madeira_d3d12.c",
+                            "tools/patch-winemetal-fps-cap.py"],
+                "note": "Unset (default): off. N: while the game presents, the process's CPU power ([xp]'s energy) is "
+                        "held at N mW on average by moving a frame cap between 60, 40, 30, 24 and 20 fps (at most one "
+                        "step per 3 s; held while nothing presents). Unlike env.MADEIRA_POWER_GOV_MW it moves no thread "
+                        "to the efficiency cores. Menus and loading at 3-4 W fill the budget after which iOS clamps the "
+                        "CPU; e.g. 1500 keeps a 60 fps menu near 30-40 fps. [fps-gov] lines every 10 s. "
+                        "env.MADEIRA_FPS_GOV_MIN / _MAX (20 / 60) bound the cap, _BAND_MJ (1500) is the energy the "
+                        "average may drift before it moves. Needs the [xp] sampler. Read at session start."},
+    "env.MADEIRA_FPS_GOV_MAX": {"category": "Windows, display & input", "title": "Frame-cap governor: highest cap (fps)",
+                "kind": "int", "default": "60", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: the highest frame cap the governor uses, the largest of "
+                        "60, 40, 30, 24 and 20 at or below this value (20 when lower). Unset: 60. Read at session start."},
+    "env.MADEIRA_FPS_GOV_MIN": {"category": "Windows, display & input", "title": "Frame-cap governor: lowest cap (fps)",
+                "kind": "int", "default": "20", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: the lowest frame cap the governor goes down to, the "
+                        "smallest of 60, 40, 30, 24 and 20 at or above this value, never above the highest cap. "
+                        "Unset: 20. Read at session start."},
+    "env.MADEIRA_FPS_GOV_BAND_MJ": {"category": "Windows, display & input", "title": "Frame-cap governor: energy band (mJ)",
+                "kind": "int", "default": "1500", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: how much energy the running balance may drift above or "
+                        "below the target before the cap moves one step (100-100000; unset or out of range: 1500). "
+                        "Smaller moves the cap sooner and more often. Read at session start."},
     # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],
