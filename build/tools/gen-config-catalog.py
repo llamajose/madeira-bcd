@@ -625,6 +625,15 @@ OVERLAY = {
                         "healer run at utility QoS, on the efficiency cores, ECO on or off; neither does work a frame "
                         "waits for. The wineserver thread, the exception thread, audio and the interface keep their "
                         "QoS. Off (default): they keep the QoS they were created with. Read at session start."},
+    # madeira-bcd: the power probe (build/ntdll-unix/server_ios.c ios_power_probe_tick).
+    "env.MADEIRA_POWER_PROBE": {"category": "Debugging / logs", "title": "Log GPU and device power every 5 s",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "1: every 5 s a [power] line next to [xp]'s CPU energy: the GPU energy and time the driver "
+                        "charged to the app's coalition, the SoC's Energy Model counters (IOReport) and the battery's "
+                        "voltage and current (the whole device while unplugged), each source named unavailable once "
+                        "when the system gives nothing; and [power-t], the threads that used the most energy. Off "
+                        "(default): nothing is read. Needs the [xp] sampler. Read at session start."},
     # madeira-bcd: the frame-cap power governor (build/ntdll-unix/server_ios.c ios_fps_gov_step,
     # madeira-d3d12 Present, tools/patch-winemetal-fps-cap.py).
     "env.MADEIRA_FPS_CAP": {"category": "Windows, display & input", "title": "Fixed frame cap (fps)",
