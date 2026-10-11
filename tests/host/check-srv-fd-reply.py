@@ -191,6 +191,7 @@ int wine_server_receive_fd( obj_handle_t *handle )
 }
 
 /* ---- the server side ---- */
+struct fd;   /* declared first: Apple clang rejects the function-scoped one as an incompatible pointer type */
 struct fd_ops { enum server_fd_type (*get_fd_type)( struct fd *fd ); };
 struct fd { int unix_fd; int cacheable; unsigned int options; const struct fd_ops *fd_ops; };
 struct process { int id; };

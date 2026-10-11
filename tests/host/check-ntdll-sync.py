@@ -341,6 +341,7 @@ static NTSTATUS NtWaitForAlertByThreadId( const void *addr, const LARGE_INTEGER 
     return ret;
 }
 NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit );
+BOOL WINAPI RtlTryEnterCriticalSection( RTL_CRITICAL_SECTION *crit );
 NTSTATUS WINAPI RtlLeaveCriticalSection( RTL_CRITICAL_SECTION *crit );
 NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size, const LARGE_INTEGER *timeout );
 void WINAPI RtlWakeAddressAll( const void *addr );
