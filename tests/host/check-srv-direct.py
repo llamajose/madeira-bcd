@@ -99,6 +99,7 @@ harness = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef pthread_mutex_t os_unfair_lock;
@@ -239,10 +240,22 @@ static void *loop_thread( void *arg )
     ios_srv_loop_exit();
     return NULL;
 }
+/* the clients go on past 60000 calls each until both paths have run 1000 times
+ * (the loop thread may start late on a loaded or sanitized host), at most 20 s */
+static int stress_need_more( const struct timespec *t0 )
+{
+    struct timespec t;
+    if (__atomic_load_n( &direct_ok, __ATOMIC_RELAXED ) > 1000 &&
+        __atomic_load_n( &direct_pipe, __ATOMIC_RELAXED ) > 1000) return 0;
+    clock_gettime( CLOCK_MONOTONIC, &t );
+    return t.tv_sec - t0->tv_sec < 20;
+}
 static void *client_thread( void *arg )
 {
     int k = (int)(long)arg, n;
-    for (n = 0; n < 60000; n++)
+    struct timespec t0;
+    clock_gettime( CLOCK_MONOTONIC, &t0 );
+    for (n = 0; n < 60000 || stress_need_more( &t0 ); n++)
     {
         union { union generic_request req; union generic_reply reply; } u;
         int r;
