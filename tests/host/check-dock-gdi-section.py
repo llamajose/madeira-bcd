@@ -12,7 +12,11 @@ Dock start now asks for the section; madeira.cfg can still turn it off.
 
 Checks:
   * startDock sets MADEIRA_GDI_SHARED_SECTION=1 once, before the launch request, and
-    nothing else in the app sets or clears it (the regular launch path is unchanged);
+    nothing else in the app's Swift sets or clears it;
+  * madeira-bcd: the bridge asks for the section for a Wine desktop session
+    (MADEIRA_DESKTOP=1) only when nothing set the variable, after madeira.cfg's and the
+    game's env lines are exported, and clears only its own value when the session ends
+    (a desktop session also starts 64-bit and runs 32-bit installers: CATIA V5, build 501);
   * the bridge exports madeira.cfg env.* entries with setenv(..., 1) when the session
     starts, i.e. after startDock, so env.MADEIRA_GDI_SHARED_SECTION = 0 still wins;
   * when the wine submodule is checked out: gdi_shared_use_section(), compiled
@@ -47,7 +51,7 @@ for path in sorted(app.rglob('*')):
         continue
     text = path.read_text(encoding='utf-8', errors='replace')
     count = text.count('"MADEIRA_GDI_SHARED_SECTION"')
-    expected = 1 if path.name == 'ContentView.swift' else 0
+    expected = {'ContentView.swift': 1, 'WineProcessBridge.m': 3}.get(path.name, 0)
     if count != expected:
         require(False, f'{path.name}: MADEIRA_GDI_SHARED_SECTION appears {count} time(s), expected {expected}')
 require(content.count('"MADEIRA_GDI_SHARED_SECTION"') == 1, 'nothing else in ContentView touches it (regular launches unchanged)')
@@ -57,6 +61,20 @@ export = bridge.index('if (![line hasPrefix:@"env."] || eq.location == NSNotFoun
 # ml1184 grew the export loop (a game's own keys win), so look to the end of it.
 require('setenv(k.UTF8String, v.UTF8String, 1);' in bridge[export:export + 6000],
         'madeira.cfg env.* entries are exported with overwrite when the session starts')
+
+# madeira-bcd: the desktop default comes after both exports (madeira.cfg's, then the game's
+# own lines), only when the variable is unset, and is undone only by its own session's end.
+game_export = bridge.index('const char *gameCfg = getenv("MADEIRA_CFG_GAME");')
+desk = bridge.index('if (desk && desk[0] == \'1\' && !getenv("MADEIRA_GDI_SHARED_SECTION")) {')
+require(export < game_export < desk, 'desktop default: after the madeira.cfg and game env exports')
+require('const char *desk = getenv("MADEIRA_DESKTOP");' in bridge[desk - 200:desk],
+        'desktop default: only for MADEIRA_DESKTOP=1 sessions')
+require('setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1);\n                        g_bcd_desktop_gdi_section = 1;'
+        in bridge[desk:desk + 300], 'desktop default: sets "1" and remembers it set it')
+ended = bridge.index('if (g_bcd_desktop_gdi_section) { unsetenv("MADEIRA_GDI_SHARED_SECTION"); g_bcd_desktop_gdi_section = 0; }')
+require(ended > desk and bridge.rfind('g_wine_running = 0;', 0, ended) > desk
+        and 'stopping wineserver' in bridge[ended:ended + 400],
+        'desktop default: cleared at the end of the session that set it, nowhere else')
 
 gdiobj = root / 'wine' / 'dlls' / 'win32u' / 'gdiobj.c'
 if gdiobj.exists():

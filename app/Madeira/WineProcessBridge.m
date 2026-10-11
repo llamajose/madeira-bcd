@@ -301,6 +301,8 @@ volatile int g_madeira_srv_eco_follow = 0;   /* env.MADEIRA_SRV_ECO_FOLLOW = 1 *
 volatile int g_madeira_srv_direct = 0;       /* env.MADEIRA_SRV_DIRECT = 1 or 2 */
 volatile int g_madeira_srv_idle_us = 0;      /* env.MADEIRA_SRV_IDLE_US = 100..50000, 0 = 1000 */
 volatile int g_madeira_srv_log_all = 0;      /* env.MADEIRA_SRV_LOG_ALL = 1 */
+/* madeira-bcd: this session's desktop default set MADEIRA_GDI_SHARED_SECTION (cleared at its end) */
+static int g_bcd_desktop_gdi_section = 0;
 
 /* Session exit report for the library front end. The app marks one process as
  * its own: the program it hands to __wine_main below, which is the session's
@@ -1306,6 +1308,25 @@ static void *wine_process_thread(void *arg) {
                     setenv("MADEIRA_FASTSYNC", "auto", 0);
                     fprintf(stderr, "[madeira-env] sync engine: fastsync (default), MADEIRA_FASTSYNC=auto\n");
                 }
+                /* madeira-bcd: a Wine desktop session (MADEIRA_DESKTOP=1: the library's Desktop,
+                 * a game started in the desktop, the developer interface's desktop buttons) starts
+                 * 64-bit (explorer), and the programs started in it are often 32-bit installers.
+                 * win32u decides once, at the first program, whether the GDI handle table is a
+                 * section 32-bit programs can map in their guest window (wine dlls/win32u/gdiobj.c,
+                 * gdi_shared_use_section); otherwise 32-bit gdi32 truncates the table's address and
+                 * faults on its first GDI handle (CATIA V5's CXINST.exe, build 501: mfc90u.dll
+                 * failed to initialise). The Dock asks for the section the same way
+                 * (ContentView.startDock). A value already set wins: madeira.cfg's or the game's
+                 * env.MADEIRA_GDI_SHARED_SECTION, exported above, or the Dock's. */
+                {
+                    const char *desk = getenv("MADEIRA_DESKTOP");
+                    if (desk && desk[0] == '1' && !getenv("MADEIRA_GDI_SHARED_SECTION")) {
+                        setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1);
+                        g_bcd_desktop_gdi_section = 1;
+                        fprintf(stderr, "[madeira-env] desktop session: MADEIRA_GDI_SHARED_SECTION=1 "
+                                        "(32-bit programs map the GDI handle table in their window)\n");
+                    }
+                }
             }
         }
 
@@ -1997,6 +2018,8 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_SRV_IDLE_US"); unsetenv("MADEIRA_SRV_LOG_ALL");
         g_madeira_srv_eco_follow = 0; g_madeira_srv_direct = 0;
         g_madeira_srv_idle_us = 0; g_madeira_srv_log_all = 0;
+        /* madeira-bcd: the desktop's GDI table default was this session's own */
+        if (g_bcd_desktop_gdi_section) { unsetenv("MADEIRA_GDI_SHARED_SECTION"); g_bcd_desktop_gdi_section = 0; }
 
         // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
         dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");
