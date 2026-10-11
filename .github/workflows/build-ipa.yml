@@ -1177,6 +1177,16 @@ jobs:
       - name: Patch winemetal frame cap for the power governor
         run: python3 tools/patch-winemetal-fps-cap.py
 
+      # On Apple's tile-based GPU every attachment a pass stores is a whole pass
+      # over that surface in memory. With madeira.cfg / a game's config
+      # rp-discard = 1, madeira-d3d12 leaves the store actions of a pass whose
+      # texture the game discards open (Unknown) and sets them when the pass
+      # ends: no store when the next use is a DiscardResource or a whole
+      # clear. MadeiraCtl op 24 sets them; unused unless the switch is on.
+      # Native only.
+      - name: Patch winemetal late render-pass store actions
+        run: python3 tools/patch-winemetal-rp-store.py
+
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
       # commit. Cached per wine/DXMT revision; a failure only leaves 32-bit
@@ -1386,6 +1396,11 @@ jobs:
       # madeira-bcd: madeira.cfg yield-mode (tools/patch-wine-yield-mode.py), opt-in.
       - name: Check yield-mode
         run: python3 tests/host/check-yield-mode.py
+
+      # madeira-bcd: render-pass traffic (gpu-traffic counters, clear-defer;
+      # opt-in rp-carry, rp-discard and its winemetal op 24, f6-rar).
+      - name: Check render-pass traffic
+        run: python3 tests/host/check-render-pass-traffic.py
 
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
