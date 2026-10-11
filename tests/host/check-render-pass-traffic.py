@@ -26,8 +26,9 @@ command lists through a loop that carries the real loop's hooks, and checks:
     a pass with a texture the game discards says Unknown store actions only
     when winemetal answers op 24, and exec_end sets DontCare exactly when the
     next use (this list, then the call's later lists) is a whole discard or a
-    whole clear of the aspect, Store otherwise; the traffic moves to "not
-    stored"; the decision follows a carried pass into the next list;
+    whole clear of the aspect, Store otherwise, after the thread's queued
+    encode-batch commands went out and before endEncoding; the traffic moves
+    to "not stored"; the decision follows a carried pass into the next list;
   - tools/patch-winemetal-rp-store.py: applies once to winemetal_unix.c,
     op 24 sits in _madeira_ctl (not forwarded to i386), and its code, compiled
     with a recording encoder, answers a probe and sets only the actions given;
@@ -202,7 +203,7 @@ int main(void) {
 else:
     print("note: no dxmt sources; the patch's own checks are skipped")
 cat = (root / "app/Madeira/ConfigCatalog.generated.swift").read_text()
-for key, dflt in (("clear-defer", "1"), ("rp-carry", "0"), ("rp-discard", "0")):
+for key, dflt in (("clear-defer", "1"), ("rp-carry", "0"), ("rp-discard", "0"), ("f6-rar", "0")):
     check(f"catalog lists {key}, default {dflt}",
           re.search(r'key: "%s".*kind: \.bool, defaultValue: "%s"' % (re.escape(key), dflt), cat) is not None)
 wf = (root / ".github/workflows/build-ipa.yml").read_text()
@@ -214,6 +215,7 @@ exec_struct = between("struct mad_exec {", "\n};\n") + "\n};\n"
 rp_last = re.search(r"    struct \{ struct mad_resource \*rt\[8\], \*depth;[^\n]*\} rp_last;\n", src).group(0)
 rp_lists = re.search(r"    ID3D12CommandList \*const \*rp_lists; UINT rp_nlists, rp_idx;[^\n]*\n", src).group(0)
 bc_enum = re.search(r"enum \{ BC_RAR, [^\n]*\};\n", src).group(0)
+eb_enum = re.search(r"enum \{ EBF_END, [^\n]*\};", src).group(0)
 rtvp = re.search(r"struct mad_rtvp \{[^\n]*\};\n", src).group(0)
 tr_globals = between("/* madeira-bcd gpu-traffic: what every render pass moves", "static int g_census_on;")
 helpers = between("static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {",
@@ -259,13 +261,18 @@ struct mad_queue { struct mad_device *device; struct mad_vis_batch *vis; unsigne
 static LONG InterlockedIncrement(volatile LONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static void *InterlockedCompareExchangePointer(void *volatile *p, void *x, void *cmp) {
     void *e = cmp; __atomic_compare_exchange_n(p, &e, x, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+/* encode-batch: what this thread queued goes out (recorded: op 24 must come after it) */
+''' + eb_enum + r'''
+static int eb_flushed;
+static void mad_eb_flush_cur(int why) { if (why == EBF_OTHER) eb_flushed = 1; }
 /* MadeiraCtl op 24 as tools/patch-winemetal-rp-store.py answers it (op24_ok = 0: a winemetal without it) */
-static int op24_ok, op24_probes, n24; static struct { UINT64 enc; UINT8 color[8], depth, stencil, pad[6]; } r24[64];
+static int op24_ok, op24_probes, n24, f24[64]; static struct { UINT64 enc; UINT8 color[8], depth, stencil, pad[6]; } r24[64];
 void MadeiraCtl(struct madeira_ctl_args *a) {
     const UINT8 *p = (const UINT8 *)(uintptr_t)a->ptr;
     a->ret = 0;
     if (a->op != 24 || !op24_ok || !p || a->len < 24) return;
-    if (!*(const UINT64 *)p) op24_probes++; else if (n24 < 64) memcpy(&r24[n24++], p, 24);
+    if (!*(const UINT64 *)p) op24_probes++; else if (n24 < 64) { f24[n24] = eb_flushed; memcpy(&r24[n24++], p, 24); }
+    eb_flushed = 0;
     a->ret = 1;
 }
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
@@ -289,14 +296,19 @@ static volatile LONG64 g_pass_attach_bytes;
 static LONG64 g_ac_load, g_ac_clear;
 ''' + tr_globals + r'''
 /* the recording Metal: every encoder as an event */
-struct ev { char kind; int ended, waits, updates; obj_handle_t h; struct WMTRenderPassInfo rpi; };
+struct ev { char kind; int ended, waits, updates, late_before_end; obj_handle_t h; struct WMTRenderPassInfo rpi; };
 static struct ev evs[256]; static int nev;
 static struct ev *ev_of(obj_handle_t h) { int i; for (i = nev - 1; i >= 0; i--) if (evs[i].h == h) return &evs[i]; return NULL; }
 obj_handle_t MTLCommandBuffer_renderCommandEncoder(obj_handle_t cb, struct WMTRenderPassInfo *rpi) {
     struct ev *v = &evs[nev++]; (void)cb; memset(v, 0, sizeof *v); v->kind = 'R'; v->rpi = *rpi; v->h = 0x1000 + nev; return v->h;
 }
 static obj_handle_t new_enc(char kind) { struct ev *v = &evs[nev++]; memset(v, 0, sizeof *v); v->kind = kind; v->h = 0x1000 + nev; return v->h; }
-void MTLCommandEncoder_endEncoding(obj_handle_t h) { struct ev *v = ev_of(h); if (v) v->ended++; }
+void MTLCommandEncoder_endEncoding(obj_handle_t h) {
+    struct ev *v = ev_of(h); int i;
+    if (!v) return;
+    v->ended++;
+    for (i = 0; i < n24; i++) if (r24[i].enc == h) v->late_before_end = 1;
+}
 static int g_mode = 1;
 static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) {
     struct ev *v = ev_of(enc);
@@ -616,6 +628,7 @@ int main(void) {
     ls[0] = l1; ecl(&Q, 1, ls);
     EXPECT(op24_probes == 1 && evs[0].rpi.colors[0].store_action == WMTStoreActionUnknown && late_color(0, 0) == WMTStoreActionDontCare &&
            late_color(0, 1) == -2 && g_tr_nostore == sz(&A, 0) && !g_tr_store, "discard after the last draw: not stored");
+    EXPECT(n24 == 1 && f24[0] && evs[0].ended == 1 && evs[0].late_before_end, "op 24 after the thread's queued commands went out, before endEncoding");
     reset(-1, -1, 1, 1); mad_rp_dset_add(&A);
     l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); rts(l1, 1, b1, NULL); draw(l1); rts(l1, 1, a1, NULL); draw(l1); discard(l1, &A, 1);
     ls[0] = l1; ecl(&Q, 1, ls);

@@ -3597,6 +3597,7 @@ static void exec_rp_late_store(struct mad_exec *e) {
         }
     }
     memset(&a, 0, sizeof a); a.op = 24; a.ptr = (UINT64)(ULONG_PTR)&r; a.len = sizeof r;
+    mad_eb_flush_cur(EBF_OTHER);   /* encode-batch: the pass's queued draws reach Metal first, as before */
     MadeiraCtl(&a);
     if (!a.ret) {   /* cannot happen after a probe that answered; never use Unknown again */
         g_rp_late = 0;
