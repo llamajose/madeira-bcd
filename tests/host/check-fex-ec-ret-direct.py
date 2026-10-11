@@ -146,7 +146,8 @@ else:
             assert on[3][emu.CPUAREA][0] == 1, 'InSimulation is set on the way into the JIT'
             if not ec:
                 same((on[0], on[1], on[2], on[3]), (off[0], off[1], off[2], off[3]))
-                assert off[4] - on[4] == 11, (off[4], on[4])
+                assert off[4] - on[4] == 11, (off[4], on[4])  # the bitmap test it skips
+                assert old[4] - on[4] == 8, (old[4], on[4])  # net of the flag test
             emulated += 1
 
 # 4. The frontend switch.
@@ -192,5 +193,5 @@ assert 'key: "env.MADEIRA_FEX_EC_RET_DIRECT"' in (root / 'app/Madeira/ConfigCata
 
 print(f'EC return direct: overlay idempotent after {len(applied)} build overlays, drift refused; RetToEntryThunk text '
       'checked' + (f'; {emulated} return addresses run through the old and new stub: switched off identical, switched on '
-                   'the same EnterEC state 11 instructions sooner' if emulated else '') +
+                   'the same EnterEC state 8 instructions sooner than unpatched' if emulated else '') +
       '; MADEIRA_FEX_EC_RET_DIRECT=0 keeps the test')

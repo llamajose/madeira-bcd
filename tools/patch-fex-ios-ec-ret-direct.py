@@ -13,8 +13,9 @@ an ARM64EC address is never in L1 (blocks are only compiled for addresses
 the loop top found outside the bitmap). With IosRetToJit set, RetToEntryThunk
 enters the JIT at once; an x64 return address is entered from L1 or looked
 up, an ARM64EC one reaches ExitFunctionEC through the loop top with the same
-x9, sp and LR. That is 11 instructions less on every return from a call into
-ARM64EC code; the rare ARM64EC target takes the longer way.
+x9, sp and LR. The 11-instruction test becomes a 3-instruction flag test, 8
+instructions less on every return from a call into ARM64EC code; the rare
+ARM64EC target takes the longer way.
 
 IosRetToJit lives in Module.S's own data: one more word in Module.cpp's data
 moved a neighbour into a misaligned adrp/ldr pair at link time.
