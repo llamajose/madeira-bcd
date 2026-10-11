@@ -59,7 +59,6 @@ struct LaunchRequest {
     private static var forcedFastsyncOff = false
 
     func apply() {
-        ExperimentalSettings.exportToEnvironment()
         setenv("MADEIRA_EXE", exe, 1)
         if let a = args, !a.isEmpty { setenv("MADEIRA_ARGS", a, 1) } else { unsetenv("MADEIRA_ARGS") }
         if let d = desktop {
@@ -89,7 +88,6 @@ struct LaunchRequest {
             LaunchRequest.forcedFastsyncOff = true
         } else if LaunchRequest.forcedFastsyncOff {
             unsetenv("MADEIRA_FASTSYNC")   // ours from an earlier launch; the cfg export above re-sets its own
-            ExperimentalSettings.exportToEnvironment()
             LaunchRequest.forcedFastsyncOff = false
         }
         LogStore.shared.startSessionLog(program: programName)
@@ -140,13 +138,6 @@ enum ExperimentalSettings {
         get { (Int(MadeiraConfig.get("swap-mb") ?? "") ?? 0) >= 64 }
         set { MadeiraConfig.set("swap-mb", newValue ? String(storageBackedMemoryMB) : nil) }
     }
-
-    /// Must run before runWineFullSequence. Everything here is read from
-    /// madeira.cfg by the native side; what is exported is the update pack
-    /// (UpdatePacks.swift) and the shader cache identity its DLL needs.
-    static func exportToEnvironment() {
-        UpdatePacks.exportEnvironment()
-    }
 }
 
 // MARK: - Root
@@ -166,10 +157,7 @@ struct RootView: View {
             switch screen {
             case .home:
                 HomeView(onLaunch: { screen = .session($0) },
-                         onDeveloper: {
-                             ExperimentalSettings.exportToEnvironment()
-                             screen = .session(nil)
-                         })
+                         onDeveloper: { screen = .session(nil) })
             case .session(let request):
                 ContentView(pendingLaunch: request)
             }
@@ -412,7 +400,6 @@ struct HomeView: View {
 
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var controllers = GameControllerManager.shared
-    @ObservedObject private var packs = UpdatePacks.shared
     @ObservedObject private var shortcuts = ShortcutRouter.shared
     @AppStorage("wine_desktop_res") private var desktopRes = "960x540"
 
@@ -458,7 +445,6 @@ struct HomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     statusRow
-                    UpdateBanner()
                     if !jitOn { jitBanner }
                     if search.isEmpty, let g = recent { continueCard(g) }
                     desktopCard
@@ -484,10 +470,7 @@ struct HomeView: View {
                 }
             }
             .onAppear {
-                if !scannedOnce {
-                    rescan()
-                    UpdatePacks.shared.refresh(silent: true)
-                }
+                if !scannedOnce { rescan() }
             }
             .onChange(of: scenePhase) { _, phase in
                 // StikDebug enables JIT from outside the app, so re-read the
@@ -526,9 +509,6 @@ struct HomeView: View {
                            text: controllers.activeControllerName ?? "Controller", tint: .green)
             }
             StatusChip(icon: "square.stack.3d.up.fill", text: "\(games.count) games", tint: .blue)
-            if packs.installedUsable, let p = packs.installed {
-                StatusChip(icon: "shippingbox.fill", text: "Pack \(p.build)", tint: .teal)
-            }
             Spacer()
         }
         }
@@ -752,6 +732,9 @@ struct HomeView: View {
         // are; FixedBaseImage gives them a relocation table (once, keeping the
         // original).
         if let note = FixedBaseImage.prepare(exe.url) { LogStore.shared.log(note) }
+        // A game seen for the first time starts with Madeira's recommended settings
+        // (GameRecommendationsApply.swift).
+        GameRecommendations.prepare(windowsPath: exe.windowsPath, title: game.title)
         let saved = GameArguments.get(exe.windowsPath)
         let args = saved.isEmpty ? GameArguments.suggestion(for: exe) : saved
         var request: LaunchRequest
@@ -970,6 +953,10 @@ struct GameSettingsSheet: View {
     @State private var photo: PhotosPickerItem?
     @State private var tick = 0
     @State private var copiedLink = false
+    /// Madeira's recommended settings for the chosen exe, nil for none (GameRecommendations.swift).
+    @State private var recommended: GameRecommendation?
+    @State private var confirmReset = false
+    @State private var prepared = false
 
     init(game: LibraryGame, archs: [String: String], onPlay: @escaping () -> Void, onCoverChanged: @escaping () -> Void) {
         self.game = game
@@ -1003,6 +990,24 @@ struct GameSettingsSheet: View {
         submit = profile.get("async-submit") ?? ""
         gpuSync = profile.get("fence-chain") ?? ""
         frameGen = profile.get("env.MADEIRA_FRAMEGEN") ?? ""
+    }
+
+    /// The switches a recommendation writes, as stored now.
+    private func loadSwitches() {
+        avx = LibraryPrefs.avx(exePath)
+        wineVCRT = LibraryPrefs.wineVCRT(exePath)
+        nvidia = LibraryPrefs.nvidia(exePath)
+        safeSync = LibraryPrefs.safeSync(exePath)
+        screen = LibraryPrefs.screen(exePath)
+        loadProfile()
+    }
+
+    /// A game seen for the first time gets Madeira's recommended settings, which the
+    /// sheet then shows (GameRecommendationsApply.swift).
+    private func prepareRecommendation() {
+        recommended = GameRecommendations.recommendation(windowsPath: exePath, steamAppID: nil)
+        GameRecommendations.prepare(windowsPath: exePath, title: game.title)
+        loadSwitches()
     }
 
     /// A picker over (value, label) pairs that also shows a value typed into the raw file.
@@ -1170,6 +1175,24 @@ struct GameSettingsSheet: View {
                             .font(.headline)
                     }
                 }
+
+                // Always last (GameRecommendationsApply.swift); written at once.
+                Section {
+                    Button {
+                        confirmReset = true
+                    } label: {
+                        Label("Reset to Recommended", systemImage: "arrow.counterclockwise")
+                    }
+                    .confirmationDialog(GameRecommendations.question(recommended), isPresented: $confirmReset,
+                                        titleVisibility: .visible) {
+                        Button("Reset", role: .destructive) {
+                            recommended = GameRecommendations.reset(windowsPath: exePath, title: game.title)
+                            loadSwitches()
+                        }
+                    }
+                } footer: {
+                    Text(GameRecommendations.note(recommended, home: true))
+                }
             }
             .navigationTitle(game.title)
             .navigationBarTitleDisplayMode(.inline)
@@ -1181,16 +1204,18 @@ struct GameSettingsSheet: View {
                     Button("Cancel") { dismiss() }
                 }
             }
+            .onAppear {
+                // Once per sheet: coming back from the config editor keeps unsaved choices.
+                guard !prepared else { return }
+                prepared = true
+                prepareRecommendation()
+            }
             .onChange(of: exePath) { _, newPath in
                 // Arguments and the desktop choice belong to an exe, not a title.
                 args = GameArguments.get(newPath)
                 inDesktop = LibraryPrefs.inDesktop(newPath)
-                avx = LibraryPrefs.avx(newPath)
-                wineVCRT = LibraryPrefs.wineVCRT(newPath)
-                nvidia = LibraryPrefs.nvidia(newPath)
-                safeSync = LibraryPrefs.safeSync(newPath)
-                screen = LibraryPrefs.screen(newPath)
-                loadProfile()
+                // The switches, the game's file and its recommendation (loadSwitches).
+                prepareRecommendation()
             }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
@@ -1314,8 +1339,6 @@ struct AppSettingsSheet: View {
                 } footer: {
                     Text("Library is upstream's game library (the default). Applies after Madeira restarts.")
                 }
-                UpdatesSection()
-
                 SavesSection()
 
                 StorageSection()

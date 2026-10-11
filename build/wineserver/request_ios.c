@@ -316,23 +316,124 @@ static void call_req_handler( struct thread *thread )
     {
         static unsigned long counts[REQ_NB_REQUESTS], total;
         static struct timespec t0;
-        if (req < REQ_NB_REQUESTS) counts[req]++;
+        /* madeira-bcd: and from whom. Four heavy-hitter slots per request
+         * (space-saving: a newcomer replaces the smallest and inherits its
+         * count), so a storm (set_cursor 2,400/s in build 437) names its
+         * thread and process; a slot's count can overstate by at most the
+         * count it inherited. */
+        static struct { unsigned int tid, pid; unsigned long n; } hh[REQ_NB_REQUESTS][4];
+        static unsigned long cursor_flags[6];   /* set_cursor by flag: handle count pos clip noclip fsclip */
+        /* madeira-bcd: the shape of each wait. Fastsync answers a single,
+         * non-alertable wait on an event (or, with MADEIRA_FASTSYNC_SEM=1, on a
+         * semaphore) in the client; every other shape stays a server round
+         * trip. GTA V sent ~15,000 selects a second in build 442 (sem=off), and
+         * these counts say how many of them the switch could take away.
+         * Shapes: single, single alertable, any of many, all of many,
+         * signal-and-wait, keyed event, other; objects by the first handle. */
+        static unsigned long sel_shape[7], sel_obj[8], sel_multi_sem;
+        if (req == REQ_select &&
+            get_req_data_size() >= sizeof(union apc_result) + sizeof(enum select_opcode))
+        {
+            const union apc_result *res = get_req_data();
+            data_size_t size = min( thread->req.select_request.size, get_req_data_size() - sizeof(*res) );
+            union select_op op;
+            unsigned int nh = 0, i, shape;
+            int has_sem = 0;
+
+            memset( &op, 0, sizeof(op) );
+            memcpy( &op, res + 1, min( size, sizeof(op) ) );
+            if ((op.op == SELECT_WAIT || op.op == SELECT_WAIT_ALL) && size > offsetof( union select_op, wait.handles ))
+                nh = min( (size - offsetof( union select_op, wait.handles )) / sizeof(obj_handle_t),
+                          MAXIMUM_WAIT_OBJECTS );
+            if (op.op == SELECT_WAIT && nh == 1)
+                shape = (thread->req.select_request.flags & SELECT_ALERTABLE) ? 1 : 0;
+            else if (op.op == SELECT_WAIT) shape = 2;
+            else if (op.op == SELECT_WAIT_ALL) shape = 3;
+            else if (op.op == SELECT_SIGNAL_AND_WAIT) shape = 4;
+            else if (op.op == SELECT_KEYED_EVENT_WAIT || op.op == SELECT_KEYED_EVENT_RELEASE) shape = 5;
+            else shape = 6;
+            sel_shape[shape]++;
+            for (i = 0; i < nh; i++)
+            {
+                struct object *obj = get_handle_obj( thread->process, op.wait.handles[i], 0, NULL );
+                const struct type_descr *type;
+                int k = 7;
+
+                if (!obj) clear_error();   /* the handler reports a bad handle itself */
+                else
+                {
+                    type = obj->ops->type;
+                    k = type == &semaphore_type ? 0 : type == &event_type ? 1 : type == &mutex_type ? 2 :
+                        type == &thread_type ? 3 : type == &process_type ? 4 : type == &timer_type ? 5 :
+                        type == &completion_type ? 6 : 7;
+                    release_object( obj );
+                }
+                if (!i) sel_obj[k]++;
+                if (!k) has_sem = 1;
+            }
+            if (nh > 1 && has_sem) sel_multi_sem++;
+        }
+        if (req == REQ_set_cursor)
+        {
+            unsigned int f = thread->req.set_cursor_request.flags, b;
+            for (b = 0; b < 6; b++) if (f & (1u << b)) cursor_flags[b]++;
+        }
+        if (req < REQ_NB_REQUESTS)
+        {
+            unsigned int tid = thread->id, pid = thread->process ? thread->process->id : 0;
+            int s, low = 0;
+            counts[req]++;
+            for (s = 0; s < 4; s++)
+            {
+                if (hh[req][s].n && hh[req][s].tid == tid) { hh[req][s].n++; break; }
+                if (hh[req][s].n < hh[req][low].n) low = s;
+            }
+            if (s == 4)
+            {
+                hh[req][low].tid = tid; hh[req][low].pid = pid; hh[req][low].n++;
+            }
+        }
         if (!total) clock_gettime( CLOCK_MONOTONIC, &t0 );
         if (++total % 200000 == 0)
         {
-            struct timespec t1; char line[600]; int n = 0, k; unsigned r;
+            struct timespec t1; char line[1400]; int n = 0, k, s; unsigned r;
             clock_gettime( CLOCK_MONOTONIC, &t1 );
             for (k = 0; k < 10; k++)
             {
-                unsigned best = 0; unsigned long bn = 0;
+                unsigned best = 0, top = 0; unsigned long bn = 0;
                 for (r = 0; r < REQ_NB_REQUESTS; r++) if (counts[r] > bn) { bn = counts[r]; best = r; }
                 if (!bn) break;
-                n += snprintf( line + n, sizeof(line) - n, " req%u=%lu", best, bn );
+                for (s = 1; s < 4; s++) if (hh[best][s].n > hh[best][top].n) top = s;
+                n += snprintf( line + n, sizeof(line) - n, " req%u=%lu(tid %04x pid %04x ~%lu)", best, bn,
+                               hh[best][top].tid, hh[best][top].pid, hh[best][top].n );
                 counts[best] = 0;
             }
             for (r = 0; r < REQ_NB_REQUESTS; r++) counts[r] = 0;
+            memset( hh, 0, sizeof(hh) );
             fprintf( stderr, "[srv-req] ml1055 last 200000 requests in %.1f s:%s\n",
                      (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, line );
+            if (cursor_flags[0] + cursor_flags[1] + cursor_flags[2] + cursor_flags[3] + cursor_flags[4])
+            {
+                extern unsigned long ios_clip_repeats_skipped;
+                fprintf( stderr, "[srv-req] set_cursor by flag: handle=%lu count=%lu pos=%lu clip=%lu noclip=%lu "
+                         "fsclip=%lu; unchanged ClipCursor notifications skipped so far: %lu\n",
+                         cursor_flags[0], cursor_flags[1], cursor_flags[2], cursor_flags[3], cursor_flags[4],
+                         cursor_flags[5], ios_clip_repeats_skipped );
+                memset( cursor_flags, 0, sizeof(cursor_flags) );
+            }
+            if (sel_shape[0] + sel_shape[1] + sel_shape[2] + sel_shape[3] + sel_shape[4] + sel_shape[5] + sel_shape[6])
+            {
+                fprintf( stderr, "[srv-req] select by shape: single %lu, single alertable %lu, any of many %lu "
+                         "(%lu with a semaphore), all of many %lu, signal-and-wait %lu, keyed event %lu, other %lu; "
+                         "first object: semaphore %lu, event %lu, mutex %lu, thread %lu, process %lu, timer %lu, "
+                         "completion %lu, other %lu\n",
+                         sel_shape[0], sel_shape[1], sel_shape[2], sel_multi_sem, sel_shape[3], sel_shape[4],
+                         sel_shape[5], sel_shape[6], sel_obj[0], sel_obj[1], sel_obj[2], sel_obj[3], sel_obj[4],
+                         sel_obj[5], sel_obj[6], sel_obj[7] );
+                memset( sel_shape, 0, sizeof(sel_shape) );
+                memset( sel_obj, 0, sizeof(sel_obj) );
+                sel_multi_sem = 0;
+            }
             t0 = t1;
         }
     }
@@ -357,6 +458,28 @@ static void call_req_handler( struct thread *thread )
         }
     }
     current = NULL;
+}
+
+/* madeira-bcd doorbell (fd_ios.c ios_srv_bell): read the request fd of thread
+ * `tid` the way a POLLIN on it would; 1 when a request is still partly unread */
+int ios_doorbell_poll_thread( unsigned int tid )
+{
+    extern void ios_fd_poll_in( struct fd *fd );
+    struct thread *thread = get_thread_from_id( tid );
+    int again = 0;
+
+    if (!thread)
+    {
+        clear_error();
+        return 0;
+    }
+    if (thread->request_fd)
+    {
+        ios_fd_poll_in( thread->request_fd );
+        again = thread->request_fd && thread->req_toread;
+    }
+    release_object( thread );
+    return again;
 }
 
 /* read a request from a thread */

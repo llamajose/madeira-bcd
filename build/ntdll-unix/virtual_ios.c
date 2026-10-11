@@ -219,6 +219,19 @@ static size_t jit_pool_offset = 0;
  * the unsplit one. */
 static size_t ios_jit_hole_off, ios_jit_hole_end;
 
+/* madeira-bcd POOL-MID (StikJITHelper.swift, `pool-mid`, on with pool-split; env
+ * WINE_IOS_JIT_HOLE2="<off>:<end>", hex pool offsets). RDR2 on build 470
+ * (2026-10-09 14:33): a 71 MB mapping sat in the band before the app's image-load
+ * constructor ran, so the split pool came out as A 285 MB + B 319 MB (604 MB of
+ * 896) around a 291 MB hole holding that mapping, 213 MB of FREE space and the
+ * main thread's stack; the image copies ran the pool dry and d3dcompiler_47.dll
+ * did not load (ERR_GFX_INIT). The app now takes such a free run between A and
+ * B as a third debugger region M, aliased in the same span, and names a second
+ * hole: hole 1 is then the part below M (the early mapping), hole 2 the part
+ * above it (the stack). Hole 1 lies below hole 2. Without the env var both bounds
+ * stay 0 and every helper below is the one-hole one. */
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;
+
 /* madeira-bcd BIG-IMAGE SLOT (env MADEIRA_POOL_BIG_SLOT_MB = N, split pool only;
  * off by default). Ten processes each copy their own system DLLs into the pool
  * (GTA V Enhanced build 373, 2026-10-04 08:41: 326 images, 469 MB -- shell32
@@ -327,8 +340,64 @@ static size_t ios_pool_code_cap( size_t total, size_t head, size_t tail,
     return cap;
 }
 
-/* 1 for a pool offset inside the hole (always 0 without a split). */
-#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)
+/* madeira-bcd pool-mid: the one-hole helpers above applied to both holes (hole 1
+ * below hole 2; with no second hole h2_off == h2_end == 0 and these are the
+ * one-hole helpers). A head allocation jumps hole 1, then hole 2; a tail carve,
+ * counted down from the top, jumps hole 2 first, then hole 1. */
+static size_t ios_pool_holes_head_place( size_t cur, size_t size, size_t h1_off, size_t h1_end,
+                                         size_t h2_off, size_t h2_end )
+{
+    return ios_pool_hole_head_place( ios_pool_hole_head_place( cur, size, h1_off, h1_end ), size, h2_off, h2_end );
+}
+
+static size_t ios_pool_holes_tail_start( size_t total, size_t cur, size_t size, size_t h1_off, size_t h1_end,
+                                         size_t h2_off, size_t h2_end )
+{
+    return ios_pool_hole_tail_start( total, ios_pool_hole_tail_start( total, cur, size, h2_off, h2_end ),
+                                     size, h1_off, h1_end );
+}
+
+static size_t ios_pool_holes_between( size_t total, size_t head, size_t tail, size_t h1_off, size_t h1_end,
+                                      size_t h2_off, size_t h2_end )
+{
+    return ios_pool_hole_between( total, head, tail, h1_off, h1_end ) +
+           ios_pool_hole_between( total, head, tail, h2_off, h2_end );
+}
+
+/* The pool memory in [lo, hi) outside both holes, in at most three pieces
+ * (ascending, 16 KB granular; smaller pieces dropped): what a head jump or a tail
+ * carve skipped over, which stays usable. Returns the number of pieces. */
+static int ios_pool_skip_pieces( size_t lo, size_t hi, size_t h1_off, size_t h1_end,
+                                 size_t h2_off, size_t h2_end, size_t piece_off[3], size_t piece_size[3] )
+{
+    size_t hole_lo[2] = { h1_off, h2_off }, hole_hi[2] = { h1_end, h2_end };
+    size_t cur = lo;
+    int n = 0, i;
+
+    for (i = 0; i < 2 && cur < hi; i++)
+    {
+        if (hole_hi[i] <= hole_lo[i] || hole_hi[i] <= cur) continue;   /* no hole, or below the cursor */
+        if (hole_lo[i] >= hi) break;
+        if (hole_lo[i] > cur && hole_lo[i] - cur >= 0x4000)
+        {
+            piece_off[n] = cur;
+            piece_size[n] = (hole_lo[i] - cur) & ~(size_t)0x3fff;
+            n++;
+        }
+        cur = hole_hi[i];
+    }
+    if (cur < hi && hi - cur >= 0x4000)
+    {
+        piece_off[n] = cur;
+        piece_size[n] = (hi - cur) & ~(size_t)0x3fff;
+        n++;
+    }
+    return n;
+}
+
+/* 1 for a pool offset inside a hole (always 0 without a split). */
+#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off || \
+                             (size_t)(o) - ios_jit_hole2_off < ios_jit_hole2_end - ios_jit_hole2_off)
 
 /* madeira-bcd POOL-LOW (StikJITHelper.swift, `pool-low = 1` in madeira.cfg or in a
  * game's own file; env WINE_IOS_JIT_TAIL_REGION="<rx>:<size>", hex). Off by default.
@@ -644,6 +713,7 @@ extern size_t ios_jit_pool_size_global;         /* defined below */
  * pool count. Called periodically, so we see WHEN a slot goes bad, not just
  * that it did. */
 static void ios_bigres_report( const char *why );   /* defined below */
+static void ios_band_census( const char *why );     /* defined below (madeira-bcd, RDR2) */
 
 static void ios_slot_probe( const char *why )
 {
@@ -918,6 +988,27 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+/* madeira-bcd: how often the warmer's address-space sweeps run, in its ~2 s
+ * cycles. In build 442's GTA V gameplay the [phys-map] walk covered ~182,000
+ * regions in ~1.3 s at 60-70 % of a core every 10 s, and every third of those
+ * also walked the four pool slots ([slot#2] alone ~72,000 regions) and the
+ * furniture window: the warmer's whole cost, in bursts the game's saturated
+ * P cores paid for. Page warming still runs every cycle; the .text sweep keeps
+ * its cadence. MADEIRA_WARMER_SWEEP_CYCLES (default 30, ~1 min; 5 restores the
+ * old 10 s map walk with the inventory every 15). */
+static unsigned ios_warmer_sweep_cycles( void )
+{
+    static unsigned v;
+    if (!v)
+    {
+        /* cycles of ~2 s between the warmer's map walk and slot/window inventory (default 30; 5 = old). */
+        const char *e = getenv( "MADEIRA_WARMER_SWEEP_CYCLES" );
+        unsigned long n = e && *e ? strtoul( e, NULL, 10 ) : 0;
+        v = n >= 1 && n <= 100000 ? (unsigned)n : 30;
+    }
+    return v;
+}
+
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -1070,7 +1161,8 @@ static void *ios_pool_warmer_thread( void *arg )
                     dprintf(2, "[pool-rot] clean: %lu .text pages sampled across %u mappings (cycle=%u)\n",
                             (unsigned long)checked, ios_jit_mapping_count, cycle);
             }
-            if (cycle == 1 || (cycle % 15) == 0)
+            if (cycle == 1 || (ios_warmer_sweep_cycles() == 5 ? (cycle % 15) == 0
+                                                               : (cycle % ios_warmer_sweep_cycles()) == 0))
             {
                 /* ml469 (wall #79): one-shot proof of whether TCP loopback
                  * works at all under this port — the webhelper's transport
@@ -1097,6 +1189,7 @@ static void *ios_pool_warmer_thread( void *arg )
                     if (ios_layerkit_hi) ios_window_inventory( "layerkit-span", ios_layerkit_lo, ios_layerkit_hi );
                 }
                 ios_bigres_report( "periodic" );
+                ios_band_census( "periodic" );   /* env.MADEIRA_BAND_CENSUS = 1 only */
             }
             /* ml358 FOOTPRINT (every cycle, one line): phys_footprint is the
              * EXACT number jetsam kills on — everything else in this file
@@ -1215,7 +1308,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * addresses identify the owner offline (pool = RX base, FEX bands,
              * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
              * walk is tens of thousands of kernel calls. */
-            if (cycle == 2 || (cycle % 5) == 0)
+            if (cycle == 2 || (cycle % ios_warmer_sweep_cycles()) == 0)
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
@@ -1271,6 +1364,8 @@ static void *ios_pool_warmer_thread( void *arg )
                 memset( swap_by_tag, 0, sizeof(swap_by_tag) );
                 memset( band_dirty, 0, sizeof(band_dirty) );
                 memset( band_res, 0, sizeof(band_res) );
+                struct timespec pm_t0, pm_t1;   /* madeira-bcd: what the walk costs */
+                clock_gettime( CLOCK_MONOTONIC, &pm_t0 );
                 for (;;)
                 {
                     vm_region_submap_info_data_64_t info;
@@ -1374,8 +1469,12 @@ static void *ios_pool_warmer_thread( void *arg )
                     raddr += rsize;
                     if (++regions > 200000) { dprintf(2, "[phys-map] TRUNCATED at %u regions\n", regions); break; }
                 }
-                dprintf(2, "[phys-map] rev=ml359 cycle=%u regions=%u total_dirty=%llu MB\n",
-                        cycle, regions, total_dirty >> 20);
+                clock_gettime( CLOCK_MONOTONIC, &pm_t1 );
+                dprintf(2, "[phys-map] rev=ml359 cycle=%u regions=%u total_dirty=%llu MB (walk %ld ms; next in %u "
+                           "cycles, MADEIRA_WARMER_SWEEP_CYCLES)\n",
+                        cycle, regions, total_dirty >> 20,
+                        (long)((pm_t1.tv_sec - pm_t0.tv_sec) * 1000 + (pm_t1.tv_nsec - pm_t0.tv_nsec) / 1000000),
+                        ios_warmer_sweep_cycles());
                 for (ti = 0; ti < 12; ti++)
                 {
                     if (!top[ti].dirty) continue;
@@ -2252,12 +2351,26 @@ static void ios_va_gap_probe( const char *why )
  */
 static uintptr_t ios_jumbo_hold_base;
 static size_t    ios_jumbo_hold_size;
+/* madeira-bcd: bumped by every release of address space through this file
+ * (unmap_area, remove_reserved_area, the jumbo holdback, the V8 cage, the image
+ * window, Social Club's slots and BRP hold); a placement walk that found no gap
+ * stays true only while it is unchanged (ios_ml1027_place). */
+static unsigned long ios_va_release_epoch;
+static inline void ios_va_release_note( void )
+{
+    __atomic_add_fetch( &ios_va_release_epoch, 1, __ATOMIC_RELAXED );
+}
 /* ml1029: how much of the holdback must stay reserved for the ONE big guest
  * reservation. Anything above this may be carved off the TOP to satisfy an
  * allocation that would otherwise fail outright. Read from
  * madeira-jumbo-keep-mb.txt; 0 (absent) => keep everything, i.e. exactly the
  * pre-ml1029 behaviour. */
 static size_t    ios_jumbo_hold_keep;
+/* madeira-bcd: the smallest request the holdback goes to; 0 (jumbo-mb) => any.
+ * env.MADEIRA_RDR2_VA_HOLD's hold goes only to RDR2.exe's 8960 MB: Social
+ * Club's hinted 1 GB reserve (jumbo#19 in build 457's log) reaches the same
+ * take() whenever its slot walk finds no room. */
+static size_t    ios_jumbo_hold_min;
 
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags );
 
@@ -2276,6 +2389,13 @@ void ios_jumbo_holdback_init( void )
 
     want = (size_t)(madeira_cfg_int( "jumbo-mb", 0 ) * 1024ll * 1024ll);   /* ml1095: madeira.cfg jumbo-mb = N */
     if (!want) return;                       /* opt-in: absent or 0 => off */
+    if (ios_jumbo_hold_size)                 /* madeira-bcd: env.MADEIRA_RDR2_VA_HOLD's hold, from virtual_init */
+    {
+        dprintf( 2, "[jumbo-hold] jumbo-mb = %llu ignored: 0x%llx +%llu MB is already held (MADEIRA_RDR2_VA_HOLD)\n",
+                 want >> 20, (unsigned long long)ios_jumbo_hold_base,
+                 (unsigned long long)(ios_jumbo_hold_size >> 20) );
+        return;
+    }
 
     /* ml1029: the keep floor, same units. ml1095: madeira.cfg jumbo-keep-mb = N */
     ios_jumbo_hold_keep = (size_t)(madeira_cfg_int( "jumbo-keep-mb", 0 ) * 1024ll * 1024ll);
@@ -2351,12 +2471,13 @@ static uintptr_t ios_jumbo_holdback_take( size_t size )
 {
     uintptr_t base = ios_jumbo_hold_base;
 
-    if (!ios_jumbo_hold_size || size > ios_jumbo_hold_size) return 0;
+    if (!ios_jumbo_hold_size || size > ios_jumbo_hold_size || size < ios_jumbo_hold_min) return 0;
     dprintf( 2, "[jumbo-hold] ml996 releasing the holdback 0x%llx +%llu MB for a %llu MB "
              "request\n", (unsigned long long)base,
              (unsigned long long)ios_jumbo_hold_size >> 20,
              (unsigned long long)size >> 20 );
     munmap( (void *)base, ios_jumbo_hold_size );
+    ios_va_release_note();
     ios_jumbo_hold_base = 0;
     ios_jumbo_hold_size = 0;
     return base;
@@ -2402,6 +2523,7 @@ static uintptr_t ios_jumbo_holdback_carve( size_t size )
                  (unsigned long long)at, (unsigned long long)size >> 20, errno );
         return 0;
     }
+    ios_va_release_note();
     ios_jumbo_hold_size -= size;
     dprintf( 2, "[jumbo-hold] ml1029 CARVED 0x%llx +%llu MB off the top; holdback now "
                 "0x%llx +%llu MB (keep floor %llu MB) -- this request would otherwise have "
@@ -2819,7 +2941,8 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                 : now - ios_pool_big_freed_at < IOS_POOL_REUSE_GRACE_SEC ? "in its reuse grace" : "out of reach");
     if (pool_limit && off == (size_t)-1)
     {
-        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+        size_t cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                 ios_jit_hole2_off, ios_jit_hole2_end );
         bump_short = cand + alloc_size > pool_limit;
     }
     if (off == (size_t)-1 && (alloc_size >= 32u * 1024 * 1024 || bump_short))
@@ -2916,7 +3039,8 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
 
     /* each `continue` below has dropped or replaced entry i: pick again */
     {
-        size_t bump_cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+        size_t bump_cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                      ios_jit_hole2_off, ios_jit_hole2_end );
         bump_ok = bump_cand + alloc_size <= pool_limit && IOS_POOL_IN_REACH(bump_cand);
     }
     while (off == (size_t)-1 &&
@@ -3034,33 +3158,40 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
 
     if (off == (size_t)-1)
     {
-        /* madeira-bcd split pool: never into the hole (ios_jit_hole_off). Without
-         * a split `cand` is the cursor itself and this is the old bump. */
-        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size,
-                                                ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+        /* madeira-bcd split pool: never into a hole (ios_jit_hole_off, pool-mid's
+         * ios_jit_hole2_off). Without a split `cand` is the cursor itself and this
+         * is the old bump. */
+        size_t cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size,
+                                                 ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                 ios_jit_hole2_off, ios_jit_hole2_end );
         if (cand + alloc_size <= pool_limit
             && IOS_POOL_IN_REACH(cand))
         {
             if (cand != jit_pool_offset)
             {
-                /* The run below the hole stays usable: hand it to the freelist as
-                 * a never-used range (no grace, nothing to advise), so the next
+                /* The runs below the hole(s) stay usable: hand them to the freelist
+                 * as never-used ranges (no grace, nothing to advise), so the next
                  * image that fits there goes there. */
-                size_t below = ios_jit_hole_off_eff > jit_pool_offset ? ios_jit_hole_off_eff - jit_pool_offset : 0;
+                size_t poff[3], psz[3], below = 0;
+                int np = ios_pool_skip_pieces( jit_pool_offset, cand, ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                               ios_jit_hole2_off, ios_jit_hole2_end, poff, psz ), k;
                 static int jump_n;
-                if (below >= 0x4000 && ios_pool_free_count < IOS_POOL_FREE_MAX)
+                for (k = 0; k < np; k++)
                 {
-                    ios_pool_freelist[ios_pool_free_count].off = jit_pool_offset;
-                    ios_pool_freelist[ios_pool_free_count].size = below & ~(size_t)0x3fff;
+                    below += psz[k];
+                    if (ios_pool_free_count >= IOS_POOL_FREE_MAX) continue;
+                    ios_pool_freelist[ios_pool_free_count].off = poff[k];
+                    ios_pool_freelist[ios_pool_free_count].size = psz[k];
                     ios_pool_freelist[ios_pool_free_count].freed_at = 0;
                     ios_pool_freelist[ios_pool_free_count].advised = 1;
                     ios_pool_free_count++;
                 }
                 if (jump_n++ < 8)
-                    dprintf(2, "[jit-pool] split pool: head 0x%lx+0x%lx would reach the hole [0x%lx,0x%lx) "
+                    dprintf(2, "[jit-pool] split pool: head 0x%lx+0x%lx would reach the hole [0x%lx,0x%lx)%s "
                             "-- placed above it at 0x%lx; the 0x%lx below it stays on the freelist\n",
                             (unsigned long)jit_pool_offset, (unsigned long)alloc_size,
                             (unsigned long)ios_jit_hole_off_eff, (unsigned long)ios_jit_hole_end_eff,
+                            ios_jit_hole2_end > ios_jit_hole2_off ? " or hole 2" : "",
                             (unsigned long)cand, (unsigned long)below);
             }
             off = cand;
@@ -3302,8 +3433,8 @@ static void ios_pool_failure_census( size_t want )
         if (entry->size > aged_largest) aged_largest = entry->size;
         if (entry->size >= want) aged_fit++;
     }
-    hole = ios_pool_hole_between( ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved,
-                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+    hole = ios_pool_holes_between( ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved,
+                                   ios_jit_hole_off_eff, ios_jit_hole_end_eff, ios_jit_hole2_off, ios_jit_hole2_end );
     if (jit_pool_offset <= ios_jit_pool_size_global && ios_jit_tail_reserved <= ios_jit_pool_size_global - jit_pool_offset &&
         hole <= ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved)
         main_virgin = ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved - hole;
@@ -5456,6 +5587,190 @@ int ios_jit_patch_stale_pointer(unsigned long long stale_va)
     return patched;
 }
 
+/* madeira-bcd: aux-IAT heal (begin). An ARM64EC DLL calls an import through
+ * a linker stub, `adrp x16, slot; ldr x16, [x16, #imm]; br x16`, whose slot is
+ * in the image's AuxiliaryIAT. Windows' loader stores the native target there
+ * when the import is EC code; Wine's never does, so the slot keeps its default,
+ * the stub's own continuation: `adrp x11, iat; ldr x11, [x11, #imm]; adrp x10,
+ * exit_thunk; add x10, ...; b helper`, which calls __os_arm64x_check_icall on
+ * the main IAT value. Where that value is an x64 fast-forward thunk (the slot
+ * kernel32 re-exports to x64 code keeps it, ml943), check_icall decodes it to
+ * the export's PE address, which is not executable here: every call is one
+ * Mach exec fault and a redirect to the image copy. Licensed GTA V Enhanced
+ * (build 437) took ~17,000 a second, 90% of them kernel32!timeGetTime calling
+ * ntdll!RtlQueryPerformanceCounter and RtlQueryPerformanceFrequency in the
+ * Launcher, the game and Social Club, each stalling its thread for a round trip
+ * through the exception thread (20-60% of a core).
+ *
+ * On such a redirect the fault handler hands us the faulting pc, lr and the
+ * thread's process. When lr - 4 is a BL to that stub shape, the stub's slot
+ * still holds the continuation, the continuation's main IAT value is the
+ * target or a thunk that decodes to exactly it, and the caller's copy is used
+ * by this process alone, the slot gets the copy address the redirect itself
+ * uses for this process. The stub then branches there directly: the same
+ * code, arguments and return address, minus the check_icall pass and the
+ * fault. A later re-sync of the page that restores the default is healed again
+ * by the next fault. MADEIRA_AUX_IAT_HEAL=0 leaves the slots alone. */
+static int ios_aux_heal_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_AUX_IAT_HEAL" );  /* 0: EC import stubs keep the exec-fault redirect */
+        cached = !(e && e[0] == '0' && !e[1]);
+    }
+    return cached;
+}
+
+static uintptr_t ios_aux_adrp_page( uintptr_t pc, uint32_t insn )
+{
+    int64_t imm = (int64_t)((((insn >> 5) & 0x7FFFFu) << 2) | ((insn >> 29) & 3u));
+    imm = (imm << 43) >> 43;   /* sign-extend 21 bits */
+    return (pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12);
+}
+
+/* index of the one live mapping whose JIT copy holds `rx` (-1 when none, or
+ * when a stale entry left by an unload still claims the range too) */
+static int ios_aux_find_copy( uintptr_t rx )
+{
+    int i, found = -1;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].jit_base;
+        size_t sz = ios_jit_mappings[i].size;
+        if (!b || !sz || !ios_jit_mappings[i].pe_base || rx < b || rx >= b + sz) continue;
+        if (found >= 0) return -1;
+        found = i;
+    }
+    return found;
+}
+
+/* index of a live mapping whose PE image holds `pe`, or -1 */
+static int ios_aux_find_pe( uintptr_t pe )
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
+        size_t sz = ios_jit_mappings[i].size;
+        if (b && sz && pe >= b && pe < b + sz) return i;
+    }
+    return -1;
+}
+
+/* `len` bytes at `addr` through the fault-safe reader (an image may have gone
+ * away under a table entry the unload never cleared); 0 on success */
+static int ios_aux_safe_read( uintptr_t addr, void *out, size_t len )
+{
+    unsigned char buf[24];
+    uintptr_t a = addr & ~(uintptr_t)7;
+    size_t pre = addr - a, w;
+    if (len + pre > sizeof(buf)) return -1;
+    for (w = 0; w < pre + len; w += 8)
+        if (ios_safe_read64( (uint64_t)(a + w), (uint64_t *)(buf + w) )) return -1;
+    memcpy( out, buf + pre, len );
+    return 0;
+}
+
+int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, uintptr_t jit_pc )
+{
+    static const unsigned char ffs[10] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9 };
+    static volatile int healed;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t pool = ios_jit_pool_size_global;
+    uintptr_t call, stub, cont, slot, main_slot, jb, end, pe_cont, text_lo, text_hi, pe;
+    uint32_t bl, s0, s1, s2, c0, c1, lfanew, iat_rva, iat_size, rva;
+    uint16_t magic;
+    uint64_t cur, value;
+    unsigned char thunk[14];
+    int i, k, n;
+
+    if (!ios_aux_heal_enabled() || !rx || !rw || !pool || !thread_peb) return 0;
+    if ((lr & 3) || lr < rx + 4 || lr >= rx + pool) return 0;
+    if (jit_pc < rx || jit_pc >= rx + pool) return 0;
+    call = lr - 4;
+    if ((i = ios_aux_find_copy( call )) < 0) return 0;
+    /* the caller's copy must be this process's alone */
+    if (ios_jit_mappings[i].owner_peb)
+    {
+        if (ios_jit_mappings[i].owner_peb != thread_peb) return 0;
+    }
+    else
+    {
+        if (ios_jit_mappings[i].map_peb != thread_peb) return 0;
+        for (k = 0; k < ios_jit_mapping_count; k++)
+            if (k != i && ios_jit_mappings[k].size && ios_jit_mappings[k].pe_base == ios_jit_mappings[i].pe_base) return 0;
+    }
+    jb = (uintptr_t)ios_jit_mappings[i].jit_base;
+    end = jb + ios_jit_mappings[i].size;
+    pe = (uintptr_t)ios_jit_mappings[i].pe_base;
+    text_lo = jb + ios_jit_mappings[i].text_offset;
+    text_hi = text_lo + ios_jit_mappings[i].text_size;
+    if (end > rx + pool) return 0;
+
+    /* the call, its stub and the stub's continuation: pool memory, always mapped */
+    bl = *(volatile uint32_t *)call;
+    if ((bl & 0xFC000000u) != 0x94000000u) return 0;                     /* BL imm26 */
+    stub = call + (uintptr_t)((intptr_t)((int32_t)(bl << 6) >> 6) * 4);
+    if ((stub & 3) || stub < jb || stub + 20 > end) return 0;
+    s0 = ((volatile uint32_t *)stub)[0];
+    s1 = ((volatile uint32_t *)stub)[1];
+    s2 = ((volatile uint32_t *)stub)[2];
+    if ((s0 & 0x9F00001Fu) != 0x90000010u) return 0;                     /* ADRP x16 */
+    if ((s1 & 0xFFC003FFu) != 0xF9400210u) return 0;                     /* LDR x16, [x16, #imm] */
+    if (s2 != 0xD61F0200u) return 0;                                      /* BR x16 */
+    cont = stub + 12;
+    c0 = ((volatile uint32_t *)cont)[0];
+    c1 = ((volatile uint32_t *)cont)[1];
+    if ((c0 & 0x9F00001Fu) != 0x9000000Bu) return 0;                     /* ADRP x11 */
+    if ((c1 & 0xFFC003FFu) != 0xF940016Bu) return 0;                     /* LDR x11, [x11, #imm] */
+    slot = ios_aux_adrp_page( stub, s0 ) + ((s1 >> 10) & 0xFFFu) * 8;
+    main_slot = ios_aux_adrp_page( cont, c0 ) + ((c1 >> 10) & 0xFFFu) * 8;
+    if ((slot & 7) || slot < jb || slot + 8 > end) return 0;
+    if ((main_slot & 7) || main_slot < jb || main_slot + 8 > end) return 0;
+    if (ios_jit_mappings[i].text_size && slot + 8 > text_lo && slot < text_hi) return 0;
+
+    /* a static import: the main slot is in the image's IAT directory (a delay-load
+     * slot, whose DLL may be unloaded again, is not); headers read fault-safely */
+    if (ios_aux_safe_read( pe + 0x3c, &lfanew, 4 ) || lfanew < 0x40 || lfanew > 0x1000) return 0;
+    if (ios_aux_safe_read( pe + lfanew, &rva, 4 ) || rva != 0x00004550u) return 0;          /* "PE\0\0" */
+    if (ios_aux_safe_read( pe + lfanew + 24, &magic, 2 ) || magic != 0x20b) return 0;       /* PE32+ */
+    if (ios_aux_safe_read( pe + lfanew + 24 + 112 + 8 * 12, &iat_rva, 4 )) return 0;        /* DataDirectory[IAT] */
+    if (ios_aux_safe_read( pe + lfanew + 24 + 112 + 8 * 12 + 4, &iat_size, 4 )) return 0;
+    rva = (uint32_t)(main_slot - jb);
+    if (rva < iat_rva || (uint64_t)rva + 8 > (uint64_t)iat_rva + iat_size) return 0;
+
+    /* still the default: the continuation, as a copy or a PE address */
+    cur = *(volatile uint64_t *)slot;
+    pe_cont = pe + (cont - jb);
+    if (cur != cont && cur != pe_cont) return 0;
+
+    /* the continuation's main IAT value is the target, or a thunk to exactly it */
+    value = *(volatile uint64_t *)main_slot;
+    if (value != fault_pc)
+    {
+        int32_t rel;
+        if (ios_aux_find_pe( (uintptr_t)value ) < 0) return 0;
+        if (ios_aux_safe_read( (uintptr_t)value, thunk, sizeof(thunk) )) return 0;
+        if (memcmp( thunk, ffs, sizeof(ffs) )) return 0;
+        memcpy( &rel, thunk + 10, 4 );
+        if ((uintptr_t)value + 14 + (intptr_t)rel != fault_pc) return 0;
+    }
+    /* exactly where the redirect sends this process */
+    if ((uintptr_t)ios_jit_translate_addr_for_owner( (void *)fault_pc, thread_peb ) != jit_pc) return 0;
+
+    __atomic_store_n( (uint64_t *)(rw + (slot - rx)), (uint64_t)jit_pc, __ATOMIC_RELEASE );
+    n = __sync_add_and_fetch( &healed, 1 );
+    /* dprintf: this runs on the exception thread, which must not wait on stdio */
+    if (n <= 32 || !(n % 256))
+        dprintf( STDERR_FILENO, "[aux-iat-heal] #%d image %p (copy %p) +0x%lx calls %p: AuxiliaryIAT slot +0x%lx "
+                 "now holds the copy %p, was the check_icall continuation; peb=%p (MADEIRA_AUX_IAT_HEAL=0 disables)\n",
+                 n, (void *)pe, (void *)jb, (unsigned long)(call - jb), (void *)fault_pc,
+                 (unsigned long)(slot - jb), (void *)jit_pc, thread_peb );
+    return 1;
+}
+/* madeira-bcd: aux-IAT heal (end) */
+
 /* task #24 [term-stack]: map a guest PE VA to its module base + size so
  * the terminate-time stack dump can self-attribute return addresses. */
 unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out)
@@ -6035,7 +6350,7 @@ int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr )
  * ml283 [exec-req] probe in that wrapper -- taken for the first 64 requests per
  * ntdll copy that ask for an EXECUTE protection -- does its own syscall, log line
  * and notification and then `return st;` WITHOUT leave_syscall_callback(). In the
- * shipped binary (function at VA 0x1800570f4) its three exits, 0x1800573bc
+ * binary shipped until 7b56800 (function at VA 0x1800570f4) its three exits, 0x1800573bc
  * (cross-process), 0x1800573c8 (no NotifyMemoryProtect) and 0x1800573f8 (after the
  * notification), all branch to the epilogue at 0x180057514; only the non-exec
  * path passes 0x1800574d8 `ldr x8,[x18,#0x1788]; cbz x8; strb wzr,[x8,#1]`.
@@ -6069,7 +6384,13 @@ int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr )
  * or `env.MADEIRA_EXECREQ_LEAVE = 1` in a game's settings), because it changes
  * what the emulator is told after every executable protect in every game: it is
  * the upstream behaviour, but notifications the leak used to drop will arrive
- * (docs/gta5-child-crash.md section 8). */
+ * (docs/gta5-child-crash.md section 8).
+ *
+ * Wine 38aa753f98b (ml1259) added the missing leave_syscall_callback() in source,
+ * and every ntdll.dll shipped since 7b56800 (2026-10-04) has it, so build 442 said
+ * "not found" for every ntdll copy. That layout (ios_execreq_fixed_sig) is now
+ * recognised: MADEIRA_EXECREQ_LEAVE=1 says once that there is nothing to patch
+ * and writes nothing. */
 #define IOS_EXECREQ_WORDS 17u
 static const uint32_t ios_execreq_sig[IOS_EXECREQ_WORDS] = {
     0x72001f3f, /* +0x00 tst  w25, #0xff                 is_current              */
@@ -6117,6 +6438,20 @@ static uint32_t ios_a64_bl_target( uint32_t pc, uint32_t insn )
 {
     int32_t imm = (int32_t)(insn << 6) >> 6;   /* sign-extended imm26 */
     return pc + (uint32_t)(imm * 4);
+}
+
+static uint32_t ios_a64_imm19_target( uint32_t pc, uint32_t insn )
+{
+    int32_t imm = (int32_t)(insn << 8) >> 13;   /* sign-extended imm19: b.cond, cbz, cbnz */
+    return pc + (uint32_t)(imm * 4);
+}
+
+static int ios_a64_is_branch( uint32_t insn )
+{
+    return (insn & 0x7c000000u) == 0x14000000u    /* b, bl */
+        || (insn & 0xff000010u) == 0x54000000u    /* b.cond */
+        || (insn & 0x7c000000u) == 0x34000000u    /* cbz, cbnz, tbz, tbnz */
+        || (insn & 0xfe000000u) == 0xd6000000u;   /* br, blr, ret */
 }
 
 static int ios_execreq_leave_wanted( void )
@@ -6169,9 +6504,65 @@ static int ios_execreq_layout_ok( const uint32_t *w, int check_x18 )
     return 1;
 }
 
-/* The probe's RVA in the image's executable sections, or 0 unless found exactly once. */
-static uint32_t ios_execreq_find( const unsigned char *img )
+/* The probe as wine 38aa753f98b builds it (VA 0x1800574d8 in 18c8f6d's ntdll.dll):
+ * every exit runs leave_syscall_callback() -- `ldr x8,[x18,#0x1788]; cbz/cbnz x8;
+ * strb wzr,[x8,#1]` -- before the epilogue. {word, mask}: what adrp and the
+ * add/ldr offsets address, and the branch offsets, move with every rebuild. */
+#define IOS_EXECREQ_FIXED_WORDS 19u
+static const uint32_t ios_execreq_fixed_sig[IOS_EXECREQ_FIXED_WORDS][2] = {
+    { 0x72001f3f, 0xffffffff }, /* +0x00 tst  w25, #0xff             is_current          */
+    { 0x54000000, 0xff00001f }, /* +0x04 b.eq -> cross-process block, then the clear     */
+    { 0x90000008, 0x9f00001f }, /* +0x08 adrp x8, (pNotifyMemoryProtect)                 */
+    { 0xf940010b, 0xffc003ff }, /* +0x0c ldr  x11, [x8, #...]                            */
+    { 0xb400000b, 0xff00001f }, /* +0x10 cbz  x11 -> the clear                           */
+    { 0xf94002c1, 0xffffffff }, /* +0x14 ldr  x1, [x22]               *size_ptr          */
+    { 0xf9400280, 0xffffffff }, /* +0x18 ldr  x0, [x20]               *addr_ptr          */
+    { 0x90000008, 0x9f00001f }, /* +0x1c adrp x8, (icall checker)                        */
+    { 0xf9400108, 0xffc003ff }, /* +0x20 ldr  x8, [x8, #...]                             */
+    { 0x9000000a, 0x9f00001f }, /* +0x24 adrp x10, ...                                   */
+    { 0x9100014a, 0xffc003ff }, /* +0x28 add  x10, x10, #...                             */
+    { 0xd63f0100, 0xffffffff }, /* +0x2c blr  x8                                         */
+    { 0x2a1303e2, 0xffffffff }, /* +0x30 mov  w2, w19                 new_prot           */
+    { 0x52800023, 0xffffffff }, /* +0x34 mov  w3, #1                  After              */
+    { 0x2a1a03e4, 0xffffffff }, /* +0x38 mov  w4, w26                 status             */
+    { 0xd63f0160, 0xffffffff }, /* +0x3c blr  x11                     NotifyMemoryProtect */
+    { 0xf94bc648, 0xffffffff }, /* +0x40 ldr  x8, [x18, #0x1788]      leave_syscall_callback() */
+    { 0xb5000008, 0xff00001f }, /* +0x44 cbnz x8 -> the clear's strb                     */
+    { 0x14000000, 0xfc000000 }, /* +0x48 b    -> epilogue                                */
+};
+
+/* Is `w` (the image at a `tst w25, #0xff`, `room` bytes before the section ends)
+ * the fixed probe? Checks that each exit reaches the clear: the cross-process
+ * block runs straight into it, the no-NotifyMemoryProtect exit branches to it,
+ * the notified exit has its own copy, and the clear falls into the epilogue. */
+static int ios_execreq_fixed_ok( const uint32_t *w, uint32_t room )
 {
+    uint32_t i, xp, clr, epi;
+
+    for (i = 0; i < IOS_EXECREQ_FIXED_WORDS; i++)
+        if ((w[i] & ios_execreq_fixed_sig[i][1]) != ios_execreq_fixed_sig[i][0]) return 0;
+    xp = ios_a64_imm19_target( 0x04, w[1] );
+    clr = ios_a64_imm19_target( 0x10, w[4] );
+    epi = clr + 12;
+    if (clr < (IOS_EXECREQ_FIXED_WORDS + 11) * 4 || clr >= room || room - clr < 12 + 7 * 4) return 0;
+    if (w[clr / 4] != 0xf94bc648 /* ldr x8, [x18, #0x1788] */ ||
+        w[clr / 4 + 1] != ios_a64_cbz64( clr + 4, epi, 8 ) ||
+        w[clr / 4 + 2] != 0x3900051f /* strb wzr, [x8, #1]: InSyscallCallback = 0 */) return 0;
+    if (w[epi / 4] != 0x2a1a03e0 /* mov w0, w26 */ || w[epi / 4 + 6] != 0xd65f03c0 /* ret */) return 0;
+    if (ios_a64_imm19_target( 0x44, w[17] ) != clr + 8 || w[18] != ios_a64_b( 0x48, epi )) return 0;
+    /* ten straight-line instructions and the BL to send_cross_process_notification */
+    if (xp + 11 * 4 != clr || w[xp / 4] != 0xf94002c3 /* ldr x3,[x22] */ ||
+        w[xp / 4 + 7] != 0xb90013fa /* str w26,[sp,#0x10] */) return 0;
+    for (i = 0; i < 10; i++) if (ios_a64_is_branch( w[xp / 4 + i] )) return 0;
+    return (w[xp / 4 + 10] & 0xfc000000u) == 0x94000000u;
+}
+
+/* The probe's RVA in the image's executable sections, or 0 unless found exactly
+ * once: with the layout the patch was written against, or (fixed) as wine
+ * 38aa753f98b builds it. */
+static uint32_t ios_execreq_find( const unsigned char *img, int fixed )
+{
+    const uint32_t need = fixed ? IOS_EXECREQ_FIXED_WORDS * 4 : IOS_EXECREQ_EPILOGUE + 7 * 4;
     uint32_t e_lfanew, size_of_image, nsec, optsz, i, found = 0, hits = 0;
     const unsigned char *sh;
 
@@ -6188,11 +6579,14 @@ static uint32_t ios_execreq_find( const unsigned char *img )
         memcpy( &vs, sh + 40 * i + 8, 4 ); memcpy( &va, sh + 40 * i + 12, 4 ); memcpy( &ch, sh + 40 * i + 36, 4 );
         if (!(ch & 0x20000000u /* IMAGE_SCN_MEM_EXECUTE */) || va >= size_of_image) continue;
         if (vs > size_of_image - va) vs = size_of_image - va;
-        for (off = (va + 3) & ~3u; off + IOS_EXECREQ_EPILOGUE + 7 * 4 <= va + vs; off += 4)
+        for (off = (va + 3) & ~3u; off + need <= va + vs; off += 4)
         {
-            if (*(const uint32_t *)(img + off) != ios_execreq_sig[0]) continue;
-            if (memcmp( img + off, ios_execreq_sig, sizeof(ios_execreq_sig) )) continue;
-            if (!ios_execreq_layout_ok( (const uint32_t *)(img + off), 1 )) continue;
+            const uint32_t *w = (const uint32_t *)(img + off);
+
+            if (w[0] != ios_execreq_sig[0]) continue;   /* tst w25, #0xff in both layouts */
+            if (fixed ? !ios_execreq_fixed_ok( w, va + vs - off )
+                      : (memcmp( w, ios_execreq_sig, sizeof(ios_execreq_sig) ) || !ios_execreq_layout_ok( w, 1 )))
+                continue;
             found = off;
             hits++;
         }
@@ -6202,11 +6596,11 @@ static uint32_t ios_execreq_find( const unsigned char *img )
 
 /* Patch the copy of `module` (the PE ntdll) that the CURRENT process runs:
  * ios_jit_translate_addr is owner-aware, so on a pseudo-process child's boot
- * thread this is the child's private copy. 1 patched, 0 already patched or not
- * wanted, -1 refused (logged). */
+ * thread this is the child's private copy. 1 patched, 0 already patched, not
+ * wanted or not needed (the fixed probe), -1 refused (logged). */
 int ios_patch_execreq_leave( void *module )
 {
-    static int said_off;
+    static int said_off, said_fixed;
     const unsigned char *img = module;
     uintptr_t rx_lo = (uintptr_t)ios_jit_rx_base_global;
     uint32_t rva, want[3], i;
@@ -6221,8 +6615,15 @@ int ios_patch_execreq_leave( void *module )
         return 0;
     }
     if (!module || !rx_lo || !ios_jit_rw_base_global) return -1;
-    if (!(rva = ios_execreq_find( img )))
+    if (!(rva = ios_execreq_find( img, 0 )))
     {
+        if ((rva = ios_execreq_find( img, 1 )))
+        {
+            if (!said_fixed++)
+                dprintf( 2, "[execreq-leave] ntdll %p: NtProtectVirtualMemory's [exec-req] path already leaves the "
+                            "syscall callback (rva %#x, wine 38aa753f98b) -- nothing to patch\n", module, rva );
+            return 0;
+        }
         dprintf( 2, "[execreq-leave] ntdll %p: the [exec-req] probe was not found exactly once with the "
                     "expected layout -- not patched (a different ntdll.dll build?)\n", module );
         return -1;
@@ -7332,10 +7733,14 @@ static int ios_va_pressure;
 /* madeira-bcd: env.MADEIRA_SC_PA_POOLS layout, -1 until ios_sc_layout() ran
  * (virtual_init); layout 2 moves the floor above libcef's pools. */
 static int ios_sc_layout_mode = -1;
+/* madeira-bcd: env.MADEIRA_RDR2_VA_HOLD's geometry is in use (ios_sc2_rdr2_geometry);
+ * it moves the floor down to the end of libcef.dll's smaller pools. */
+static int ios_sc2_rdr2;
 
 static inline ULONG_PTR ios_usable_va_floor_get(void)
 {
     size_t sz = ios_jit_pool_size_global;
+    if (ios_sc_layout_mode == 2 && ios_sc2_rdr2) return (ULONG_PTR)0x7010000000ULL;   /* IOS_SC2_RDR2_FLOOR */
     if (ios_sc_layout_mode == 2) return (ULONG_PTR)0x7100000000ULL;   /* IOS_SC2_FLOOR */
     /* madeira-bcd pool-low: the RW reservation starts with region C's alias, so the
      * pool's own alias sits higher than 0x7000000000; the floor is where it ends. */
@@ -7898,6 +8303,81 @@ static int ios_ml1041_readable_words( const void *from, int want )
  *
  * Runs only after a failure that is otherwise fatal, and is bounded: one region
  * walk plus at most MAX_TRY placements. */
+/* madeira-bcd: what the last complete walk proved. Every SocialClubHelper.exe
+ * start runs V8's partially reserved sandbox, whose fallbacks ask for 16 GB,
+ * 8 GB and 4 GB (with an 8 GB - 64 KB padded retry), ten times each: ~35
+ * unhinted asks that cannot fit below the ceiling. Each ended in this walk over
+ * ~157,000 regions, 170-380 ms under virtual_mutex, so ~9 s per start in which
+ * every thread of every process waited for its own memory calls (442 logs, the
+ * [jumbo#] +Nms gaps, both runs). The walk also sees the largest gap; while no
+ * release has gone through this file since (ios_va_release_epoch) and for at
+ * most IOS_PLACE_PROOF_NS, a larger request cannot be placed, so it fails here
+ * without walking. Frees outside Wine (the system's own mappings) do not bump
+ * the epoch; the time bound limits that. MADEIRA_PLACE_PROOF=0 walks every time. */
+#define IOS_PLACE_PROOF_NS (2000ull * 1000 * 1000)
+static unsigned long long ios_place_proof_gap;   /* 0: nothing proven */
+static uint64_t ios_place_proof_ns;
+static unsigned long ios_place_proof_epoch;
+static unsigned long ios_place_proof_skips;
+
+static uint64_t ios_place_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int ios_place_proof_enabled( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        /* 0 walks the whole map on every failed large mapping; by default a failed walk is trusted for 2 s until a release. */
+        const char *e = getenv( "MADEIRA_PLACE_PROOF" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* A reservation made after the proof came out of gaps that walk already
+ * counted, so releasing it (whole or in part) cannot open a gap larger than the
+ * proof allows and need not bump the epoch: V8's 4 GB step reserves 4 GB, finds
+ * it misaligned and releases it before every padded retry. The next proof saw
+ * them mapped, so it forgets them. virtual_mutex held. */
+#define IOS_PLACE_FRESH 16
+static struct { uint64_t base, size; } ios_place_fresh[IOS_PLACE_FRESH];
+static unsigned int ios_place_fresh_next;
+
+static void ios_place_note_new( const void *base, size_t size )
+{
+    unsigned int i;
+
+    if (!ios_place_proof_ns || size < (64u << 20)) return;
+    i = ios_place_fresh_next++ % IOS_PLACE_FRESH;
+    ios_place_fresh[i].base = (uint64_t)(uintptr_t)base;
+    ios_place_fresh[i].size = size;
+}
+
+static int ios_place_release_is_fresh( const void *start, size_t size )
+{
+    uint64_t a = (uint64_t)(uintptr_t)start;
+    unsigned int i;
+
+    for (i = 0; i < IOS_PLACE_FRESH; i++)
+        if (ios_place_fresh[i].size && a >= ios_place_fresh[i].base &&
+            a + size <= ios_place_fresh[i].base + ios_place_fresh[i].size) return 1;
+    return 0;
+}
+
+/* Does a walk that ended with no gap of `largest` or more still hold for `size`? */
+static int ios_place_proven_full( size_t size, uint64_t now )
+{
+    return ios_place_proof_enabled() && ios_place_proof_ns &&
+           (unsigned long long)size > ios_place_proof_gap &&
+           now - ios_place_proof_ns < IOS_PLACE_PROOF_NS &&
+           ios_place_proof_epoch == __atomic_load_n( &ios_va_release_epoch, __ATOMIC_RELAXED );
+}
+
 static void *ios_ml1027_place( size_t size, int prot )
 {
     mach_vm_address_t raddr = 0x100000000ull;   /* below this is images/furniture */
@@ -7905,11 +8385,26 @@ static void *ios_ml1027_place( size_t size, int prot )
     mach_vm_address_t prev_end = 0;
     mach_vm_address_t best_base = 0;
     unsigned long long best_gap = ~0ull;
+    unsigned long long largest = 0;   /* any gap, the JIT pool's included: an upper bound */
+    unsigned long epoch = __atomic_load_n( &ios_va_release_epoch, __ATOMIC_RELAXED );
+    uint64_t t0 = ios_place_now_ns();
     unsigned regions = 0, gaps = 0;
     int truncated = 0;
     natural_t rdepth = 0;
     void *got;
     enum { MAX_TRY = 8 };
+
+    if (ios_place_proven_full( size, t0 ))
+    {
+        unsigned long n = ++ios_place_proof_skips;
+        if (n <= 8 || !(n % 64))
+            dprintf( 2, "[mmap-place] #%lu size=0x%lx refused without a walk: the walk %llu ms ago "
+                        "found no gap above %llu MB and nothing was released since "
+                        "(MADEIRA_PLACE_PROOF=0 walks every time)\n",
+                     n, (unsigned long)size, (unsigned long long)((t0 - ios_place_proof_ns) / 1000000),
+                     ios_place_proof_gap >> 20 );
+        return MAP_FAILED;
+    }
 
     {
         task_vm_info_data_t vmi;
@@ -7934,6 +8429,7 @@ static void *ios_ml1027_place( size_t size, int prot )
         if (prev_end && raddr > prev_end)
         {
             unsigned long long gap = (unsigned long long)(raddr - prev_end);
+            if (gap > largest) largest = gap;
             if (gap >= size && gap < best_gap &&
                 !ios_jit_pool_intersects( (void *)prev_end, size ))
             { best_gap = gap; best_base = prev_end; gaps++; }
@@ -7955,19 +8451,31 @@ static void *ios_ml1027_place( size_t size, int prot )
     if (!truncated && prev_end && prev_end < ceiling)
     {
         unsigned long long tail = (unsigned long long)(ceiling - prev_end);
+        if (tail > largest) largest = tail;
         if (tail >= size && tail < best_gap &&
             !ios_jit_pool_intersects( (void *)prev_end, size ))
         { best_gap = tail; best_base = prev_end; gaps++; }
+    }
+    /* A complete walk bounds every gap from here on until something is released
+     * (an empty map below the ceiling proves nothing: keep walking then). */
+    if (!truncated && prev_end)
+    {
+        ios_place_proof_gap = largest;
+        ios_place_proof_epoch = epoch;
+        ios_place_proof_ns = ios_place_now_ns();
+        memset( ios_place_fresh, 0, sizeof(ios_place_fresh) );
+        ios_place_fresh_next = 0;
     }
 
     if (!best_base)
     {
         dprintf( 2, "[mmap-place] ml1027 NO GAP FITS size=0x%lx after %u regions "
-                    "(ceiling=0x%llx walk_stopped_at=0x%llx tail=%llu MB gaps_seen=%u)%s\n",
+                    "(ceiling=0x%llx walk_stopped_at=0x%llx tail=%llu MB gaps_seen=%u, largest gap "
+                    "%llu MB, walk %llu ms)%s\n",
                  (unsigned long)size, regions, (unsigned long long)ceiling,
                  (unsigned long long)prev_end,
                  (unsigned long long)(ceiling > prev_end ? (ceiling - prev_end) >> 20 : 0),
-                 gaps,
+                 gaps, largest >> 20, (unsigned long long)((ios_place_now_ns() - t0) / 1000000),
                  truncated ? " [TRUNCATED -- scan INCOMPLETE, NOT a verdict]"
                            : " -- the map really is full for this size" );
         return MAP_FAILED;
@@ -8756,6 +9264,38 @@ static int ios_exe_win_small_fixed(void)
     return enabled;
 }
 
+/* madeira-bcd: the image view virtual_map_section is placing right now is
+ * resource-only: no execute access and not the loader's (no
+ * ArbitraryUserPointer), i.e. LOAD_LIBRARY_AS_IMAGE_RESOURCE for a version or
+ * resource query. Set and cleared there around virtual_map_image; thread-local
+ * for the reason above.
+ *
+ * A licensed Rockstar session reads Social-Club-Setup.exe's version that way
+ * when the launcher starts (GTA V Enhanced, build 456, 18:47:27: a 0x7a7d000
+ * view at its ImageBase 0x140000000). Being over the 64 MB floor, it took the
+ * window; the view was gone a moment later, and SocialClubHelper.exe
+ * (0x141c00000), its CPU area and its stack then filled [0x140000000,
+ * 0x148000000), so every later map at 0x140000000 was REFUSED c0000018.
+ * GTA5_Enhanced.exe moved high, but an image without relocations (RDR2.exe,
+ * 0x7528000) runs nowhere else. With env.MADEIRA_FIXED_BASE_GUARD = 1 such a
+ * view takes neither the window nor an interval held for the next generation;
+ * it is mapped elsewhere, where a resource query works the same. Off by
+ * default: in a licensed GTA session it would move GTA5_Enhanced.exe to its
+ * preferred base and SocialClubHelper.exe out of the window. */
+static __thread int ios_exe_win_resource_request;
+
+static int ios_fixed_base_guard(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_FIXED_BASE_GUARD" );
+        on = e && e[0] == '1' && !e[1];
+    }
+    return on;
+}
+
 /* Returns 1 if the reservation was released for this request. */
 static int ios_exe_win_claim( const void *addr, size_t size )
 {
@@ -8782,6 +9322,16 @@ static int ios_exe_win_claim( const void *addr, size_t size )
             dprintf( 2, "ml977: NOT releasing the window for %p+%#lx (under the 64MB floor) -- "
                      "a relocatable image sharing the default ImageBase must not starve the "
                      "fixed-base one\n", addr, (unsigned long)size );
+        return 0;
+    }
+    if (ios_exe_win_resource_request && ios_fixed_base_guard())
+    {
+        static int guard_n;
+        if (guard_n++ < 8)
+            dprintf( 2, "[exe-window] guard: %p+%#lx is a resource-only image view (no execute access, "
+                     "not the loader: a version or resource query); it does not take the fixed-base "
+                     "window and is mapped elsewhere (MADEIRA_FIXED_BASE_GUARD)\n",
+                     addr, (unsigned long)size );
         return 0;
     }
     if (ios_exe_win_state != 1)
@@ -8823,6 +9373,7 @@ static int ios_exe_win_claim( const void *addr, size_t size )
                      (unsigned long)ios_exe_win_held_size, (int)kr );
             if (kr == KERN_SUCCESS)
             {
+                ios_va_release_note();
                 ios_exewin_pending_base = ios_exe_win_held_base;
                 ios_exewin_pending_size = ios_exe_win_held_size;
                 ios_exe_win_held_base   = NULL;
@@ -8841,6 +9392,7 @@ static int ios_exe_win_claim( const void *addr, size_t size )
         dprintf( 2, "ml977: vm_deallocate of the window FAILED -- leaving it held\n" );
         return 0;
     }
+    ios_va_release_note();
     ios_exe_win_state = 0;
     dprintf( 2, "ml977: RELEASED the executable window to %p+%#lx (fixed-base main image)\n",
              addr, (unsigned long)size );
@@ -12200,6 +12752,78 @@ static void ios_fex_arena_census( void *start, void *end, size_t request, size_t
         dprintf( 2, "[fex-va] other_sizes views=%u reserved=0x%llx committed=0x%llx\n",
                  other_views, (unsigned long long)other_bytes, (unsigned long long)other_committed );
 }
+
+/* madeira-bcd: how close the FEX arena is to full while things still work.
+ * Grand Theft Auto V Enhanced through the Rockstar Games Launcher (build 434,
+ * log 2026-10-07 20:51) stopped in FEXAlloc with the arena 95% covered
+ * (11.4 of 12 GB, 262 threads) and 593 MB free in 1052 holes, none with a
+ * 4 MB-aligned 4 MB gap; the next start of the same build played. Without a
+ * failure nothing said how close a run came. Called with virtual_mutex held
+ * after a successful placement inside the arena: a line every 30 s and when
+ * free space first drops below 3, 2, 1 and 0.5 GB (200 lines at most),
+ * measured at most once a second. Views only, no page scan.
+ * MADEIRA_FEX_HEADROOM_LOG=0 turns it off. */
+static void ios_fex_arena_headroom( void *start, void *end )
+{
+    static const size_t marks[] = { 3ull << 30, 2ull << 30, 1ull << 30, 512ull << 20 };
+    static unsigned next_mark, lines;
+    static long long next_ns, next_walk_ns;
+    static int on = -1;
+    const ULONG_PTR align_mask = 0x3fffff;  /* rpmalloc's 4 MB medium pages, what failed */
+    struct file_view *view;
+    ULONG_PTR lo = ios_fex_arena_base_unix, hi = ios_fex_arena_end_unix, cursor;
+    size_t covered = 0, biggest = 0, aligned_biggest = 0, free_bytes;
+    unsigned nviews = 0, holes = 0, crossed = 0;
+    struct timespec ts;
+    long long now;
+
+    if (on < 0) { const char *e = getenv( "MADEIRA_FEX_HEADROOM_LOG" ); on = !(e && e[0] == '0'); }  /* 0: no [fex-headroom] lines */
+    if (!on || lines >= 200 || !lo || hi <= lo) return;
+    if ((ULONG_PTR)start < lo || (ULONG_PTR)end > hi) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (now < next_walk_ns) return;   /* the walk costs every view: once a second at most */
+    next_walk_ns = now + 1000000000LL;
+
+    cursor = lo;
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        ULONG_PTR b = (ULONG_PTR)view->base, e;
+
+        if (b >= hi) break;
+        e = view->size > ~(ULONG_PTR)0 - b ? ~(ULONG_PTR)0 : b + view->size;
+        if (e <= lo || e <= b) continue;
+        if (b < lo) b = lo;
+        if (e > hi) e = hi;
+        nviews++;
+        if (b > cursor)
+        {
+            ULONG_PTR aligned = (cursor + align_mask) & ~align_mask;
+            holes++;
+            if (b - cursor > biggest) biggest = b - cursor;
+            if (aligned < b && b - aligned > aligned_biggest) aligned_biggest = b - aligned;
+        }
+        if (e > cursor) { covered += e - (b > cursor ? b : cursor); cursor = e; }
+    }
+    if (cursor < hi)
+    {
+        ULONG_PTR aligned = (cursor + align_mask) & ~align_mask;
+        holes++;
+        if (hi - cursor > biggest) biggest = hi - cursor;
+        if (aligned < hi && hi - aligned > aligned_biggest) aligned_biggest = hi - aligned;
+    }
+    free_bytes = hi - lo - covered;
+    while (next_mark < ARRAY_SIZE(marks) && free_bytes < marks[next_mark]) { next_mark++; crossed = 1; }
+    if (!crossed && now < next_ns) return;
+    next_ns = now + 30000000000LL;
+    lines++;
+    dprintf( 2, "[fex-headroom] arena=%p..%p used=%lluMB free=%lluMB (%u%% used) holes=%u maxgap=%lluKB "
+                "max_4mb_aligned_gap=%lluKB views=%u%s (MADEIRA_FEX_HEADROOM_LOG=0 disables)\n",
+             (void *)lo, (void *)hi, (unsigned long long)(covered >> 20), (unsigned long long)(free_bytes >> 20),
+             (unsigned)((unsigned long long)covered * 100 / (hi - lo)), holes,
+             (unsigned long long)(biggest >> 10), (unsigned long long)(aligned_biggest >> 10), nviews,
+             crossed ? " (threshold crossed)" : "" );
+}
 #endif
 
 static void dump_view( struct file_view *view )
@@ -12714,6 +13338,7 @@ static void remove_reserved_area( void *addr, size_t size )
 
     TRACE( "removing %p-%p\n", addr, (char *)addr + size );
     mmap_remove_reserved_area( addr, size );
+    ios_va_release_note();
 
     /* unmap areas not covered by an existing view */
     WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
@@ -12752,6 +13377,7 @@ static void unmap_area( void *start, size_t size )
 
     assert( !((UINT_PTR)start & host_page_mask) );
     size = ROUND_SIZE( 0, size, host_page_mask );
+    if (!ios_place_release_is_fresh( start, size )) ios_va_release_note();
 
     ios_jit_range_tripwire( "unmap_area", start, size, -1, __builtin_return_address(0) );
 
@@ -14548,7 +15174,8 @@ enum { IOS_SC2_NONE, IOS_SC2_E, IOS_SC2_L, IOS_SC2_J2, IOS_SC2_J2L, IOS_SC2_OILP
 /* grant kinds beyond the slots */
 enum { IOS_SC_K_V1 = 8, IOS_SC_K_CAGE, IOS_SC_K_OTHER };
 
-static const struct { uint64_t base, size; const char *what; } ios_sc2_slots[] =
+/* Not const: env.MADEIRA_RDR2_VA_HOLD changes three entries at boot (ios_sc2_rdr2_geometry). */
+static struct { uint64_t base, size; const char *what; } ios_sc2_slots[] =
 {
     [IOS_SC2_E]      = { IOS_SC2_E_BASE,      IOS_SC2_POOL_REAL,   "chrome_elf.dll's PartitionAlloc pools" },
     [IOS_SC2_L]      = { IOS_SC2_L_BASE,      IOS_SC2_POOL_REAL,   "libcef.dll's PartitionAlloc pools" },
@@ -14557,6 +15184,82 @@ static const struct { uint64_t base, size; const char *what; } ios_sc2_slots[] =
     [IOS_SC2_OILPAN] = { IOS_SC2_OILPAN_BASE, IOS_SC2_OILPAN_SIZE, "Oilpan's caged heap" },
 };
 static unsigned ios_sc2_held;      /* bit k: slot k held natively right now */
+static uint64_t ios_sc2_floor = IOS_SC2_FLOOR;   /* the furniture's floor: IOS_SC2_RDR2_FLOOR in that geometry */
+static uint64_t ios_sc2_arena_lo = IOS_SC_ARENA_BASE;   /* the FEX arena's start: IOS_SC2_RDR2_ARENA_BASE there */
+
+/* madeira-bcd (RDR2): layout 2 with room for RDR2.exe's start-up reserve.
+ * Opt-in: env.MADEIRA_RDR2_VA_HOLD = 1, read only with layout 2; default off,
+ * and off nothing below changes.
+ *
+ * RDR2.exe reserves 8960 MB in one block as it starts (build 457, log
+ * 2026-10-08 21:20:59: the band's largest gap was 2775 MB, so it showed
+ * "exited unexpectedly"). Layout 2 is sized for GTA V, and three of its
+ * regions are far larger than what Social Club uses:
+ *   - libcef.dll's pools: 4 GB real; no GTA V log (builds 451-457) has a
+ *     growth line, so it never committed past 256 MB; 153 MB at 457's failure.
+ *   - libcef.dll's metadata: 8 GB real; it follows those pools (the super
+ *     page at pool offset X has its metadata at region + X + 4/12 KB).
+ *   - chrome_elf.dll's metadata: 8 GB real; it follows chrome_elf.dll's pools,
+ *     which reached +6450 MB in GTA V's longest session (455, 16:38:52).
+ * With the switch the 8960 MB below chrome_elf.dll's pools, [0x75d0000000,
+ * 0x7800000000), is held from boot as the jumbo holdback
+ * (ios_jumbo_holdback_take): the first 8960 MB reserve the kernel cannot
+ * place gets it, and nothing smaller (ios_jumbo_hold_min). Social Club's large
+ * asks are its layout 2 slots, V8's VirtualAlloc2 (never that path) and one
+ * hinted 1 GB.
+ *
+ * Build 460 (log 2026-10-08 23:59:11) then hung 4 minutes into the story: the
+ * furniture window was full (12280 of 12288 MB: Social Club's V8 tables, 1.1 GB
+ * of Metal's IOAccelerator mappings the kernel put there, RDR2's and every
+ * process's stacks) and RDR2 could not create a thread (64 x "[thr-create]
+ * FAILED at kernel stack"). Its censuses measured libcef.dll's pools at
+ * +8 MB, its metadata at +154..166 MB and chrome_elf.dll's metadata (libcef's
+ * BackupRefPtr data plus chrome_elf's own pages) at +158..174 MB. So the
+ * furniture now takes most of the app's hold:
+ *   [0x7000000000, +256 MB)   libcef.dll's pools
+ *   [0x7010000000, ceiling)   furniture (floor IOS_SC2_RDR2_FLOOR: +3.75 GB)
+ *   [0x7400000000, +6.25 GB)  chrome_elf.dll's metadata (libcef's BRP half starts here too)
+ *   [0x7590000000, +1 GB)     libcef.dll's metadata
+ *   [0x75d0000000, +8960 MB)  RDR2.exe's hold
+ * The same run's FEX arena was 76-84 % used (9.1-10.4 of 12 GB, ~35 MB per
+ * thread at 263 threads), the next wall once more threads fit, while
+ * Oilpan's 4 GB cage used 21-33 MB. So Oilpan keeps 1 GB and the arena
+ * starts right above it:
+ *   [0x7c00000000, +1 GB)     Oilpan's caged heap
+ *   [0x7c40000000, top)       FEX arena, 15 GB (IOS_SC2_RDR2_ARENA_BASE)
+ * The RW alias, chrome_elf.dll's pools and the V8 cage keep their places. */
+#define IOS_SC2_RDR2_HOLD_SIZE 0x230000000ULL   /* RDR2.exe's 8960 MB */
+#define IOS_SC2_RDR2_HOLD_BASE (IOS_SC2_E_BASE - IOS_SC2_RDR2_HOLD_SIZE)
+#define IOS_SC2_RDR2_L_REAL    0x10000000ULL    /* 256 MB of libcef.dll's pools */
+#define IOS_SC2_RDR2_FLOOR     (IOS_SC2_L_BASE + IOS_SC2_RDR2_L_REAL)   /* ios_usable_va_floor_get */
+#define IOS_SC2_RDR2_J2L_REAL  0x40000000ULL    /* 1 GB of libcef.dll's metadata */
+#define IOS_SC2_RDR2_J2L_BASE  (IOS_SC2_RDR2_HOLD_BASE - IOS_SC2_RDR2_J2L_REAL)
+#define IOS_SC2_RDR2_OILPAN_REAL 0x40000000ULL  /* 1 GB of Oilpan's caged heap */
+#define IOS_SC2_RDR2_ARENA_BASE (IOS_SC2_OILPAN_BASE + IOS_SC2_RDR2_OILPAN_REAL)
+
+static int ios_sc2_rdr2_hold_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        /* 1: Social Club layout 2 keeps 8960 MB free for RDR2.exe (smaller PartitionAlloc regions); default 0. */
+        const char *e = getenv( "MADEIRA_RDR2_VA_HOLD" );
+        on = e && e[0] == '1' && !e[1];
+    }
+    return on;
+}
+
+static void ios_sc2_rdr2_geometry(void)
+{
+    ios_sc2_slots[IOS_SC2_L].size = IOS_SC2_RDR2_L_REAL;
+    ios_sc2_slots[IOS_SC2_J2L].base = IOS_SC2_RDR2_J2L_BASE;
+    ios_sc2_slots[IOS_SC2_J2L].size = IOS_SC2_RDR2_J2L_REAL;
+    ios_sc2_slots[IOS_SC2_J2].size = IOS_SC2_RDR2_J2L_BASE - IOS_SC2_J2_BASE;
+    ios_sc2_slots[IOS_SC2_OILPAN].size = IOS_SC2_RDR2_OILPAN_REAL;
+    ios_sc2_floor = IOS_SC2_RDR2_FLOOR;
+    ios_sc2_arena_lo = IOS_SC2_RDR2_ARENA_BASE;
+    ios_sc2_rdr2 = 1;
+}
 
 /* env.MADEIRA_SC_PA_POOLS, the RW alias base and the pool span -> layout 0
  * (off), 1 or 2. Layout 2 needs the alias where the app put it for it, ending
@@ -14591,6 +15294,225 @@ static int ios_sc_layout(void)
         ios_sc_layout_mode = m;
     }
     return ios_sc_layout_mode;
+}
+
+/* madeira-bcd (RDR2): what each piece of the 64 GB band really uses. Opt-in,
+ * logging only: env.MADEIRA_BAND_CENSUS = 1 (default off).
+ *
+ * RDR2.exe reserves 8960 MB in one block as it starts (upstream: the larger
+ * of 7/8 of the reported memory and 8960 MB). In its first licensed run
+ * (build 457, log 2026-10-08 21:20:59) that failed: only [0x7000000000,
+ * 0x8000000000) has room for a block that size, Social Club's layout 2, the
+ * furniture and the FEX arena fill it, and the largest gap left was 2775 MB.
+ * Layout 2's pieces are sized for GTA V. Whether one of them can give up room
+ * for RDR2 depends on how much of it is used, which nothing measured:
+ * [bigres-use] counts commit calls, not pages, and [slot#N] counts mappings,
+ * which our own PROT_NONE holds fill.
+ *
+ * One mach_vm_region walk over the band; each region is split over the
+ * pieces it touches. Per piece: regions, mapped, used (any access, i.e.
+ * committed), resident and dirty (dirtied + compressed) MB, the highest used
+ * address as an offset into the piece (now and the highest seen this
+ * session), and the largest unmapped gap. Resident and dirty pages count in
+ * the piece where their region starts. Then the band's largest gap, aligned
+ * to 64 KB as Wine places a reserve, and whether 8960 MB fits there. Runs with
+ * the periodic slot probe and at a failed large reserve, 64 times at most. */
+#define IOS_BAND_LO         0x7000000000ULL
+#define IOS_BAND_HI         0x8000000000ULL
+#define IOS_BAND_RDR2_ASK   0x230000000ULL     /* RDR2.exe's 8960 MB */
+#define IOS_BAND_PIECES_MAX 12
+
+struct ios_band_piece
+{
+    uint64_t lo, hi;
+    const char *what;
+    unsigned regions;
+    uint64_t mapped, used, resident, dirty, top, gap;
+};
+
+static int ios_band_census_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        /* 1: log what each piece of [0x7000000000, 0x8000000000) uses (RDR2's 8960 MB reserve); default 0. */
+        const char *e = getenv( "MADEIRA_BAND_CENSUS" );
+        on = e && e[0] == '1' && !e[1];
+    }
+    return on;
+}
+
+/* The pieces in address order, covering the band without gaps. The JIT pool's
+ * RW alias [rw_lo, rw_hi) gets its own piece in layout 2 when it starts at
+ * IOS_SC2_RW_ALIAS and ends below the cage; rdr2: MADEIRA_RDR2_VA_HOLD's
+ * geometry (ios_sc2_rdr2_geometry). */
+static int ios_band_pieces( struct ios_band_piece *p, int layout, int rdr2, uint64_t rw_lo, uint64_t rw_hi )
+{
+    int i, n = 0;
+
+    memset( p, 0, sizeof(*p) * IOS_BAND_PIECES_MAX );
+    if (layout == 2 && rdr2)
+    {
+        p[n].lo = IOS_SC2_L_BASE;          p[n++].what = "libcef.dll's pools";
+        p[n].lo = IOS_SC2_RDR2_FLOOR;      p[n++].what = "furniture";
+        p[n].lo = IOS_SC2_J2_BASE;         p[n++].what = "chrome_elf.dll's metadata";
+        p[n].lo = IOS_SC2_RDR2_J2L_BASE;   p[n++].what = "libcef.dll's metadata";
+        p[n].lo = IOS_SC2_RDR2_HOLD_BASE;  p[n++].what = "RDR2 hold";
+        p[n].lo = IOS_SC2_E_BASE;          p[n++].what = "chrome_elf.dll's pools";
+    }
+    else if (layout == 2)
+    {
+        p[n].lo = IOS_SC2_L_BASE;      p[n++].what = "libcef.dll's pools";
+        p[n].lo = IOS_SC2_FLOOR;       p[n++].what = "furniture";
+        p[n].lo = IOS_SC2_J2_BASE;     p[n++].what = "chrome_elf.dll's metadata";
+        p[n].lo = IOS_SC2_J2L_BASE;    p[n++].what = "libcef.dll's metadata";
+        p[n].lo = IOS_SC2_E_BASE;      p[n++].what = "chrome_elf.dll's pools";
+    }
+    if (layout == 2)
+    {
+        if (rw_lo == IOS_SC2_RW_ALIAS && rw_hi > rw_lo && rw_hi < IOS_SC2_CAGE_BASE)
+        {
+            p[n].lo = IOS_SC2_RW_ALIAS; p[n++].what = "JIT pool RW alias";
+            p[n].lo = rw_hi;            p[n++].what = "above the RW alias";
+        }
+        else
+        {
+            p[n].lo = IOS_SC2_RW_ALIAS; p[n++].what = "JIT pool RW alias and above";
+        }
+        p[n].lo = IOS_SC2_CAGE_BASE;   p[n++].what = "V8 cage";
+        p[n].lo = IOS_SC2_OILPAN_BASE; p[n++].what = "Oilpan's cage";
+        p[n].lo = rdr2 ? IOS_SC2_RDR2_ARENA_BASE : IOS_SC_ARENA_BASE;   p[n++].what = "FEX arena";
+    }
+    else
+    {
+        uint64_t a;
+        for (a = IOS_BAND_LO; a < IOS_BAND_HI; a += 0x400000000ULL) { p[n].lo = a; p[n++].what = "16 GB slot"; }
+    }
+    for (i = 0; i < n; i++) p[i].hi = i + 1 < n ? p[i + 1].lo : IOS_BAND_HI;
+    return n;
+}
+
+/* A region [lo, hi) with protection prot: split over the pieces it touches. */
+static void ios_band_region( struct ios_band_piece *p, int n, uint64_t lo, uint64_t hi, int prot,
+                             uint64_t resident, uint64_t dirty )
+{
+    int i;
+
+    for (i = 0; i < n; i++)
+    {
+        uint64_t a = lo > p[i].lo ? lo : p[i].lo, b = hi < p[i].hi ? hi : p[i].hi;
+        if (a >= b) continue;
+        p[i].regions++;
+        p[i].mapped += b - a;
+        if (prot)
+        {
+            p[i].used += b - a;
+            if (b - p[i].lo > p[i].top) p[i].top = b - p[i].lo;
+        }
+        if (lo >= p[i].lo && lo < p[i].hi) { p[i].resident += resident; p[i].dirty += dirty; }
+    }
+}
+
+/* An unmapped gap [lo, hi): the largest per piece, and the band's largest
+ * after aligning its start to 64 KB. */
+static void ios_band_gap( struct ios_band_piece *p, int n, uint64_t lo, uint64_t hi, uint64_t *gap, uint64_t *gap_at )
+{
+    uint64_t start = (lo + 0xffff) & ~0xffffULL;
+    int i;
+
+    if (lo >= hi) return;
+    for (i = 0; i < n; i++)
+    {
+        uint64_t a = lo > p[i].lo ? lo : p[i].lo, b = hi < p[i].hi ? hi : p[i].hi;
+        if (a < b && b - a > p[i].gap) p[i].gap = b - a;
+    }
+    if (start < hi && hi - start > *gap) { *gap = hi - start; *gap_at = start; }
+}
+
+static void ios_band_census( const char *why )
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t top_max[IOS_BAND_PIECES_MAX];
+    static unsigned count;
+    struct ios_band_piece p[IOS_BAND_PIECES_MAX];
+    uint64_t addr = IOS_BAND_LO, hi = IOS_BAND_HI, gap = 0, gap_at = 0, rw_lo, rw_hi;
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t vcnt = TASK_VM_INFO_COUNT;
+    unsigned walked = 0;
+    struct tm tm;
+    time_t now;
+    int i, n;
+
+    if (!ios_band_census_enabled() || pthread_mutex_trylock( &lock )) return;
+    if (count >= 64) { pthread_mutex_unlock( &lock ); return; }
+    count++;
+    rw_lo = (uint64_t)(uintptr_t)ios_jit_rw_base_global;
+    rw_hi = rw_lo + ios_jit_pool_size_global;
+    if (ios_jit_low_size_global)
+    {
+        uint64_t l = (uint64_t)ios_jit_low_rw_global;
+        if (l < rw_lo) rw_lo = l;
+        if (l + ios_jit_low_size_global > rw_hi) rw_hi = l + ios_jit_low_size_global;
+    }
+    n = ios_band_pieces( p, ios_sc_layout_mode, ios_sc2_rdr2, rw_lo, rw_hi );
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vcnt ) == KERN_SUCCESS &&
+        vmi.max_address && (uint64_t)vmi.max_address < hi)
+        hi = (uint64_t)vmi.max_address;
+    if (hi <= IOS_BAND_LO)
+    {
+        dprintf( 2, "[band] census #%u (%s): the task map ends at 0x%llx, below the band\n", count, why,
+                 (unsigned long long)hi );
+        pthread_mutex_unlock( &lock );
+        return;
+    }
+    while (addr < hi)
+    {
+        mach_vm_address_t q = addr;
+        mach_vm_size_t size = 0;
+        vm_region_extended_info_data_t info;
+        mach_msg_type_number_t cnt = VM_REGION_EXTENDED_INFO_COUNT;
+        mach_port_t obj = MACH_PORT_NULL;
+        uint64_t end;
+
+        if (mach_vm_region( mach_task_self(), &q, &size, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info,
+                            &cnt, &obj ) != KERN_SUCCESS || q >= hi || !size)
+        {
+            ios_band_gap( p, n, addr, hi, &gap, &gap_at );
+            break;
+        }
+        if (q > addr) ios_band_gap( p, n, addr, q, &gap, &gap_at );
+        end = q + size > hi ? hi : q + size;
+        ios_band_region( p, n, q > addr ? q : addr, end, info.protection,
+                         (uint64_t)info.pages_resident << 14,
+                         ((uint64_t)info.pages_dirtied + info.pages_swapped_out) << 14 );
+        addr = end;
+        if (++walked >= 1000000)
+        {
+            dprintf( 2, "[band] census #%u: stopped after %u regions at 0x%llx\n", count, walked,
+                     (unsigned long long)addr );
+            break;
+        }
+    }
+    now = time( NULL );
+    localtime_r( &now, &tm );
+    dprintf( 2, "[band] census #%u (%s) %02d:%02d:%02d layout %d%s, [0x%llx,0x%llx) %u regions: largest gap %llu MB "
+                "at 0x%llx -- RDR2.exe's 8960 MB reserve %s (MADEIRA_BAND_CENSUS)\n",
+             count, why, tm.tm_hour, tm.tm_min, tm.tm_sec, ios_sc_layout_mode,
+             ios_sc2_rdr2 ? " with MADEIRA_RDR2_VA_HOLD" : "", IOS_BAND_LO,
+             (unsigned long long)hi, walked, (unsigned long long)(gap >> 20), (unsigned long long)gap_at,
+             gap >= IOS_BAND_RDR2_ASK ? "fits" : "does not fit" );
+    for (i = 0; i < n; i++)
+    {
+        if (p[i].top > top_max[i]) top_max[i] = p[i].top;
+        dprintf( 2, "[band]   [0x%llx,0x%llx) %s: regions=%u mapped=%llu used=%llu resident=%llu dirty=%llu MB, "
+                    "top +%llu MB (session +%llu MB), gap %llu MB\n",
+                 (unsigned long long)p[i].lo, (unsigned long long)p[i].hi, p[i].what, p[i].regions,
+                 (unsigned long long)(p[i].mapped >> 20), (unsigned long long)(p[i].used >> 20),
+                 (unsigned long long)(p[i].resident >> 20), (unsigned long long)(p[i].dirty >> 20),
+                 (unsigned long long)(p[i].top >> 20), (unsigned long long)(top_max[i] >> 20),
+                 (unsigned long long)(p[i].gap >> 20) );
+    }
+    pthread_mutex_unlock( &lock );
 }
 
 /* Which slot a SocialClubHelper.exe reserve gets in layout 2. `held` has bit k
@@ -14695,7 +15617,32 @@ static void ios_sc2_unhold( int k )
 {
     if (!(ios_sc2_held & (1u << k))) return;
     mach_vm_deallocate( mach_task_self(), ios_sc2_slots[k].base, ios_sc2_slots[k].size );
+    ios_va_release_note();
     ios_sc2_held &= ~(1u << k);
+}
+
+/* [lo, hi): 1 when PROT_NONE regions cover it without a gap (a native hold),
+ * 0 when nothing is mapped there, -1 otherwise. */
+static int ios_sc2_none_only( mach_vm_address_t lo, mach_vm_address_t hi )
+{
+    mach_vm_address_t cur = lo;
+    int seen = 0;
+
+    while (cur < hi)
+    {
+        mach_vm_address_t r = cur;
+        mach_vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t inf = { 0 };
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (mach_vm_region( mach_task_self(), &r, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&inf,
+                            &cnt, &obj ) != KERN_SUCCESS || r >= hi)
+            return seen ? -1 : 0;
+        if (r > cur || inf.protection != VM_PROT_NONE) return -1;
+        seen = 1;
+        cur = r + rs;
+    }
+    return 1;
 }
 
 /* virtual_init: take the four slots before anything can land in them, or fall
@@ -14705,6 +15652,7 @@ static void ios_sc2_boot_holds(void)
     int k;
 
     if (ios_sc_layout() != 2) return;
+    if (ios_sc2_rdr2_hold_enabled()) ios_sc2_rdr2_geometry();
     for (k = IOS_SC2_E; k <= IOS_SC2_OILPAN; k++)
     {
         if (ios_sc2_hold( k )) continue;
@@ -14716,11 +15664,59 @@ static void ios_sc2_boot_holds(void)
         ios_sc_layout_mode = 0;
         return;
     }
-    dprintf( 2, "[sc-cef] layout 2: held libcef.dll's pools [0x%llx,+4 GB), PartitionAlloc metadata of chrome_elf.dll "
-                "[0x%llx,+8 GB) and libcef.dll [0x%llx,+8 GB), chrome_elf.dll's pools [0x%llx,+4 GB), Oilpan "
-                "[0x%llx,+4 GB); RW alias 0x%llx, V8 cage 0x%llx, furniture floor 0x%llx\n",
-             IOS_SC2_L_BASE, IOS_SC2_J2_BASE, IOS_SC2_J2L_BASE, IOS_SC2_E_BASE, IOS_SC2_OILPAN_BASE,
-             IOS_SC2_RW_ALIAS, IOS_SC2_CAGE_BASE, IOS_SC2_FLOOR );
+    if (!ios_sc2_rdr2)
+    {
+        dprintf( 2, "[sc-cef] layout 2: held libcef.dll's pools [0x%llx,+4 GB), PartitionAlloc metadata of chrome_elf.dll "
+                    "[0x%llx,+8 GB) and libcef.dll [0x%llx,+8 GB), chrome_elf.dll's pools [0x%llx,+4 GB), Oilpan "
+                    "[0x%llx,+4 GB); RW alias 0x%llx, V8 cage 0x%llx, furniture floor 0x%llx\n",
+                 IOS_SC2_L_BASE, IOS_SC2_J2_BASE, IOS_SC2_J2L_BASE, IOS_SC2_E_BASE, IOS_SC2_OILPAN_BASE,
+                 IOS_SC2_RW_ALIAS, IOS_SC2_CAGE_BASE, IOS_SC2_FLOOR );
+        return;
+    }
+    dprintf( 2, "[sc-cef] layout 2 with MADEIRA_RDR2_VA_HOLD: held libcef.dll's pools [0x%llx,+%llu MB) and its "
+                "PartitionAlloc metadata [0x%llx,+%llu MB), chrome_elf.dll's metadata [0x%llx,+%llu MB) and pools "
+                "[0x%llx,+4 GB), Oilpan [0x%llx,+%llu MB); RW alias 0x%llx, V8 cage 0x%llx, furniture floor 0x%llx\n",
+             (unsigned long long)ios_sc2_slots[IOS_SC2_L].base, (unsigned long long)(ios_sc2_slots[IOS_SC2_L].size >> 20),
+             (unsigned long long)ios_sc2_slots[IOS_SC2_J2L].base, (unsigned long long)(ios_sc2_slots[IOS_SC2_J2L].size >> 20),
+             (unsigned long long)ios_sc2_slots[IOS_SC2_J2].base, (unsigned long long)(ios_sc2_slots[IOS_SC2_J2].size >> 20),
+             IOS_SC2_E_BASE, IOS_SC2_OILPAN_BASE, (unsigned long long)(ios_sc2_slots[IOS_SC2_OILPAN].size >> 20),
+             IOS_SC2_RW_ALIAS, IOS_SC2_CAGE_BASE, IOS_SC2_RDR2_FLOOR );
+    /* The app held [0x7000000000, +4 GB) for libcef.dll's pools; the slot took
+     * its first 256 MB. Give the rest to the furniture, but only while it is
+     * still the app's untouched PROT_NONE hold. */
+    {
+        int none = ios_sc2_none_only( IOS_SC2_RDR2_FLOOR, IOS_SC2_FLOOR );
+        if (none > 0)
+        {
+            mach_vm_deallocate( mach_task_self(), IOS_SC2_RDR2_FLOOR, IOS_SC2_FLOOR - IOS_SC2_RDR2_FLOOR );
+            ios_va_release_note();
+        }
+        dprintf( 2, "[sc-cef] MADEIRA_RDR2_VA_HOLD: [0x%llx,0x%llx) %s; the furniture starts at 0x%llx (%llu MB more)\n",
+                 IOS_SC2_RDR2_FLOOR, IOS_SC2_FLOOR,
+                 none > 0 ? "released from the app's hold" : none == 0 ? "was free" : "is partly mapped by something else",
+                 IOS_SC2_RDR2_FLOOR, (IOS_SC2_FLOOR - IOS_SC2_RDR2_FLOOR) >> 20 );
+    }
+    {
+        mach_vm_address_t a = IOS_SC2_RDR2_HOLD_BASE;
+        kern_return_t kr = mach_vm_map( mach_task_self(), &a, IOS_SC2_RDR2_HOLD_SIZE, 0, VM_FLAGS_FIXED,
+                                        MEMORY_OBJECT_NULL, 0, 0, PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
+        if (kr != KERN_SUCCESS || ios_jumbo_hold_size)
+        {
+            if (kr == KERN_SUCCESS) mach_vm_deallocate( mach_task_self(), a, IOS_SC2_RDR2_HOLD_SIZE );
+            dprintf( 2, "[sc-cef] MADEIRA_RDR2_VA_HOLD: could not hold [0x%llx,0x%llx) (kr=%d, holdback %llu MB) -- "
+                        "an 8960 MB reserve fails as before\n", IOS_SC2_RDR2_HOLD_BASE,
+                     IOS_SC2_RDR2_HOLD_BASE + IOS_SC2_RDR2_HOLD_SIZE, (int)kr,
+                     (unsigned long long)(ios_jumbo_hold_size >> 20) );
+            return;
+        }
+        ios_jumbo_hold_base = (uintptr_t)a;
+        ios_jumbo_hold_size = (size_t)IOS_SC2_RDR2_HOLD_SIZE;
+        ios_jumbo_hold_min = (size_t)IOS_SC2_RDR2_HOLD_SIZE;
+        ios_jumbo_hold_keep = 0;
+        dprintf( 2, "[sc-cef] MADEIRA_RDR2_VA_HOLD: [0x%llx,0x%llx) held for one 8960 MB reserve (RDR2.exe's): "
+                    "the first one the kernel cannot place gets it ([jumbo-hold] lines); nothing smaller does\n",
+                 IOS_SC2_RDR2_HOLD_BASE, IOS_SC2_RDR2_HOLD_BASE + IOS_SC2_RDR2_HOLD_SIZE );
+    }
 }
 
 /* Reservations SocialClubHelper.exe got through the jumbo path, by owner, so a
@@ -14809,7 +15805,8 @@ static void ios_sc_rehold( int kind )
 static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
 {
     static int tried;
-    mach_vm_address_t h = IOS_SC_BRP_HOLD_BASE, a = IOS_SC_ARENA_BASE;
+    mach_vm_address_t h = IOS_SC_BRP_HOLD_BASE, a = ios_sc2_arena_lo;
+    mach_vm_size_t asz = 0x8000000000ULL - ios_sc2_arena_lo;   /* 12 GB; 15 GB with MADEIRA_RDR2_VA_HOLD */
     kern_return_t kr = KERN_SUCCESS;
     int mode = ios_sc_layout();
 
@@ -14820,7 +15817,7 @@ static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
                           PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
     if (kr == KERN_SUCCESS)
     {
-        kr = mach_vm_map( mach_task_self(), &a, IOS_SC_ARENA_SIZE, 0xffff, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, 0,
+        kr = mach_vm_map( mach_task_self(), &a, asz, 0xffff, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, 0,
                           PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
         if (kr != KERN_SUCCESS && mode == 1) mach_vm_deallocate( mach_task_self(), h, IOS_SC_BRP_HOLD_SIZE );
     }
@@ -14828,17 +15825,18 @@ static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
     {
         dprintf( 2, "[sc-cef] env.MADEIRA_SC_PA_POOLS=%d: could not take [0x%llx,0x%llx) (kr=%d) -- the FEX arena "
                     "stays where it was and SocialClubHelper.exe's PartitionAlloc pools cannot be placed\n",
-                 mode, mode == 1 ? IOS_SC_BRP_HOLD_BASE : IOS_SC_ARENA_BASE, IOS_SC_ARENA_BASE + IOS_SC_ARENA_SIZE,
+                 mode, mode == 1 ? IOS_SC_BRP_HOLD_BASE : ios_sc2_arena_lo, ios_sc2_arena_lo + asz,
                  (int)kr );
         return 0;
     }
     ios_sc_brp_held = (mode == 1);
     ios_sc_brp_layout = 1;
     *addr = a;
-    *size = IOS_SC_ARENA_SIZE;
-    dprintf( 2, "[sc-cef] env.MADEIRA_SC_PA_POOLS=%d: FEX arena [0x%llx,0x%llx) (12 GB); [0x%llx,0x%llx) held for "
+    *size = asz;
+    dprintf( 2, "[sc-cef] env.MADEIRA_SC_PA_POOLS=%d: FEX arena [0x%llx,0x%llx) (%llu GB); [0x%llx,0x%llx) held for "
                 "SocialClubHelper.exe's %s\n", mode,
-             IOS_SC_ARENA_BASE, IOS_SC_ARENA_BASE + IOS_SC_ARENA_SIZE,
+             (unsigned long long)ios_sc2_arena_lo, (unsigned long long)(ios_sc2_arena_lo + asz),
+             (unsigned long long)(asz >> 30),
              IOS_SC_BRP_HOLD_BASE, IOS_SC_BRP_HOLD_BASE + IOS_SC_BRP_HOLD_SIZE,
              mode == 1 ? "PartitionAlloc pools" : "Oilpan cage" );
     return 1;
@@ -14848,6 +15846,7 @@ static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
 static void ios_sc_pa_drop_hold(void)
 {
     if (ios_sc_brp_held) mach_vm_deallocate( mach_task_self(), IOS_SC_BRP_HOLD_BASE, IOS_SC_BRP_HOLD_SIZE );
+    ios_va_release_note();
     ios_sc_brp_held = ios_sc_brp_layout = 0;
 }
 
@@ -15796,6 +16795,36 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                      hole, (unsigned long)jit_pool_size );
                     }
                 }
+                /* madeira-bcd pool-mid: a second hole above the first, with the
+                 * third region M between them (see ios_jit_hole2_off). Taken only
+                 * with a valid first hole and at least 16 KB of M; anything else is
+                 * ignored, which leaves the one-hole pool. */
+                {
+                    const char *hole2 = getenv( "WINE_IOS_JIT_HOLE2" );
+                    if (hole2 && *hole2)
+                    {
+                        char *sep = NULL;
+                        unsigned long long h0 = strtoull( hole2, &sep, 16 ), h1 = 0;
+                        if (sep && *sep == ':') h1 = strtoull( sep + 1, NULL, 16 );
+                        if (ios_jit_hole_end > ios_jit_hole_off && h0 >= ios_jit_hole_end + 0x4000 &&
+                            h1 > h0 && h1 < jit_pool_size && !(h0 & 0x3fff) && !(h1 & 0x3fff))
+                        {
+                            ios_jit_hole2_off = (size_t)h0;
+                            ios_jit_hole2_end = (size_t)h1;
+                            dprintf( 2, "[jit-pool] pool-mid: third region RX [%p,%p) (%lu MB) between the holes; "
+                                     "hole 2 [0x%llx,0x%llx) (%llu MB, the main thread's stack) is never handed out "
+                                     "either; usable %lu MB of the 0x%lx span\n",
+                                     (char *)jit_rx_base + ios_jit_hole_end, (char *)jit_rx_base + h0,
+                                     (unsigned long)((h0 - ios_jit_hole_end) >> 20), h0, h1, (h1 - h0) >> 20,
+                                     (unsigned long)((jit_pool_size - (ios_jit_hole_end - ios_jit_hole_off) - (h1 - h0)) >> 20),
+                                     (unsigned long)jit_pool_size );
+                        }
+                        else
+                            dprintf( 2, "[jit-pool] pool-mid: WINE_IOS_JIT_HOLE2=%s ignored (hole 1 [0x%lx,0x%lx), "
+                                     "pool size 0x%lx)\n", hole2, (unsigned long)ios_jit_hole_off,
+                                     (unsigned long)ios_jit_hole_end, (unsigned long)jit_pool_size );
+                    }
+                }
                 /* The default big-image slot is above the hole. A game may
                  * request the lower side; if it cannot leave 256MB for startup
                  * images, retain the old upper placement instead. */
@@ -15804,7 +16833,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );
                     /* 1 puts the existing image slot below the native hole; 0/default keeps it above. */
                     const char *lower = getenv( "MADEIRA_POOL_BIG_SLOT_BELOW" );
-                    if (big && *big && strtoul( big, NULL, 10 ))
+                    if (big && *big && strtoul( big, NULL, 10 ) && ios_jit_hole2_end > ios_jit_hole2_off)
+                        dprintf( 2, "[pool-big] madeira-bcd MADEIRA_POOL_BIG_SLOT_MB=%s ignored: the pool has a second "
+                                 "hole (pool-mid), the slot is laid out against one\n", big );
+                    else if (big && *big && strtoul( big, NULL, 10 ))
                     {
                         unsigned long mb = strtoul( big, NULL, 10 );
                         size_t want = mb <= (SIZE_MAX >> 20) ? (size_t)mb << 20 : 0;
@@ -17750,8 +18782,14 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     /* ml1077: never execute from the tier. ml1257: BEFORE set_vprot, not after --
      * the copy-back maps anonymous RW, which used to overwrite the protection
      * set_vprot had just applied (a guard page came back writable), and an EXEC
-     * mprotect on the shared file mapping must not be what decides the outcome. */
-    if (vprot & (VPROT_EXEC | VPROT_WRITECOPY | VPROT_GUARD)) ios_swap_release_range( base, size, 1 );
+     * mprotect on the shared file mapping must not be what decides the outcome.
+     * madeira-bcd swap-images: a pure-x64 image view (VPROT_X64DATA) keeps its
+     * file pages for EXEC and WRITECOPY -- mprotect_exec never gives its pages
+     * host EXEC, and the file range is this view's alone -- so the emulator's SMC
+     * protections and the loader's VirtualProtect calls do not pull its sections
+     * back into anonymous memory; a GUARD request still does. */
+    if ((vprot & VPROT_GUARD) || ((vprot & (VPROT_EXEC | VPROT_WRITECOPY)) && !(view->protect & VPROT_X64DATA)))
+        ios_swap_release_range( base, size, 1 );
     if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED ))
     {
         dprintf(2, "[vmem-denied] set_vprot failed: base=%p size=%p protect=0x%x\n",
@@ -18236,6 +19274,43 @@ failed:
     return status;
 }
 
+/* madeira-bcd: [stack-spill] a 4 GB floor constrains nothing on iOS.
+ *
+ * init_thread_stack asks for every thread's kernel stack (1 MB), CHPE emulator
+ * stack and WoW64 64-bit stack with limit_low = limit_4g, as upstream does to
+ * keep them out of the low 4 GB. Nothing is ever mapped below 4 GB here (the
+ * __PAGEZERO), but virtual_set_large_address_space resets address_space_start
+ * to 0x10000 for a 64-bit program, so map_view's "limit_low at or below
+ * address_space_start" test (ml119) never matches these requests. They scan
+ * the low map from 4 GB on every thread creation (~260-300 refused tries each,
+ * the [va-scan] SLOW lines) and, once the furniture band is full, fail with
+ * STATUS_NO_MEMORY instead of taking the relax valve. RDR2 (build 460, log
+ * 2026-10-08 23:59:11) froze that way four minutes into the story: RDR2.exe's
+ * main thread retried CreateThread, every try ended in [va-scan] FAILED
+ * window=0x100000000..0x73ffff0000 size=0x100000 and "[thr-create] FAILED at
+ * kernel stack", while 1838 MB above the JIT pool's RW alias were free.
+ * MADEIRA_THREAD_STACK_SPILL=1 treats a limit_low at or below 4 GB as absent:
+ * the scan starts at the furniture floor, and a full band falls back to the
+ * kernel's pick like any other relaxable request. Off by default. */
+static int ios_stack_spill_enabled(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        const char *s = getenv( "MADEIRA_THREAD_STACK_SPILL" );
+
+        v = s && s[0] == '1' && !s[1];
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+        if (v)
+            dprintf( 2, "[stack-spill] MADEIRA_THREAD_STACK_SPILL=1: requests bounded only by a 4 GB floor "
+                        "(thread kernel, emulator and WoW64 stacks) start at the furniture floor and use the "
+                        "kernel's pick when the band is full\n" );
+    }
+    return v;
+}
+
 /***********************************************************************
  *           map_view
  *
@@ -18302,6 +19377,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          * top-of-space tenant from ml106) stay below 464G-64K; only the PA
          * 16GB/32GB pool reserves may use the slots above. */
         int ceiling_relaxable = 0;
+        int stack_spill = 0;   /* madeira-bcd: relaxable only through ios_stack_spill_enabled */
         void *wow_hi_start = NULL, *wow_hi_end = NULL;   /* madeira-bcd: band above the 32-bit windows */
         if (ios_furniture_ceiling && !limit_high && size < 0x400000000ULL &&
             (void *)ios_furniture_ceiling < end)
@@ -18320,6 +19396,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
              * for the same call. (top_down is a hint, not a contract, and is
              * knowingly dropped on the relax path.) */
             ceiling_relaxable = (limit_low <= (ULONG_PTR)address_space_start);
+            /* madeira-bcd: [stack-spill] — see ios_stack_spill_enabled */
+            if (!ceiling_relaxable && limit_low <= limit_4g && ios_stack_spill_enabled())
+                ceiling_relaxable = stack_spill = 1;
         }
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
@@ -18456,6 +19535,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {
             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
+#ifdef WINE_IOS
+            ios_fex_arena_headroom( start, end );
+#endif
             goto done;
         }
 
@@ -18502,13 +19584,20 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
                 {
                 static unsigned long vs_storm;
-                static unsigned vs_fails;
+                static unsigned vs_fails, vs_relaxed;
                 /* ml366: FAILED must never be storm-gated — ml365's mmdevapi
                  * c0000017 loads left NO [va-scan] evidence because boot-time
                  * SLOW lines had already spent this site's storm budget. A
                  * failure is the one verdict worth a line every time (own
-                 * generous cap so a retry loop cannot flood the log). */
-                if (ptr ? ios_storm_gate( &vs_storm ) : (vs_fails++ < 256))
+                 * generous cap so a retry loop cannot flood the log).
+                 * madeira-bcd: a failure the unclamped retry absorbs gets its
+                 * own smaller budget (64, then every 1024th): in GTA V
+                 * Enhanced (log 2026-10-08 16:38:52, build 455) 256 of them
+                 * had spent the cap 7 minutes into the session, so nothing
+                 * could be seen when the Social Club helper failed to create
+                 * a thread 6 minutes later. */
+                if (ptr ? ios_storm_gate( &vs_storm )
+                        : ceiling_relaxable ? (++vs_relaxed <= 64 || !(vs_relaxed % 1024)) : (vs_fails++ < 256))
                 dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
                             " | seen=%p..%p views=%u maxgap=%p tailgap=%p stop=%s"
                             " | firstfail=%p errno=%d(%s) %s%s\n",
@@ -18526,6 +19615,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             }
 #ifdef WINE_IOS
             if (!ptr) ios_fex_arena_census( start, end, size, align_mask );
+            else ios_fex_arena_headroom( start, end );
 #endif
             if (ptr)
             {
@@ -18594,11 +19684,63 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             if (unmap_size) munmap( ptr, unmap_size );
         }
         ptr = unmap_extra_space( ptr, view_size, host_size, align_mask );
+        if (stack_spill)
+        {
+            static unsigned long spill_n;
+
+            if (++spill_n <= 16 || !(spill_n % 256))
+                dprintf( 2, "[stack-spill] #%lu furniture band full: 0x%lx bytes with a 4 GB floor "
+                            "placed at %p by the kernel's pick (MADEIRA_THREAD_STACK_SPILL)\n",
+                         spill_n, (unsigned long)size, ptr );
+        }
     }
 done:
     status = create_view( view_ret, ptr, size, vprot );
     if (status != STATUS_SUCCESS) unmap_area( ptr, size );
     return status;
+}
+
+
+/* madeira-bcd swap-images (madeira.cfg or the game's own file `swap-images = 1`,
+ * off by default; needs the swap tier, swap-mb, and env.MADEIRA_X64_IMAGE_NOCOPY = 1).
+ *
+ * A PE section is mmapped from its file only when its address and file offset
+ * are 16 KB-aligned; an x64 PE has 4 KB sections at 512-byte file offsets, so
+ * map_file_into_view_ex reads every section into ANONYMOUS memory, which
+ * phys_footprint charges in full for the life of the image (compressed or not).
+ * The 467 run (2026-10-09 13:09, line 38693) had libcef.dll's view at
+ * 0x70d6b40000 228 MB dirty in two regions and both steamclient64.dll copies 22 MB
+ * each; the pure-x64 images mapped before RDR2.exe (Steam's client, the
+ * launcher, Social Club) add up to ~357 MB, and RDR2.exe and its DLLs ~160 MB.
+ *
+ * With the switch, a pure-x64 image (the same images VPROT_X64DATA marks: no
+ * pool copy, the host never executes them) keeps being read exactly as before,
+ * and afterwards each section's host-page interior moves to the swap tier's
+ * file, whose dirty pages are "external" and not charged (ml1076):
+ * map_file_into_view_ex notes the range (ios_swap_image_note, lock held),
+ * virtual_map_image calls ios_swap_image_flush after leaving virtual_mutex, and
+ * the copy into the file is a pwrite made outside the lock -- ml1081: nothing
+ * that can block on the file may run while the lock is held. Edge host pages
+ * shared with the header or a neighbouring section stay anonymous. EXEC and
+ * WRITECOPY requests on such views no longer copy the range back
+ * (set_protection): the host never executes them and every view is private. */
+#define IOS_SWAP_IMAGE_PENDING 32
+static _Thread_local int ios_swap_image_armed;     /* map_image_into_view's sections loop, for this image */
+static _Thread_local unsigned ios_swap_image_npend;
+static _Thread_local struct { char *va; size_t len; void *view_base; } ios_swap_image_pend[IOS_SWAP_IMAGE_PENDING];
+
+/* Remember the host-page interior of [addr, addr+size), just read into the
+ * anonymous memory of image view `view`. virtual_mutex held; no syscalls. */
+static void ios_swap_image_note( const struct file_view *view, char *addr, size_t size )
+{
+    char *hs = (char *)(((uintptr_t)addr + host_page_mask) & ~(uintptr_t)host_page_mask);
+    char *he = (char *)(((uintptr_t)addr + size) & ~(uintptr_t)host_page_mask);
+
+    if (!ios_swap_image_armed || he <= hs || ios_swap_image_npend >= IOS_SWAP_IMAGE_PENDING) return;
+    ios_swap_image_pend[ios_swap_image_npend].va = hs;
+    ios_swap_image_pend[ios_swap_image_npend].len = he - hs;
+    ios_swap_image_pend[ios_swap_image_npend].view_base = view->base;
+    ios_swap_image_npend++;
 }
 
 
@@ -18871,6 +20013,9 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
 
     mprotect( map_addr, map_size, PROT_READ | PROT_WRITE );
     pread( fd, map_addr, size, offset );
+#ifdef WINE_IOS
+    if (for_image) ios_swap_image_note( view, map_addr, map_size );   /* madeira-bcd swap-images (off: a no-op) */
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -19061,12 +20206,14 @@ static uint64_t ios_swap_cap, ios_swap_bump;
 /* resv: the extent maps a whole reservation (wide at reserve time, broad), so a
  * decommit inside it punches the file in place (ml1257). key: the size asked for
  * (reservation or commit), the churn filter's unit; born: ns when it was backed
- * (ml1258). */
-static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; } ios_swap_ext[16384];
+ * (ml1258). img: an image section's (madeira-bcd swap-images, ios_swap_image_map). */
+static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; int img; } ios_swap_ext[16384];
 static unsigned ios_swap_n;
 static struct { uint64_t off, len; } ios_swap_free[8192];
 static unsigned ios_swap_nfree;
 static unsigned long long ios_swap_bytes, ios_swap_peak, ios_swap_backs, ios_swap_releases, ios_swap_unbacks, ios_swap_refused;
+/* madeira-bcd swap-images: image sections in the file now / at most, sections backed, refused */
+static unsigned long long ios_swap_img_bytes, ios_swap_img_peak, ios_swap_img_backs, ios_swap_img_refused;
 
 /* COVERAGE, FREE-SPACE REUSE AND A LOW-VOLUME CENSUS (only while the tier is on).
  *
@@ -19087,7 +20234,8 @@ static unsigned long long ios_swap_bytes, ios_swap_peak, ios_swap_backs, ios_swa
  *    the file PROT_NONE at reserve time, so that a heap committing 64 KB at a
  *    time commits file pages (a hole reads as zero).
  *  - broad (ml1257, device-verified: Metro 2033 Redux 3.3 -> 2.7 GB footprint):
- *    every fresh reservation of at least the floor (default 4 MB) up to 8 GB is
+ *    every fresh reservation of at least the floor (default 4 MB) up to 8 GB
+ *    (MADEIRA_SWAP_RESERVE_MAX_MB, at most 16 GB: madeira-bcd) is
  *    backed WHOLE when it is made, committed or not (PROT_NONE where not), so
  *    every later commit inside it -- any size -- is an mprotect of file pages.
  *    Red Dead Redemption 2 reserves big and commits in small pieces; Metro 2033 Redux's heap never reaches
@@ -19186,8 +20334,11 @@ static void ios_swap_config( void )
     ios_swap_mode = ios_swap_broad ? "broad" : ios_swap_wide ? "wide" : "blocks";
     ios_swap_min = ios_swap_env_size( "MADEIRA_SWAP_MIN_KB", cfg_min ? cfg_min : ios_swap_broad ? 4u << 20 : 1u << 20,
                                       10, 64u << 10, (size_t)1 << 32 );
+    /* madeira-bcd: broad takes up to 16 GB when the env asks, so that RDR2.exe's
+     * 8960 MB heap (env.MADEIRA_RDR2_VA_HOLD's hold) can be backed whole with
+     * MADEIRA_SWAP_RESERVE_MAX_MB = 9216; unset it stays 8 GB. */
     if (ios_swap_broad)
-        ios_swap_resv_max = ios_swap_env_size( "MADEIRA_SWAP_RESERVE_MAX_MB", (size_t)8 << 30, 20, 1u << 20, (size_t)8 << 30 );
+        ios_swap_resv_max = ios_swap_env_size( "MADEIRA_SWAP_RESERVE_MAX_MB", (size_t)8 << 30, 20, 1u << 20, (size_t)16 << 30 );
     else
         ios_swap_resv_max = ios_swap_env_size( "MADEIRA_SWAP_RESERVE_MAX_MB", 256u << 20, 20, 1u << 20, (size_t)1 << 32 );
 }
@@ -19528,7 +20679,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     }
 mapped:
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
-    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size;
+    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size; ios_swap_ext[ios_swap_n].img = 0;
     ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
     ios_swap_churn_backed( size );   /* ml1226 */
     ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
@@ -19622,6 +20773,7 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
             }
             ios_swap_give( ooff, olen );
             ios_swap_bytes -= olen;
+            if (ios_swap_ext[i].img) ios_swap_img_bytes -= olen;   /* madeira-bcd swap-images */
             ios_swap_releases++;
             /* trim the extent: up to two remaining pieces */
             if (oa == a && ob == b)
@@ -19707,6 +20859,9 @@ void ios_swap_stats_line( void )
     if (ios_pool_takes || ios_pool_guarded)
         dprintf( 2, "[swap] ml1150 pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list\n",
                  ios_pool_bytes >> 20, ios_pool_peak >> 20, ios_pool_takes, ios_pool_guarded, ios_pool_lost >> 20 );
+    if (ios_swap_img_backs || ios_swap_img_refused)   /* madeira-bcd swap-images */
+        dprintf( 2, "[swap] swap-images: %llu MB of image sections in the file (peak %llu), %llu sections moved, %llu refused\n",
+                 ios_swap_img_bytes >> 20, ios_swap_img_peak >> 20, ios_swap_img_backs, ios_swap_img_refused );
     /* ml1221: the census (bytes by reason) with every stats line, ~10 s, not only
      * after its own 30 s: Ori and the Will of the Wisps was jetsammed at 26 s and never printed one. */
     ios_swap_tick( 1 );
@@ -19769,6 +20924,13 @@ static void ios_swap_tick( int force )
             p = ios_swap_put( p, end, " " ); p = ios_swap_put( p, end, ios_swap_skip_name[i] );
             p = ios_swap_put( p, end, "=" ); p = ios_swap_put_u( p, end, ios_swap_skip_bytes[i] >> 20 );
         }
+    }
+    if (ios_swap_img_backs || ios_swap_img_refused)   /* madeira-bcd swap-images */
+    {
+        p = ios_swap_put( p, end, " | images=" );     p = ios_swap_put_u( p, end, ios_swap_img_bytes >> 20 );
+        p = ios_swap_put( p, end, "MB peak=" );       p = ios_swap_put_u( p, end, ios_swap_img_peak >> 20 );
+        p = ios_swap_put( p, end, "MB sections=" );   p = ios_swap_put_u( p, end, ios_swap_img_backs );
+        p = ios_swap_put( p, end, " refused=" );      p = ios_swap_put_u( p, end, ios_swap_img_refused );
     }
     p = ios_swap_put( p, end, " | footprint=" );      p = ios_swap_put_u( p, end, ios_swap_footprint_mb() );
     p = ios_swap_put( p, end, "MB coverage=" );       p = ios_swap_put( p, end, ios_swap_mode );
@@ -19849,6 +21011,57 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     else ios_swap_tick( 0 );
     return 1;
 }
+/* madeira-bcd swap-images (see ios_swap_image_flush): the file side. With the
+ * lock held, ios_swap_image_take reserves a file range for a section's
+ * host-page interior (-1: tier off, extent table or disk full); the caller
+ * copies the section into it with pwrite after leaving the lock, and with the
+ * lock held again ios_swap_image_map maps the range over the anonymous copy
+ * -- a MAP_FIXED that fails leaves the old mapping and its data in place on
+ * Darwin, as for ios_swap_map -- or gives it back. No page is touched here.
+ * Image extents never feed the churn filter (key 0, born 0) and never come
+ * from the ml1150 pool, whose ranges a pwrite cannot reach. */
+static uint64_t ios_swap_image_take( size_t len )
+{
+    uint64_t off;
+    if (ios_swap_fd < 0 || !len || (len & host_page_mask) || ios_swap_n >= 16384) return (uint64_t)-1;
+    if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_img_refused++; return (uint64_t)-1; }
+    off = ios_swap_take( len );
+    if (off == (uint64_t)-1) ios_swap_img_refused++;
+    return off;
+}
+static int ios_swap_image_map( char *va, size_t len, uint64_t off )
+{
+    void *p;
+    if (ios_swap_fd < 0) return 0;
+    if (((uintptr_t)va & host_page_mask) || ios_swap_n >= 16384 || ios_swap_overlaps( va, len ))
+    {
+        ios_swap_give( off, len );
+        ios_swap_img_refused++;
+        return 0;
+    }
+    p = mmap( va, len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, ios_swap_fd, (off_t)off );
+    if (p == MAP_FAILED)
+    {
+        static int said;
+        if (said++ < 8) dprintf( 2, "[swap] swap-images: mmap MAP_SHARED %p+0x%zx failed errno=%d (section stays anonymous)\n", va, len, errno );
+        ios_swap_give( off, len );
+        ios_swap_img_refused++;
+        return 0;
+    }
+    ios_swap_ext[ios_swap_n].va = va; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
+    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = 0; ios_swap_ext[ios_swap_n].born = 0;
+    ios_swap_ext[ios_swap_n].img = 1; ios_swap_n++;
+    ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
+    ios_swap_backs++;
+    ios_swap_img_bytes += len; if (ios_swap_img_bytes > ios_swap_img_peak) ios_swap_img_peak = ios_swap_img_bytes;
+    ios_swap_img_backs++;
+    if (ios_swap_img_backs <= 16 || (ios_swap_img_backs % 64) == 0 || len >= (64u << 20))
+        dprintf( 2, "[swap] swap-images: moved %p+0x%zx (image section, file off %llu MB): %llu MB of images in the file, "
+                    "%llu MB file-backed in %u extents\n", va, len, (unsigned long long)(off >> 20),
+                 ios_swap_img_bytes >> 20, ios_swap_bytes >> 20, ios_swap_n );
+    ios_swap_tick( 0 );
+    return 1;
+}
 /* swap-tier core end */
 static unsigned long long ios_swap_footprint_mb( void )
 {
@@ -19871,6 +21084,82 @@ static void ios_swap_cfg( int *mode, int *min_mb )
 {
     *mode = (int)madeira_cfg_int( "swap-mode", 1 );       /* ml1257: madeira.cfg swap-mode = 2 */
     *min_mb = (int)madeira_cfg_int( "swap-min-mb", 0 );   /* ml1257: madeira.cfg swap-min-mb = N */
+}
+
+/* madeira-bcd swap-images: the switch, read once; on only with the tier on.
+ * virtual_mutex held (the first call starts the tier, as allocate_virtual_memory does). */
+static int ios_swap_images_enabled( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        /* 1: pure-x64 images' sections move to the swap tier's file after they are read (needs swap-mb and env.MADEIRA_X64_IMAGE_NOCOPY = 1). */
+        on = madeira_cfg_bool( "swap-images", 0 );
+        if (on)
+        {
+            ios_swap_init();
+            if (ios_swap_fd < 0) on = 0;
+            dprintf( 2, "[swap] swap-images %s (madeira.cfg swap-images = 1)\n",
+                     on ? "on: sections of pure-x64 images move to the swap file after they are read"
+                        : "requested but the swap tier is off (swap-mb): images stay anonymous" );
+        }
+    }
+    return on;
+}
+
+/* madeira-bcd swap-images: move the sections ios_swap_image_note recorded on
+ * this thread into the swap file. Called by virtual_map_image with
+ * virtual_mutex RELEASED (ml1081). Per range: reserve the file range (lock),
+ * pwrite the section's current bytes there (no lock: may block on the file),
+ * then map it over the anonymous copy and re-apply the pages' protections
+ * (lock), or give it back. Between the two locked steps nothing writes the
+ * range: the view is not returned to its caller yet. Every step re-checks that
+ * the range still lies in the same pure-x64 image view (VPROT_X64DATA) and is
+ * not backed yet; `ok` = 0 (the image failed to map) drops the notes. */
+static void ios_swap_image_flush( int ok )
+{
+    unsigned i, n = ios_swap_image_npend;
+    ios_swap_image_npend = 0;
+    for (i = 0; ok && i < n; i++)
+    {
+        char *va = ios_swap_image_pend[i].va;
+        size_t len = ios_swap_image_pend[i].len;
+        void *view_base = ios_swap_image_pend[i].view_base;
+        struct file_view *view;
+        uint64_t off = (uint64_t)-1;
+        sigset_t sigset;
+        ssize_t written;
+        int err, same;
+
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        view = find_view( va, len );
+        if (view && view->base == view_base && (view->protect & SEC_IMAGE) && (view->protect & VPROT_X64DATA) &&
+            !ios_swap_overlaps( va, len ))
+            off = ios_swap_image_take( len );
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        if (off == (uint64_t)-1) continue;
+
+        written = pwrite( ios_swap_fd, va, len, (off_t)off );
+        err = written < 0 ? errno : 0;
+
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        view = find_view( va, len );
+        same = view && view->base == view_base && (view->protect & VPROT_X64DATA);
+        if (written == (ssize_t)len && same)
+        {
+            if (ios_swap_image_map( va, len, off )) mprotect_range( va, len, 0, 0 );
+        }
+        else
+        {
+            static int said;
+            if (said++ < 8)
+                dprintf( 2, "[swap] swap-images: %p+0x%zx not moved (pwrite %zd of %zu, errno %d; view %s): stays anonymous\n",
+                         va, len, written, len, err, same ? "unchanged" : view ? "changed" : "gone" );
+            ios_swap_give( off, len );
+            ios_swap_img_refused++;
+        }
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    }
 }
 
 /* Replacement for decommit_pages in pinned virtual_ios.c.  The original
@@ -21013,6 +22302,57 @@ static BOOL ios_subfloor_window_held( ULONG_PTR low, ULONG_PTR real )
     return FALSE;
 }
 
+/* madeira-bcd: madeira.cfg ignore-volatile-metadata = 1 (opt-in). FEX runs an
+ * image that carries PE volatile metadata (MSVC's /volatileMetadata, on by
+ * default for x64 since VS 2019) without TSO ordering for every instruction the
+ * metadata does not list, as Windows' x64 emulator does (FEX ImageTracker::
+ * HandleImageMap -> AddForceTSOInformation). Code that orders plain loads and
+ * stores through x86's own memory model then runs relaxed: GhostOfTsushima.exe
+ * carries 5424 entries (build 336), Horizon Zero Dawn's concrt140.dll 1795
+ * (build 481); HorizonZeroDawn.exe and the Rockstar games carry none. With the
+ * switch on, an x64 image's VolatileMetadataPointer is cleared here, after
+ * relocation and before the PE side or FEX reads it, so FEX applies its own TSO
+ * settings to the whole image. Off: nothing changes. */
+static void ios_ignore_volatile_metadata( char *base, SIZE_T total_size, IMAGE_NT_HEADERS *nt,
+                                          ULONG_PTR pref_base, const UNICODE_STRING *nt_name )
+{
+    static int enabled = -1;
+    static unsigned said;
+    IMAGE_NT_HEADERS64 *nt64 = (IMAGE_NT_HEADERS64 *)nt;
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_LOAD_CONFIG_DIRECTORY64 *lc;
+    ULONGLONG va, rva = ~0ull;
+    unsigned accesses = 0, ranges = 0;
+    const SIZE_T need = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY64, VolatileMetadataPointer ) + sizeof(ULONGLONG);
+
+    if (enabled < 0) enabled = madeira_cfg_bool( "ignore-volatile-metadata", 0 );
+    if (!enabled) return;
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) return;
+    dir = &nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    if (!dir->VirtualAddress || !dir->Size || dir->VirtualAddress >= total_size ||
+        total_size - dir->VirtualAddress < need) return;
+    lc = (IMAGE_LOAD_CONFIG_DIRECTORY64 *)(base + dir->VirtualAddress);
+    if (lc->Size < need || !(va = lc->VolatileMetadataPointer)) return;
+    /* A VA: relocated with the image, or still at the preferred base (ml949). */
+    if (va >= nt64->OptionalHeader.ImageBase && va - nt64->OptionalHeader.ImageBase < total_size)
+        rva = va - nt64->OptionalHeader.ImageBase;
+    else if (va >= pref_base && va - pref_base < total_size)
+        rva = va - pref_base;
+    if (rva != ~0ull && rva + 6 * sizeof(DWORD) <= total_size)
+    {   /* IMAGE_VOLATILE_METADATA: Size, Version, access table + size, range table + size */
+        const DWORD *md = (const DWORD *)(base + rva);
+        accesses = md[3] / 4;
+        ranges = md[5] / 8;
+    }
+    lc->VolatileMetadataPointer = 0;
+    if (said++ < 32)
+        dprintf( 2, "[fex-vmeta] madeira-bcd: %s at %p: volatile metadata (%u accesses, %u ranges) cleared; FEX orders "
+                    "the whole image by its TSO settings (ignore-volatile-metadata)\n",
+                 debugstr_us(nt_name), base, accesses, ranges );
+}
+
 
 /***********************************************************************
  *           map_image_into_view
@@ -21145,6 +22485,16 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
     /* map all the sections */
 
+#ifdef WINE_IOS
+    /* madeira-bcd swap-images: the sections of the images [x64-image] marks
+     * below (same test, VPROT_ARM64EC aside: ios_swap_image_flush re-checks the
+     * mark) are noted as they are read; see ios_swap_image_note. */
+    ios_swap_image_npend = 0;
+    ios_swap_image_armed = ios_swap_images_enabled() && ios_x64_image_nocopy_enabled() && !ios_map_resource_view &&
+                           !ios_wow_base() && nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                           nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                           !image_info->is_hybrid && !image_info->wine_builtin;
+#endif
     for (i = pos = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
         static const SIZE_T sector_align = 0x1ff;
@@ -21250,6 +22600,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             memset( ptr + sec[i].VirtualAddress + file_size, 0, end - file_size );
         }
     }
+#ifdef WINE_IOS
+    ios_swap_image_armed = 0;   /* madeira-bcd swap-images: only the sections loop notes */
+#endif
 
 #ifdef __aarch64__
     if ((dir = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG )))
@@ -21398,6 +22751,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     }
     /* madeira-bcd: [sc-rph], before the protections and the JIT-pool copy. */
     ios_sc_render_handler_patch( ptr, total_size, nt, sec, nt_name );
+    /* madeira-bcd: [fex-vmeta], likewise (opt-in, ignore-volatile-metadata). */
+    ios_ignore_volatile_metadata( ptr, total_size, nt, (ULONG_PTR)image_info->base, nt_name );
 
     /* madeira-bcd [x64-image]: decided before any protection is set, so both
      * the section pass and the eager copy loop below see the mark (see
@@ -21508,6 +22863,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 #endif
 
 done:
+#ifdef WINE_IOS
+    ios_swap_image_armed = 0;   /* madeira-bcd swap-images: also on the failure paths out of the loop */
+#endif
     free( sections );
     return status;
 }
@@ -21895,6 +23253,9 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
 
 done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#ifdef WINE_IOS
+    ios_swap_image_flush( NT_SUCCESS(status) );   /* madeira-bcd swap-images: outside the lock (ml1081) */
+#endif
     if (needs_close) close( unix_fd );
     if (shared_needs_close) close( shared_fd );
     return status;
@@ -21985,11 +23346,15 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
              * view; it gets no pool copy (ios_map_resource_view). */
             ios_map_resource_view = !(access & SECTION_MAP_EXECUTE) &&
                                     !NtCurrentTeb()->Tib.ArbitraryUserPointer && ios_resource_map_nocopy();
+            /* the fixed-base window's guard (ios_exe_win_resource_request) */
+            ios_exe_win_resource_request = !(access & SECTION_MAP_EXECUTE) &&
+                                           !NtCurrentTeb()->Tib.ArbitraryUserPointer;
 #endif
             res = virtual_map_image( handle, addr_ptr, size_ptr, shared_file, limit_low, limit_high,
                                      alloc_type, machine, image_info, &nt_name, FALSE, offset.QuadPart );
 #ifdef WINE_IOS
             ios_map_resource_view = 0;
+            ios_exe_win_resource_request = 0;
 #endif
         }
         if (shared_file) NtClose( shared_file );
@@ -22290,6 +23655,118 @@ void virtual_init(void)
         e = getenv( "MADEIRA_WOW_LIMIT_BY_WINDOW" );
         if (e && e[0] == '0') ios_wow_limit_by_window = 0;
     }
+}
+
+
+/* madeira-bcd: 1 when the calling pseudo-process is a Chromium browser that
+ * judges memory pressure by GlobalMemoryStatusEx: SocialClubHelper.exe or
+ * steamwebhelper.exe (the last component of its PEB's image path, any case).
+ * Used by ios_avail_phys for avail-phys-cef-mb. */
+static int ios_avail_phys_chromium( void )
+{
+    static const char *const names[] = { "socialclubhelper.exe", "steamwebhelper.exe" };
+    PEB *peb = ios_jit_current_peb();
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    const WCHAR *path;
+    size_t len, base = 0, k, n;
+    unsigned i;
+
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        n = strlen( names[i] );
+        if (len - base != n) continue;
+        for (k = 0; k < n; k++)
+        {
+            WCHAR c = path[base + k];
+            if (c >= 'A' && c <= 'Z') c += 32;
+            if (c != (WCHAR)names[i][k]) break;
+        }
+        if (k == n) return 1;
+    }
+    return 0;
+}
+
+
+/***********************************************************************
+ *           ios_avail_phys
+ *
+ * madeira-bcd: madeira.cfg or the game's own file `avail-phys = 1`, opt-in
+ * (owner's Red Dead Redemption 2 run of 2026-10-09 11:02). Wine's
+ * get_performance_info (system.c) reports the whole phone's free + inactive
+ * pages as SystemPerformanceInformation.AvailablePages, which is
+ * GlobalMemoryStatusEx's ullAvailPhys, while this app dies at its own memory
+ * limit (the total virtual_get_system_info reports, ml992). Windows programs
+ * saw gigabytes available until iOS killed the app at 8184 MB, so Chromium's
+ * memory pressure evaluator (SocialClubHelper.exe, steamwebhelper.exe), which
+ * purges caches and collects garbage below 1000 MB (moderate) and 400 MB
+ * (critical) available, never fired. With the switch the value is lowered to
+ * what remains before the limit (os_proc_available_memory) when that is
+ * smaller. Called by the patched get_performance_info
+ * (tools/patch-wine-avail-phys.py); off, host_free comes back unchanged.
+ *
+ * madeira-bcd: avail-phys-cef-mb = N (madeira.cfg or the game's own file, MB,
+ * 0 = off, independent of avail-phys) caps what Chromium browsers see -- Social
+ * Club's SocialClubHelper.exe and Steam's steamwebhelper.exe, nothing else (see
+ * ios_avail_phys_chromium) -- at N MB. The 467 run (2026-10-09 13:09) reached
+ * Chromium's moderate level only at 7.3 GB, a minute into play, long after the
+ * helper had grown: at RDR2.exe's start its V8 cage held 167 MB dirty, its
+ * PartitionAlloc 88 MB, and its ANGLE device two 32 MB staging blocks. Below
+ * 400 MB (e.g. 300) Chromium's Windows evaluator reports CRITICAL pressure on
+ * every 5 s check from the helper's start (full V8 GC, PartitionAlloc and
+ * discardable purges, Skia/tile caches dropped); 400-999 MB (e.g. 900)
+ * reports MODERATE every 10 s. The game and the launcher keep the real figure.
+ */
+unsigned long long ios_avail_phys( unsigned long long host_free )
+{
+    extern size_t os_proc_available_memory( void );
+    static int on = -1, band = -1, said, capped;
+    static unsigned long long memsize, cef;
+    unsigned long long left, value = host_free;
+    int now;
+
+    if (on < 0)
+    {
+        size_t len = sizeof(memsize);
+        long long mb;
+        if (sysctlbyname( "hw.memsize", &memsize, &len, NULL, 0 )) memsize = 0;
+        on = madeira_cfg_bool( "avail-phys", 0 );   /* madeira.cfg avail-phys = 1 */
+        if (on) dprintf( 2, "[avail-phys] on: available physical memory is what remains before this "
+                         "app's memory limit (madeira.cfg avail-phys = 1)\n" );
+        /* MB of available memory SocialClubHelper.exe / steamwebhelper.exe see at most (0 = off; 300 = Chromium's critical level). */
+        mb = madeira_cfg_int( "avail-phys-cef-mb", 0 );
+        cef = mb > 0 && mb <= 65536 ? (unsigned long long)mb << 20 : 0;
+        if (cef) dprintf( 2, "[avail-phys] Chromium browsers (SocialClubHelper.exe, steamwebhelper.exe) see at most "
+                          "%llu MB available: %s (madeira.cfg avail-phys-cef-mb = %lld)\n", cef >> 20,
+                          mb < 400 ? "Chromium's critical level, purges every 5 s" :
+                          mb < 1000 ? "Chromium's moderate level, purges every 10 s" : "no pressure level", mb );
+    }
+    if (on && (left = (unsigned long long)os_proc_available_memory()) &&
+        !(memsize && left > memsize))   /* rdr61: a "no limit" sentinel larger than the machine is not a measurement */
+    {
+        now = left < (400ull << 20) ? 2 : left < (1000ull << 20) ? 1 : 0;
+        if (now != band && said < 64)
+        {
+            said++;
+            dprintf( 2, "[avail-phys] %llu MB left before the limit (host free %llu MB): %s\n",
+                     left >> 20, host_free >> 20,
+                     now == 2 ? "below 400 MB, Chromium's critical level" :
+                     now == 1 ? "below 1000 MB, Chromium's moderate level" : "1000 MB or more" );
+        }
+        band = now;
+        if (left < host_free) value = left;
+    }
+    /* madeira-bcd: avail-phys-cef-mb, the Chromium browsers only (see above) */
+    if (cef && value > cef && ios_avail_phys_chromium())
+    {
+        if (capped++ < 4)
+            dprintf( 2, "[avail-phys] a Chromium browser asked: %llu MB reported instead of %llu MB "
+                     "(madeira.cfg avail-phys-cef-mb)\n", cef >> 20, value >> 20 );
+        value = cef;
+    }
+    return value;
 }
 
 
@@ -23475,6 +24952,71 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
 }
 
 
+/* madeira-bcd: [stack-floor] programs whose threads keep a smaller stack.
+ *
+ * ml422/ml423 give every guest thread stack at least 8 MB because Chromium's
+ * renderer threads overflowed 4 MB under ARM64EC. All pseudo-processes share
+ * one address space, so the floor is paid in furniture VA by every thread of
+ * every program: RDR2.exe made 186 threads in build 460 (log 2026-10-08
+ * 23:59:11), each with at least 8 MB of the band whose exhaustion froze it,
+ * where a 1 MB request (the twelve logged ones) needs 1 MB on Windows.
+ * MADEIRA_SMALL_STACK_EXES lists exe names
+ * (comma or semicolon separated, case-insensitive, e.g. "RDR2.exe") whose
+ * threads get what they ask for with a 2 MB minimum — twice the Windows
+ * default, for the native frames ARM64EC adds — instead; every other program,
+ * Chromium included, keeps 8 MB. Empty by default. */
+#define IOS_SMALL_STACK_FLOOR (2 * 1024 * 1024)
+
+/* 1 when the last component of `path` (len WCHARs) is one of the names in
+ * `list`. */
+static int ios_exe_name_in_list( const WCHAR *path, size_t len, const char *list )
+{
+    size_t base = 0, k, n;
+
+    if (!path || !list) return 0;
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    while (*list)
+    {
+        const char *name = list, *e;
+
+        while (*name == ' ') name++;
+        e = name;
+        while (*e && *e != ',' && *e != ';') e++;
+        n = e - name;
+        while (n && name[n - 1] == ' ') n--;
+        if (n && n == len - base)
+        {
+            for (k = 0; k < n; k++)
+            {
+                WCHAR c = path[base + k];
+                char w = name[k];
+
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (w >= 'A' && w <= 'Z') w += 32;
+                if (c != (WCHAR)(unsigned char)w) break;
+            }
+            if (k == n) return 1;
+        }
+        list = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+/* The floor for a new guest thread stack of the calling pseudo-process. */
+static SIZE_T ios_thread_stack_floor(void)
+{
+    const char *list = getenv( "MADEIRA_SMALL_STACK_EXES" );
+    PEB *peb;
+    RTL_USER_PROCESS_PARAMETERS *pp;
+
+    if (!list || !*list) return 8 * 1024 * 1024;
+    peb = ios_jit_current_peb();
+    pp = peb ? peb->ProcessParameters : NULL;
+    if (pp && ios_exe_name_in_list( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR), list ))
+        return IOS_SMALL_STACK_FLOOR;
+    return 8 * 1024 * 1024;
+}
+
 /***********************************************************************
  *           virtual_alloc_thread_stack
  */
@@ -23512,11 +25054,26 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
      * fingerprint names the recursion cycle — chase that, not more size. */
     if (guard_page && size < 8 * 1024 * 1024)
     {
-        static int floored;
-        if (floored < 12 && ++floored <= 12)
-            dprintf( 2, "[stack-floor] rev=ml424 #%d thread stack reserve 0x%lx -> 0x800000\n",
-                     floored, (unsigned long)size );
-        size = 8 * 1024 * 1024;
+        /* madeira-bcd: MADEIRA_SMALL_STACK_EXES — see ios_thread_stack_floor */
+        SIZE_T min_size = ios_thread_stack_floor();
+
+        if (min_size < 8 * 1024 * 1024)
+        {
+            static int kept;
+            if (kept < 12 && ++kept <= 12)
+                dprintf( 2, "[stack-floor] madeira-bcd #%d thread stack reserve 0x%lx -> 0x%lx "
+                            "(the program is in MADEIRA_SMALL_STACK_EXES)\n",
+                         kept, (unsigned long)size, (unsigned long)max( size, min_size ) );
+            size = max( size, min_size );
+        }
+        else
+        {
+            static int floored;
+            if (floored < 12 && ++floored <= 12)
+                dprintf( 2, "[stack-floor] rev=ml424 #%d thread stack reserve 0x%lx -> 0x800000\n",
+                         floored, (unsigned long)size );
+            size = 8 * 1024 * 1024;
+        }
     }
 #endif
     size = ROUND_SIZE( 0, size, granularity_mask );
@@ -24848,6 +26405,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             if (status == STATUS_SUCCESS)
             {
                 base = view->base;
+                ios_place_note_new( base, ROUND_SIZE( 0, view->size, host_page_mask ) );   /* see ios_place_fresh */
                 if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
                 ios_swap_init();
                 /* ml1077 commit-time backing (classic runs it unchanged); wide also backs a
@@ -25784,6 +27342,7 @@ static NTSTATUS ios_cage_grant( ULONG type, ULONG protect, SIZE_T asked, void **
     NTSTATUS st;
 
     munmap( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE );
+    ios_va_release_note();
     ios_cage_holdback_live = 0;
     *pick = (void *)(uintptr_t)IOS_CAGE_BASE;
     st = allocate_virtual_memory( pick, &csz, type, protect, 0, 0, 0, 0 );
@@ -25859,7 +27418,7 @@ static int ios_sc2_commit_class( uint64_t a, uint64_t size, const struct ios_sc2
     }
     /* in no grant's real view: the furniture window and the FEX arena have
      * their own users; elsewhere, the reported-but-unreserved part of a grant */
-    if ((a >= IOS_SC2_FLOOR && a < IOS_SC2_J2_BASE) || a >= IOS_SC_ARENA_BASE) return IOS_SC2_C_OK;
+    if ((a >= ios_sc2_floor && a < IOS_SC2_J2_BASE) || a >= ios_sc2_arena_lo) return IOS_SC2_C_OK;
     for (i = 0; i < n; i++)
         if (g[i].view == g[i].report && a >= g[i].view + g[i].real && a < g[i].report + g[i].asked
             && (best < 0 || g[i].report > g[best].report)) best = i;
@@ -25875,6 +27434,34 @@ static const char *ios_sc_kind_what( int kind )
     return kind == IOS_SC_K_CAGE ? "the V8 cage" : kind == IOS_SC_K_V1 ? "the layout 1 pools" : "a large reservation";
 }
 
+/* Layout 2: how far into each of its large grants a helper has committed, in
+ * 256 MB steps (madeira-bcd). SocialClubHelper.exe died of Chromium's
+ * out-of-memory exit after 24 minutes of GTA V Enhanced (log 2026-10-08
+ * 13:39:08, build 451, 14:01:51); at 13:56 one of its commits had landed past
+ * chrome_elf.dll's real 4 GB pool. These lines tell a pool that grows all
+ * session long from one that jumps at the end. The metadata regions follow
+ * their pools and are left out. Counted per helper; at most 64 lines. */
+static void ios_sc2_note_growth( uint64_t a, uint64_t size, const struct ios_sc2_gv *gv, void *peb )
+{
+    static uint64_t high[IOS_SC_K_OTHER + 1];
+    static void *high_peb[IOS_SC_K_OTHER + 1];
+    static unsigned lines;
+    uint64_t end = a + size - gv->view;
+    int k = gv->kind;
+
+    if (k < 0 || k > IOS_SC_K_OTHER || k == IOS_SC2_J2 || k == IOS_SC2_J2L) return;
+    if (high_peb[k] != peb) { high_peb[k] = peb; high[k] = 0; }
+    if (end <= high[k]) return;
+    if ((end >> 28) > (high[k] >> 28) && lines < 64)
+    {
+        lines++;
+        dprintf( 2, "[sc-cef] layout 2: SocialClubHelper.exe has committed %s up to +%llu MB (%llu MB real of "
+                    "%llu MB reported)\n", ios_sc_kind_what( k ), (unsigned long long)(end >> 20),
+                 (unsigned long long)(gv->real >> 20), (unsigned long long)(gv->asked >> 20) );
+    }
+    high[k] = end;
+}
+
 /* Layout 2: warn once per kind of trouble and grant when a helper's commit
  * shows a PartitionAlloc block running out of its real 4 GB, a BRP super page,
  * or a commit in the given-but-unreserved part of a grant. */
@@ -25883,7 +27470,7 @@ static void ios_sc2_note_commit( void *addr, SIZE_T size )
     static unsigned char warned[IOS_SC2_C_N][IOS_SC_K_OTHER + 1];
     struct ios_sc2_gv g[IOS_SC_GRANT_MAX];
     uint64_t a = (uint64_t)(ULONG_PTR)addr, off = 0;
-    int i, n = 0, gi = 0, c, owner;
+    int i, n = 0, gi = -1, c, owner;
     void *peb;
 
     if (a < IOS_SC2_L_BASE || !ios_sc_grant_n || !ios_sc_current_is_helper()) return;
@@ -25901,6 +27488,8 @@ static void ios_sc2_note_commit( void *addr, SIZE_T size )
     }
     pthread_mutex_unlock( &ios_sc_grant_lock );
     c = ios_sc2_commit_class( a, size, g, n, &gi, &off );
+    if (gi >= 0 && (c != IOS_SC2_C_OK || a - g[gi].view < g[gi].real))   /* a commit in this grant */
+        ios_sc2_note_growth( a, size, &g[gi], peb );
     if (c == IOS_SC2_C_OK || g[gi].kind < 0 || g[gi].kind > IOS_SC_K_OTHER || warned[c][g[gi].kind]) return;
     warned[c][g[gi].kind] = 1;
     owner = g[gi].kind == IOS_SC2_J2 ? IOS_SC2_E : g[gi].kind == IOS_SC2_J2L ? IOS_SC2_L : g[gi].kind;
@@ -26417,6 +28006,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         }
                     }
                 }
+                ios_band_census( "jumbo reserve failed" );   /* env.MADEIRA_BAND_CENSUS = 1 only */
                 if (probed++ < 2)
                 {
                     ios_va_gap_probe( "jumbo reserve failed" );
@@ -27705,9 +29295,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             enum { TAIL_SMALL = 0x1000000 };
             size_t head_now = jit_pool_offset, tail_now = ios_jit_tail_reserved;
             /* Neither the native hole nor either placement of the image slot
-             * is available to the tail. Default headroom remains 48MB. */
+             * is available to the tail. Default headroom remains 48MB. Pool-mid's
+             * second hole is not room either: counted with the headroom. */
             size_t cap = ios_pool_code_cap( ios_jit_pool_size_global, head_now, tail_now,
-                                            ios_jit_hole_off_eff, ios_jit_hole_end_eff, ios_pool_head_reserve );
+                                            ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                            ios_pool_head_reserve +
+                                            ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,
+                                                                   ios_jit_hole2_off, ios_jit_hole2_end ) );
             /* A retired generation of this size already sitting on the carve
              * free-list costs the pool nothing new: never refuse that. */
             if (alloc_size > cap)
@@ -27842,22 +29436,32 @@ retry_code_carve_reuse:
          * ios_jit_tail_reserved is the shared file-scope counter so the
          * head allocators can refuse to grow into tail-carved buffers. */
         size_t reserve_offset, tail_added, tail_skipped = 0;
+        size_t skip_off[3], skip_size[3];
+        int skip_n = 0;
         if (ios_jit_hole_end > ios_jit_hole_off)
         {
-            /* madeira-bcd split pool: a carve that would overlap the hole goes
+            /* madeira-bcd split pool: a carve that would overlap a hole goes
              * directly below it; the span it skips above the hole becomes a free
-             * carve once this one is granted. */
+             * carve once this one is granted (pool-mid: up to two such spans,
+             * the hole 2 one and the one between the holes). */
             size_t cur, start;
             do
             {
                 cur = ios_jit_tail_reserved;
-            start = ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,
-                                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+            start = ios_pool_holes_tail_start( ios_jit_pool_size_global, cur, alloc_size,
+                                                   ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                   ios_jit_hole2_off, ios_jit_hole2_end );
             } while (!__sync_bool_compare_and_swap( &ios_jit_tail_reserved, cur, start + alloc_size ));
             reserve_offset = start;
             tail_added = start + alloc_size - cur;
-            if (start != cur && ios_jit_pool_size_global - cur > ios_jit_hole_end_eff)
-                tail_skipped = ios_jit_pool_size_global - cur - ios_jit_hole_end_eff;
+            if (start != cur && start <= ios_jit_pool_size_global && cur <= start)
+            {
+                int k;
+                skip_n = ios_pool_skip_pieces( ios_jit_pool_size_global - start, ios_jit_pool_size_global - cur,
+                                               ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                               ios_jit_hole2_off, ios_jit_hole2_end, skip_off, skip_size );
+                for (k = 0; k < skip_n; k++) tail_skipped += skip_size[k];
+            }
         }
         else
         {
@@ -27995,15 +29599,20 @@ retry_code_carve_reuse:
                 ios_tail_carves[ios_tail_carve_n].freed_at = 0;
                 ios_tail_carve_n++;
             }
-            /* madeira-bcd split pool: this carve went below the hole; the span it
-             * skipped above the hole is a never-used carve a smaller ask can take. */
-            if (tail_skipped >= 0x100000 && ios_tail_carve_n < IOS_TAIL_CARVE_MAX)
+            /* madeira-bcd split pool: this carve went below a hole; the span it
+             * skipped above the hole is a never-used carve a smaller ask can take
+             * (pool-mid: one per hole it jumped). */
             {
-                ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;
-                ios_tail_carves[ios_tail_carve_n].size = tail_skipped & ~(size_t)0x3fff;
-                ios_tail_carves[ios_tail_carve_n].free = 1;
-                ios_tail_carves[ios_tail_carve_n].freed_at = 0;   /* never executed, outside region C */
-                ios_tail_carve_n++;
+                int k;
+                for (k = 0; k < skip_n; k++)
+                {
+                    if (skip_size[k] < 0x100000 || ios_tail_carve_n >= IOS_TAIL_CARVE_MAX) continue;
+                    ios_tail_carves[ios_tail_carve_n].off = skip_off[k];
+                    ios_tail_carves[ios_tail_carve_n].size = skip_size[k];
+                    ios_tail_carves[ios_tail_carve_n].free = 1;
+                    ios_tail_carves[ios_tail_carve_n].freed_at = 0;   /* never executed, outside region C */
+                    ios_tail_carve_n++;
+                }
             }
             pthread_mutex_unlock( &ios_tail_carve_lock );
             if (tail_added != alloc_size)
@@ -28220,7 +29829,7 @@ retry_code_carve_reuse:
             int sc2 = is_jumbo && ios_sc_layout_mode == 2 && ios_sc_cef_enabled() && ios_sc_current_is_helper();
             int caged = 0;
 
-            if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < IOS_SC_ARENA_BASE)
+            if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < ios_sc2_arena_lo)
                 ios_sc2_note_commit( *ret, *size_ptr );
             if (sc2 && ios_sc_grant_dead_n) ios_sc_reap_dead();
             if (sc2 && ios_sc2_ex_cage( *size_ptr, type, protect, limit_low, limit_high, align, attributes,

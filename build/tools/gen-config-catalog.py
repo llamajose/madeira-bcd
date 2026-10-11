@@ -50,6 +50,14 @@ OVERLAY = {
                         "data live; does not recycle executable ranges or change GPU capabilities. Restart the "
                         "session after changing it.",
                 "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"]},
+    "env.MADEIRA_PRELOAD_DLLS": {"category": "Memory & JIT pool", "title": "Load these DLLs with the D3D12 device",
+                "kind": "text", "default": "",
+                "note": "Default empty. DLL names separated by ';' (e.g. xinput1_4.dll): each program loads and pins "
+                        "them at its first D3D12 device or probe call, while the JIT pool still has room for their "
+                        "copies. RDR2 loads xinput1_4.dll only at its first controller read, and on build 476 the "
+                        "pool was full by then: no controller and no on-screen controls. Restart the session after "
+                        "changing it.",
+                "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"]},
     "env.MADEIRA_POOL_RECYCLE_IMAGES": {"category": "Memory & JIT pool", "title": "Images in retired code-buffer space",
                 "kind": "bool", "default": "0",
                 "note": "Default off. If other image allocations fail, retired region-C code buffers up to 64 MB "
@@ -62,6 +70,261 @@ OVERLAY = {
                         "image, as 32-bit programs already do, and its executable protections are applied without "
                         "EXEC. Frees the pool for hybrid DLL copies and code buffers. Hybrid images keep their "
                         "copy. Set it in the game's own file; restart the session after changing it."},
+    "env.MADEIRA_FIXED_BASE_GUARD": {"category": "Memory & JIT pool", "title": "Keep 0x140000000 for a fixed-base game",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a resource-only image view (a version or resource query, e.g. the Rockstar "
+                        "Games Launcher reading Social-Club-Setup.exe) never takes the reserved executable window at "
+                        "0x140000000; it is mapped elsewhere. The window then stays free for a game exe without "
+                        "relocations that can only run there (Red Dead Redemption 2). It moves other programs' "
+                        "images (licensed GTA V Enhanced), so set it only in such a game's own file; read at "
+                        "session start."},
+    "env.MADEIRA_RDR2_VA_HOLD": {"category": "Memory & JIT pool", "title": "Keep 8960 MB free for Red Dead Redemption 2",
+                "kind": "bool", "default": "0",
+                "note": "Default off; only with env.MADEIRA_SC_PA_POOLS = 2. 1: Social Club's layout 2 keeps libcef.dll's "
+                        "PartitionAlloc pools at 256 MB and its metadata at 1 GB, chrome_elf.dll's metadata at 6.25 GB, "
+                        "gives the rest of the app's 4 GB hold to Wine's furniture (3.75 GB more room for threads and "
+                        "allocations), keeps Oilpan's cage at 1 GB so the FEX arena grows to 15 GB, and holds "
+                        "[0x75d0000000, 0x7800000000) from boot for one 8960 MB reserve, the one "
+                        "Red Dead Redemption 2 makes as it starts. Set it only in that game's own file; GTA V keeps "
+                        "layout 2 as it is. Read at session start."},
+    "env.MADEIRA_SWAP_RESERVE_MAX_MB": {"category": "Memory & JIT pool", "title": "Swap tier: largest reservation backed (MB)",
+                "kind": "int", "default": "", "sources": ["build/ntdll-unix/virtual_ios.c"],
+                "note": "The largest new reservation the swap tier backs whole: 256 MB in wide (at most 4 GB), 8 GB in "
+                        "broad (at most 16 GB). 9216 with broad coverage (swap-mode = 2) also backs Red Dead "
+                        "Redemption 2's 8960 MB heap with the file. Read at session start."},
+    "env.MADEIRA_THREAD_STACK_SPILL": {"category": "Memory & JIT pool", "title": "New threads may use the kernel's pick when memory space is full",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a new thread's 1 MB kernel stack (and its emulator stack) is looked for from "
+                        "the start of Wine's furniture band instead of from 4 GB (each new thread no longer tries "
+                        "about 300 refused addresses first), and when that band is full the kernel places it "
+                        "anywhere still free instead of the thread failing. Red Dead Redemption 2 froze four minutes "
+                        "into the story because every new thread failed this way while 1.8 GB was free elsewhere. "
+                        "Read at session start."},
+    "env.MADEIRA_SMALL_STACK_EXES": {"category": "Memory & JIT pool", "title": "Programs whose threads keep a 2 MB stack",
+                "kind": "text", "default": "",
+                "note": "Empty by default: every thread stack is at least 8 MB (Chromium needs that). Exe names, "
+                        "separated by commas (e.g. RDR2.exe): threads of these programs get the stack they ask for, "
+                        "at least 2 MB, so their stacks take less of the shared memory space. Never list Chromium "
+                        "programs (SocialClubHelper.exe, Launcher.exe, steamwebhelper.exe). Read when a thread starts."},
+    "replay-split": {"category": "Direct3D 12", "title": "Log where Direct3D 12 submission time goes",
+                "kind": "bool", "default": "0",
+                "note": "Default off, logging only. 1: every 5 seconds a [perf] replay split line divides the time "
+                        "ExecuteCommandLists takes per frame into waiting for the queue, preparation, opening a "
+                        "command buffer, each kind of command (draws, dispatches, copies, clears, barriers, render "
+                        "targets, queries, state) and the end of each list. For finding why a game's frame is slow "
+                        "when the GPU is not busy."},
+    "env.MADEIRA_MFC": {"category": "Wine libraries", "title": "Microsoft MFC (mfc140.dll, mfc140u.dll)",
+                "kind": "bool", "default": "1",
+                "note": "On by default. MFC comes from the same Microsoft VC++ package as the C++ runtime and is "
+                        "linked into the game's system32; games that import it (Horizon Zero Dawn) stop at once "
+                        "without it. Wine has no MFC of its own. 0 leaves it out. Read at session start."},
+    "fullscreen-window": {"category": "Direct3D 12", "title": "Full screen moves the game's window over the whole screen",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: when a Direct3D 12 game switches to full screen, its window is moved to the "
+                        "screen's top-left corner and over the whole screen first, as Windows does; the game then "
+                        "sizes it to the chosen mode. Without it a game that only resizes its window (Red Dead "
+                        "Redemption 2) keeps it where it was, beside the Wine desktop. Read once per session."},
+    "indirect-fast": {"category": "Direct3D 12", "title": "Encode ExecuteIndirect records without per-record setup",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: after the first record of an ExecuteIndirect, the other records (which share "
+                        "all state but their offset) are encoded 64 at a time with only their offset and the "
+                        "indirect draw or dispatch, instead of the whole per-draw setup each. For games that issue "
+                        "thousands of indirect records a frame (Red Dead Redemption 2), where that setup costs more "
+                        "CPU time than the GPU spends. DXIL and DXBC pipelines (DXBC from build 470); pipelines "
+                        "with tessellation or geometry stages, diagnostics and captures keep the per-record path. "
+                        "Read once per session."},
+    "dxbc-register-spaces": {"category": "Direct3D 12", "title": "Shader model 5.1 resources in register spaces other than 0",
+                "kind": "bool", "default": "0",
+                "note": "Default off: a DXBC shader (shader model 5.1) that declares a resource in a register space "
+                        "other than 0 is refused, and its pipeline is not created. 1: such shaders are converted, and "
+                        "each resource is bound from the root-signature entry with the same space and register. "
+                        "Horizon Zero Dawn needs it (its constant buffers sit in spaces 6 and 8). Shaders converted "
+                        "with it on are cached apart from the others. Read once per session.",
+                "sources": ["madeira-d3d12/src/unix/madeira_ir_unix.mm", "madeira-d3d12/src/pe/madeira_d3d12.c"]},
+    "env.MADEIRA_GAME_DIALOG_CURSOR": {"category": "Windows, display & input", "title": "Cursor over a game's launcher or message box",
+                "kind": "bool", "default": "1",
+                "note": "Default on. A game session draws no cursor: the finger is the pointer. While the game shows a "
+                        "launcher or message box, the arrow is drawn where the finger last touched (where the click "
+                        "lands) and goes away with the box. Tap the button itself to press it. 0: no cursor, as "
+                        "before. Desktop (Dock) sessions keep their own cursor."},
+    # madeira-bcd: Horizon Zero Dawn on build 471 got no input at all.
+    "env.MADEIRA_INPUT_FOREGROUND": {"category": "Windows, display & input",
+                "title": "Bring the game to the front when no window is",
+                "kind": "bool", "default": "0",
+                "note": "Default off. iOS has no window manager: a game that shows its window without activating "
+                        "it and reads no XInput stays in the background, and Windows sends raw keyboard and mouse "
+                        "input only to the program in front (Horizon Zero Dawn ignored every key and tap). 1: while "
+                        "no window at all is in front, the game's main window is brought to the front when it polls "
+                        "its messages or a key or tap arrives. Never while another window is in front."},
+    "env.MADEIRA_WGI_HOST_PADS": {"category": "Controllers", "title": "Controllers in Windows.Gaming.Input",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: each connected XInput controller (a paired pad or the touch controller) "
+                        "is also a Windows.Gaming.Input gamepad, an Xbox pad to the game, with rumble. For games "
+                        "that read their controller only that way (Horizon Zero Dawn); a game that also reads "
+                        "XInput could list it twice. Read when the game first asks for a gamepad.",
+                "sources": ["tools/patch-wine-wgi-host-pads.py"]},
+    # madeira-bcd: Red Dead Redemption 2 on build 470, 1.5 GB of argument-ring chunks.
+    "ind-probe": {"category": "Direct3D 12", "title": "ExecuteIndirect probe (diagnostic)",
+                "kind": "bool", "default": "1",
+                "note": "Default on. Every 3 s per pipeline, the first argument record of an ExecuteIndirect is read "
+                        "back by a small compute pass and logged as a [probe] line, 1500 lines at most. Each probe "
+                        "ends the open render pass. 0: no probes (Red Dead Redemption 2's list, build 476)."},
+    # madeira-bcd: Horizon Zero Dawn's refused shaders (build 475, 2026-10-09 16:20).
+    "msc-unbounded-retry": {"category": "Direct3D 12", "title": "Retry refused shaders with sized unbounded ranges",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a DXIL shader the converter refuses with code 4 (a resource not in the root "
+                        "signature) is converted once more with the root signature's unbounded descriptor ranges "
+                        "given a size (2048 samplers, 1000000 others). Horizon Zero Dawn's ranges start at register 4 "
+                        "and ~4,900 of its shaders were refused. Once that works for a root signature, its later "
+                        "shaders take the sized ranges first."},
+    "pso-placeholder": {"category": "Direct3D 12", "title": "Placeholder for pipelines whose shaders did not convert",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a graphics pipeline whose vertex or pixel shader did not convert is returned "
+                        "to the game as a placeholder whose draws are skipped, instead of a failure. Horizon Zero "
+                        "Dawn stopped with an \"Error\" box when its settings menu got such a failure."},
+    # madeira-bcd: Horizon Zero Dawn's 23,045 libraries (build 480, 2026-10-09 20:28).
+    "pso-lazy-libs": {"category": "Direct3D 12", "title": "Shader libraries only for pipelines in use",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a pipeline built at its first draw (or dispatch) lets its converted Metal "
+                        "libraries go once the game has created it, and reads them back from the shader cache at "
+                        "that first draw. Horizon Zero Dawn creates ~52,000 pipelines in its menu and draws a few "
+                        "thousand; their libraries held hundreds of MB until iOS closed the game. Needs the shader "
+                        "cache (on by default); with pso-warm, a library stays until its warm-up compile is done."},
+    # madeira-bcd: Horizon Zero Dawn's corrupted first gameplay frames (build 480, 2026-10-09 20:37).
+    "clear-rects": {"category": "Direct3D 12", "title": "Clear only the rectangles a game asks for",
+                "kind": "bool", "default": "0",
+                "note": "Default off: a render-target or depth-stencil clear with rectangles clears the whole view, as "
+                        "before. 1: only the rectangles are cleared, in a small pass of their own (as DXMT's D3D11 "
+                        "ClearView does); a rectangle that covers the view still clears it the fast way. Horizon Zero "
+                        "Dawn passes rectangles from its first gameplay frames."},
+    "skin-check": {"category": "Direct3D 12", "title": "Diagnostic: check meshes skinned on the GPU",
+                "kind": "int", "default": "0",
+                "note": "Default 0 (off). N: windows of N frames (1 = 8) log every draw that reads a vertex buffer a "
+                        "compute shader wrote, the dispatches that wrote it with every binding, a summary of up to "
+                        "32 KB of each such stream copied just before the draw, and the shaders' bytecode. For "
+                        "characters drawn with missing faces or spikes (Horizon Zero Dawn); costs time in those frames."},
+    "skin-check-every": {"category": "Direct3D 12", "title": "Diagnostic: presents between skin-check windows",
+                "kind": "int", "default": "300",
+                "note": "With skin-check on: a window starts this many presents after the previous one began "
+                        "(at least 30); the first starts 60 presents after the first such draw."},
+    "skin-check-capture": {"category": "Direct3D 12", "title": "Diagnostic: skin-check copies the streams",
+                "kind": "bool", "default": "1",
+                "note": "On by default with skin-check. 0: log only, with no GPU copies, which add a copy between "
+                        "the skinning dispatches and the draw (to compare what the frames look like)."},
+    "view-census": {"category": "Direct3D 12", "title": "Diagnostic: report buffer views that fall back",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: typed buffer views that cannot become a Metal texture buffer (the shader then "
+                        "sees no data), views cut short at the end of their resource, and views or constant buffer "
+                        "views past their resource are counted and named in the log, with Metal's minimum alignment "
+                        "for each pixel format typed views use. Changes nothing else."},
+    "skin-check-trace": {"category": "Direct3D 12", "title": "Diagnostic: skin-check traces whole frames",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1, with skin-check on: the first frame of the first two windows logs every draw "
+                        "in one line (shaders, counts, streams, input layout); a pipeline with integer vertex inputs "
+                        "(a mesh skinned in its vertex shader) also gets its vertex-stage bindings, copies of its "
+                        "CPU-written inputs and first vertices, and its vertex shader's bytecode (32 such draws)."},
+    "skin-dump": {"category": "Direct3D 12", "title": "Diagnostic: skin-check dumps the skinning data",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1, with skin-check on: in the first window's first two frames the compute "
+                        "shaders that skin a mesh have their inputs and the stream they wrote copied whole (up to 256 KB "
+                        "each) and logged as base64 (4 MB at most), so the skinning can be recomputed on a PC. Uses a "
+                        "24 MB capture buffer."},
+    "typed-view-align": {"category": "Direct3D 12", "title": "Typed buffer view alignment",
+                "kind": "int", "default": "0",
+                "note": "Default 0 (64 bytes, as before). 16 or 256: a typed buffer view's texture starts at that "
+                        "boundary, never below Metal's minimum for its format (logged once per format); 16 is what "
+                        "Apple's converter documents, so a float4 view has no padding elements. 4: every view's texture "
+                        "starts exactly at its first element, for the element sizes a GPU probe at the first view shows "
+                        "read right (logged); the others start at 16. A view Metal refuses there is made at 16, then 64. "
+                        "Read once per game start."},
+    "typed-view-shadow": {"category": "Direct3D 12", "title": "Aligned copies of offset typed views",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a typed shader-resource view of UPLOAD memory whose first element is not on a "
+                        "16-byte boundary reads a 16-byte-aligned copy of its bytes, made when the view is made and "
+                        "refreshed at every ExecuteCommandLists (the GPU rounds a texture buffer's start down to 16 bytes "
+                        "and the shader converter ignores the element offset). view-census counts them. Read once per "
+                        "game start."},
+    "vis-trace": {"category": "Direct3D 12", "title": "Diagnostic: per-frame draws and culling readback",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: one log line per present (the HUD's frame number): draws, depth-only and "
+                        "3+-target draws, indices, dispatches, depth-pyramid readback copies, new offset typed views, and "
+                        "Queue::Wait calls (how many passed before the awaited batch was committed); and every value of the "
+                        "22x10, 11x5 and 5x2 mips of the pyramid a game culls with, as the GPU wrote them. The GPU also "
+                        "copies each of those mips into Madeira's own memory, and a mip whose readback memory holds "
+                        "something else is flagged (an earlier frame's values: STALE). Read once per game start."},
+    "readback-far": {"category": "Direct3D 12", "title": "Experiment: empty culling readback",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a readback of a depth pyramid (an R32_FLOAT mip of 1 or more of a texture with 4+ "
+                        "mips, up to 64x64) is not copied; the CPU fills it with 4096, so a game that culls on the CPU "
+                        "against it culls nothing (everything is drawn: slower). A test, not a fix. Read once per game "
+                        "start."},
+    "static-cbv": {"category": "Direct3D 12", "title": "Constant buffers as the draw was recorded",
+                "kind": "int", "default": "0",
+                "note": "Default off: the GPU reads every descriptor of a table when it runs. 1: a descriptor table's "
+                        "single constant-buffer ranges are read when each draw or dispatch is recorded, as NVIDIA's "
+                        "driver and vkd3d-proton do; a game that rewrites one after recording the draw no longer makes "
+                        "that draw use another object's constants. Ranges marked VOLATILE stay as before. 2: VOLATILE "
+                        "ones too (vkd3d-proton's force_static_cbv). 3: only count the rewrites ([static-cbv] lines). "
+                        "Read once per game start."},
+    "readback-swap": {"category": "Direct3D 12", "title": "D3D12 readback buffers on file-backed memory",
+                "kind": "bool", "default": "1",
+                "note": "Default on: like upload buffers (upload-swap), READBACK buffers of 8 MB or more live on "
+                        "file-backed storage, off the memory footprint. 0: READBACK buffers get Metal's own memory "
+                        "(Horizon Zero Dawn: two 32 MB buffers), so what the GPU writes into them reaches the CPU "
+                        "without the file tier between; upload buffers stay where upload-swap puts them. Read once per "
+                        "game start."},
+    # madeira-bcd: A/B switches for the Sony ports' corrupted meshes (Horizon Zero Dawn, Ghost of Tsushima).
+    "d3d12-wave-ops": {"category": "Direct3D 12", "title": "Report wave operations",
+                "kind": "bool", "default": "1",
+                "note": "On by default. 0: OPTIONS1 reports WaveOps FALSE, so a game with a fallback picks shaders "
+                        "without wave intrinsics (an A/B for the shader converter's wave code; Horizon Zero Dawn reads "
+                        "it). Read once per game start."},
+    "d3d12-binding-tier": {"category": "Direct3D 12", "title": "Reported resource binding tier",
+                "kind": "int", "default": "2",
+                "note": "Default 2. 3: OPTIONS reports resource binding tier 3, as Apple's D3DMetal and vkd3d-proton do; "
+                        "a game can take another binding path for it. Anything else keeps tier 2. Read once per game "
+                        "start."},
+    "d3d12-raw-typed-views": {"category": "Direct3D 12", "title": "Raw buffer views readable as typed",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: raw and structured buffer views also carry a texture-buffer view (R32, or "
+                        "RG32/RGBA32 for a structured SRV whose stride allows it), as native drivers and vkd3d-proton "
+                        "do, so a shader that reads one as Buffer<T> gets the data instead of zeros (vertices at the "
+                        "origin). Costs one Metal texture object per such view."},
+    "ignore-volatile-metadata": {"category": "Memory & JIT pool", "title": "FEX: x86 ordering for the whole game",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: an x64 image's PE volatile metadata (MSVC /volatileMetadata) is cleared when "
+                        "it is mapped, so FEX orders every instruction of it by its TSO settings instead of only the "
+                        "ones the metadata lists (Ghost of Tsushima's exe carries it; Horizon Zero Dawn's concrt140.dll "
+                        "too). Slower; for testing memory-ordering bugs. Each cleared image is logged as [fex-vmeta]. "
+                        "Read at session start."},
+    "msc-fail-memo": {"category": "Direct3D 12", "title": "Remember refused shaders for the session",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a shader the converter refused is not converted again for the next pipeline "
+                        "that uses it (same bytecode, root signature and options) until the game exits. Horizon Zero "
+                        "Dawn converted each refused shader ~6 times, ~30,000 conversions in its first minutes."},
+    "ring-share": {"category": "Direct3D 12", "title": "Share argument buffers between command lists",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a command list gives the argument-buffer chunks its replay wrote back as "
+                        "soon as the GPU is done with them, instead of keeping them until it is recorded again; "
+                        "all lists then share one pool. Red Dead Redemption 2 kept 1.5 GB of them (half of its "
+                        "Metal memory) with the switch off."},
+    # madeira-bcd: tools/patch-winemetal-null-fragment.py (winemetal reads it).
+    "gs-null-fragment": {"category": "Direct3D 12", "title": "Empty fragment function for pipelines without a pixel shader",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-winemetal-null-fragment.py"],
+                "note": "Default on. Metal aborts on a mesh pipeline (geometry shader or tessellation emulation) "
+                        "with rasterization on and no fragment function, while D3D allows a pipeline with no pixel "
+                        "shader. On: such a pipeline gets an empty fragment function and writes no render target, "
+                        "as in D3D; depth and stencil work as before. Horizon Zero Dawn's pipeline thread died "
+                        "without it and the game stopped after its first frame. 0: such a pipeline is refused "
+                        "instead (the geometry shader is dropped). Pipelines with a pixel shader are not touched. "
+                        "Read once per session."},
+    "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "
+                        "each piece of [0x7000000000, 0x8000000000) uses (Social Club's pools and metadata, the "
+                        "furniture, the V8 and Oilpan cages, the FEX arena), the largest free gap, and whether Red "
+                        "Dead Redemption 2's 8960 MB reserve fits; 64 censuses at most. Logging only, changes no "
+                        "placement; read at session start."},
     "env.MADEIRA_EC_HOOK_TRACE": {"category": "Debugging / logs", "title": "Log code patches the emulated copy misses",
                 "kind": "bool", "default": "1",
                 "note": "Default on, logging only. Compare executable PE sections and their pool copies before "
@@ -125,6 +388,15 @@ OVERLAY = {
     "async-submit": {"title": "D3D12 asynchronous submission"},
     "upload-swap": {"title": "D3D12 upload buffers on file-backed memory"},
     "d3d12-typed-uav-load": {"title": "D3D12 typed UAV loads (report support)"},
+    # madeira-bcd: the packed shader cache (madeira-d3d12/src/unix/madeira_sc_pack.c).
+    "d3d12-shader-pack": {"category": "Direct3D 12", "title": "D3D12 shader cache in two pack files",
+                "kind": "bool", "default": "0",
+                "note": "Off by default: one file per converted shader in Documents/shadercache, as before. 1: the "
+                        "converter keeps its DXBC and DXIL cache entries in two append-only files "
+                        "(shadercache/pack/dxbc.mdpk, dxil.mdpk); loose entries of earlier runs move in as games use "
+                        "them. Off again, the packs are not read: what moved into them converts again. Bounds: DXIL as "
+                        "env.MADEIRA_D3D12_DXIL_CACHE_MB (512 MB), DXBC 2 GB; a full pack starts over. Read once per "
+                        "app start; the game's own file wins."},
     # Read by DXMT's DXGI and by win32u's display adapter (sysparams_ios.c); a
     # library entry's "Report an NVIDIA GPU" sets it.
     "env.DXMT_ENABLE_NVEXT": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Report an NVIDIA GPU (all games)",
@@ -186,16 +458,26 @@ OVERLAY = {
                         "(where the pool cannot split), the pool takes two runs above the window instead if together "
                         "they are larger (GTA V: 368 + 320 MB instead of 464 MB). Falls back to the single run if the "
                         "placement misses. On by default; 0 turns it off. Read at launch, the game's own file wins."},
+    "pool-mid": {"category": "Memory & JIT pool", "title": "Split JIT pool: use the free run between the regions",
+                "kind": "bool", "default": "0",
+                "note": "With pool-split on: when another mapping sits between the pool's two regions and leaves a "
+                        "free run of 64 MB or more there, that run becomes a third debugger region in the same pool "
+                        "(RDR2 build 470: 604 MB pool, a 71 MB mapping and 213 MB free between the regions; the "
+                        "DLL copies ran out and the game failed with ERR_GFX_INIT). Only from what the two regions "
+                        "left of the pool size; costs that region's size in memory. Off by default (RDR2's list turns "
+                        "it on); read at launch, the game's own file wins.",
+                "sources": ["app/Madeira/StikJITHelper.swift", "build/ntdll-unix/virtual_ios.c"]},
     "pool-low": {"category": "Memory & JIT pool", "title": "JIT code buffers below the executable window",
                 "kind": "bool", "default": "0",
-                "note": "1: the largest free run below the 0x140000000 executable window (less pool-low-margin) "
+                "note": "1: a free run below the 0x140000000 executable window (less pool-low-margin) "
                         "becomes a third debugger region for the emulator's code buffers, so the whole JIT pool is "
                         "left to DLL copies (GTA V: about 300 MB more). Needs the pool above the window; costs the "
                         "region's size in memory. Off by default; read at launch, the game's own file wins."},
     "pool-low-margin": {"category": "Memory & JIT pool", "title": "Code-buffer region: MB left free below the window",
                 "kind": "int", "default": "128",
                 "note": "With pool-low on: how much of the free run below the executable window stays free for "
-                        "programs that load there (child processes' main executables). 128 by default."},
+                        "programs that load there (child processes' main executables). A run with a free run at "
+                        "least this large below it keeps none. 128 by default."},
     "env.MADEIRA_SC_CEF": {"category": "Wine core (ntdll)", "title": "Social Club's Chromium in one process",
                 "kind": "bool", "default": "1",
                 "note": "On by default; 0 turns it off. SocialClubHelper.exe runs --single-process with "
@@ -205,7 +487,8 @@ OVERLAY = {
                         "pool was full. No effect on programs without Social Club."},
     "env.MADEIRA_SC_CEF_FLAGS": {"category": "Wine core (ntdll)", "title": "Extra SocialClubHelper.exe switches",
                 "note": "Appended verbatim to SocialClubHelper.exe's command line while env.MADEIRA_SC_CEF is on, "
-                        "e.g. --disable-gpu or --enable-logging=file --v=1."},
+                        "e.g. --disable-gpu or --enable-logging=file --v=1. A --js-flags= in it gets --jitless as its "
+                        "first flag (Chromium keeps only the last --js-flags=), unless MADEIRA_JITLESS = 0."},
     "env.MADEIRA_SC_PA_POOLS": {"category": "Memory & JIT pool", "title": "Room for Social Club's PartitionAlloc pools",
                 "kind": "choice", "default": "",
                 "choices": [("", "Off"), ("1", "Layout 1 (chrome_elf.dll only)"), ("2", "Layout 2 (chrome_elf, libcef, Oilpan)")],
@@ -221,6 +504,37 @@ OVERLAY = {
                         "upstream's DXMT dxgi plus IDXGIFactory7 and EnumAdapterByLuid (GTA V Enhanced stops with "
                         "ERR_GFX_D3D_NOD3D12 without Factory7). Off (default): upstream's committed dxgi.dll. Set it in "
                         "the game's own file, not for every game; read at session start."},
+    "avail-phys": {"category": "Memory & JIT pool", "title": "Report the memory left before the app's limit as available",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: Windows programs' available physical memory (GlobalMemoryStatusEx) is what "
+                        "remains before Madeira's memory limit instead of the phone's free memory, so Chromium "
+                        "(Social Club, Steam) frees caches below 1000 MB and 400 MB left, and a game can see memory "
+                        "running out. Set it in the game's own file; read at session start."},
+    # madeira-bcd: the memory before the game (2026-10-09, virtual_ios.c ios_avail_phys / ios_swap_image_flush).
+    "avail-phys-cef-mb": {"category": "Memory & JIT pool", "title": "Available memory Chromium sees (MB)",
+                "kind": "int", "default": "0",
+                "note": "0 (default): off. N: Social Club's SocialClubHelper.exe and Steam's steamwebhelper.exe see at "
+                        "most N MB of available physical memory, nobody else (the game and the launcher keep the real "
+                        "figure). Below 400 (e.g. 300) Chromium reports critical memory pressure every 5 s and purges "
+                        "caches and garbage; 400-999 (e.g. 900), moderate every 10 s. Independent of avail-phys. Set it "
+                        "in the game's own file; read at session start."},
+    "swap-images": {"category": "Memory & JIT pool", "title": "Swap tier: pure-x64 DLLs and programs in the file",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: the sections of pure-x64 images (with env.MADEIRA_X64_IMAGE_NOCOPY = 1: "
+                        "libcef.dll, steamclient64.dll, launchers, the game exe) move to the swap tier's file once they "
+                        "are read, so they stop counting against the memory limit (iOS writes them back and may drop "
+                        "them). Needs swap-mb. Page edges shared with a neighbouring section stay in memory. Set it in "
+                        "the game's own file; read at session start."},
+    # madeira-bcd: budget-change events in dxgi-src.dll (tools/patch-dxgi-budget-events.py).
+    "env.MADEIRA_DXGI_BUDGET_EVENTS": {"category": "Direct3D 9/10/11 (DXMT)",
+                "title": "Tell the game when its video memory budget changes",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-dxgi-budget-events.py"],
+                "note": "Needs env.MADEIRA_DXGI_SRC = 1. The video memory budget DXGI reports shrinks as Madeira "
+                        "nears its memory limit (vram-trim-mb below it). 1: a game's budget-change event is "
+                        "registered for real, signalled at once and again whenever the budget moves by 32 MB, so a "
+                        "game that waits for it (Red Dead Redemption 2) reads the smaller budget and frees textures. "
+                        "Off (default): the registration is refused, as before. Set it in the game's own file; read "
+                        "at session start."},
     # madeira-bcd: the opt-in source build of DXMT's 64-bit d3d11.dll (tools/build-d3d11-dll.sh).
     "env.MADEIRA_D3D11_SRC": {"category": "Direct3D 9/10/11 (DXMT)", "title": "D3D11 built from DXMT source (context state swap)",
                 "kind": "bool", "default": "0",
@@ -228,6 +542,25 @@ OVERLAY = {
                         "upstream's DXMT d3d11 plus SwapDeviceContextState, which Wine's Direct2D (d2d1) calls and "
                         "upstream's aborts in (Rockstar Games Launcher exited with code 3). Off (default): upstream's "
                         "committed d3d11.dll. Set it in the game's own file, not for every game; read at session start."},
+    # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
+    "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
+                "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],
+                "choices": [("", "As before"), ("stamped", "Only stamped locks"), ("0", "Off")],
+                "note": "The monitor releases an SRW lock it believes a dead thread left held. Unset (default): as "
+                        "before, which counts one strike per parked waiter, so a busy lock with 3 waiters is released "
+                        "at once even while its owner lives (Horizon Zero Dawn stopped with \"Error\" right after such "
+                        "a release, build 479). stamped: one strike per monitor cycle, three in a row, and only locks a "
+                        "live thread has stamped (FEX's code-buffer locks) can be released. 0: no releases. The "
+                        "dead-thread reaper is unchanged. Restart the session after changing it."},
+    "env.DXMT_SMALL_RINGS": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Small DXMT staging rings for these programs",
+                "kind": "text", "default": "", "sources": ["tools/patch-d3d11-src-small-rings.py"],
+                "note": "Needs env.MADEIRA_D3D11_SRC = 1. Program file names separated by ';' (e.g. "
+                        "Launcher.exe;SocialClubHelper.exe), or 1 for every program: in those programs DXMT's staging "
+                        "ring, copy-temp ring and upload heap use 4 MB Metal blocks instead of 32 MB. A ring keeps its "
+                        "blocks until 300 later submissions and an idle program keeps them for good (Rockstar Games "
+                        "Launcher 132 MB, Social Club 68 MB through a whole RDR2 session). Larger uploads still get a "
+                        "block of their own; each named program logs one [small-rings] line. Unset or 0 (default): "
+                        "32 MB as upstream. Set it in the game's own file; read when the program starts."},
     # madeira-bcd: the D3D12/DXGI GPU as a D3DKMT adapter (build/win32u-unix/d3dkmt_ios.c).
     "env.MADEIRA_KMT_ADAPTER": {"category": "Windows, display & input", "title": "D3DKMT adapter for the GPU (WDDM 3.1)",
                 "kind": "bool", "default": "0",

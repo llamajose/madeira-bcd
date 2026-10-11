@@ -53,6 +53,11 @@ jobs:
       - name: Check generated settings catalog
         run: python3 tests/host/check-config-catalog.py
 
+      # madeira-bcd: the games' built-in recommended settings and where the app
+      # applies them (GameRecommendations.swift; owner's decision 2026-10-09).
+      - name: Check built-in recommended game settings
+        run: python3 tests/host/check-game-recommendations.py --require-swift
+
       # --- UNVERIFIED: exact configure invocation for the wine fork's
       # iOS/arm64 cross target isn't documented anywhere in the repo.
       # This is a best guess and will likely need correcting once we see
@@ -360,6 +365,11 @@ jobs:
       - name: Check opt-in graphics DLL lifetime
         run: python3 tests/host/check-graphics-pin.py
 
+      # madeira-bcd: RDR2 on build 476 loaded xinput1_4.dll only at its first
+      # controller read, with the JIT pool full (MADEIRA_PRELOAD_DLLS).
+      - name: Check opt-in DLL preload with the D3D12 device
+        run: python3 tests/host/check-preload-dlls.py
+
       - name: Check ARM64EC allocator span geometry
         run: python3 tests/host/check-rpmalloc-span8.py
 
@@ -389,6 +399,7 @@ jobs:
         run: |
           python3 tests/host/check-pool-low-images.py
           python3 tests/host/check-x64-image-nocopy.py
+          python3 tests/host/check-swap-images.py
           python3 tests/host/check-ec-hook.py
           python3 tests/host/check-x64-graphics-entry.py
           python3 tests/host/check-pool-startup-budget.py --require-swift
@@ -404,6 +415,33 @@ jobs:
 
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
+
+      # madeira-bcd: env MADEIRA_LOCK_ORPHAN = stamped (opt-in): the orphan-lock
+      # reaper counts strikes per cycle, not per parked waiter, and releases only
+      # locks a live thread has stamped. As it was, it released live locks
+      # (Horizon Zero Dawn's "Error" stop, build 479). Unset, nothing changes.
+      - name: Patch wine with the opt-in safe orphan-lock reaper
+        run: |
+          python3 tests/host/check-lock-orphan.py
+          python3 tools/patch-wine-lock-orphan.py wine/dlls/ntdll/unix/sync.c
+
+      # madeira.cfg avail-phys = 1 (opt-in): GlobalMemoryStatusEx's available
+      # physical memory is what remains before this app's memory limit, so
+      # Chromium (Social Club, Steam) sees memory pressure before iOS kills the
+      # app. Patches wine/dlls/ntdll/unix/system.c; off, nothing changes.
+      - name: Patch wine with the opt-in available memory
+        run: |
+          python3 tests/host/check-avail-phys.py
+          python3 tools/patch-wine-avail-phys.py wine/dlls/ntdll/unix/system.c
+
+      # Self-modifying-code fault storms (RockstarService, builds 435-437):
+      # the ARM64EC SMC path decides plain and backpatched stores without
+      # FEX's backpatch lock, and the PE ntdll's uncapped "[rtcs] pre" line is
+      # kept to 10 per second per thread (MADEIRA_RTCS_LOG=all|N).
+      - name: Check the SMC store fast path and the [rtcs] log cap
+        run: |
+          python3 tests/host/check-smc-store-fastpath.py
+          python3 tests/host/check-rtcs-cap.py
 
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
@@ -568,6 +606,14 @@ jobs:
           path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
           key: llvm-mingw-20260421-ucrt-macos-universal
 
+      # env.MADEIRA_DXGI_BUDGET_EVENTS = 1 (opt-in): the budget-change events
+      # tools/patch-dxgi-budget-events.py adds to dxgi-src.dll, checked (and
+      # compiled for arm64ec) before the build below applies it.
+      - name: Check opt-in DXGI budget events
+        env:
+          MINGW: ${{ github.workspace }}/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin
+        run: python3 tests/host/check-dxgi-budget-events.py
+
       # madeira-bcd: DXMT's 64-bit dxgi.dll compiled from the dxmt submodule
       # with IDXGIFactory7 + EnumAdapterByLuid (tools/patch-dxgi-factory7.py, on
       # a copy). The committed arm64ec dxgi.dll stops at IDXGIFactory6 and GTA V
@@ -580,10 +626,20 @@ jobs:
       # upstream's dxgi.dll goes out alone, as before. Since 2026-10-02 it also
       # applies tools/patch-dxgi-umd-version.py to a copy of dxgi_adapter.cpp:
       # CheckInterfaceSupport's UMD version comes from D3DKMT when
-      # env.MADEIRA_KMT_ADAPTER = 1 (else ~0, upstream).
+      # env.MADEIRA_KMT_ADAPTER = 1 (else ~0, upstream). Since 2026-10-09 also
+      # tools/patch-dxgi-budget-events.py: video-memory budget-change events
+      # when env.MADEIRA_DXGI_BUDGET_EVENTS = 1 (a failed patch only warns).
       - name: Build dxgi-src.dll (DXMT dxgi from source, IDXGIFactory7)
         continue-on-error: true
         run: bash tools/build-dxgi-dll.sh
+
+      # env.DXMT_SMALL_RINGS (opt-in): 4 MB staging ring blocks for the
+      # programs it names (tools/patch-d3d11-src-small-rings.py), checked (and
+      # compiled for arm64ec) before the build below applies it.
+      - name: Check opt-in small staging rings
+        env:
+          MINGW: ${{ github.workspace }}/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin
+        run: python3 tests/host/check-d3d11-small-rings.py
 
       # madeira-bcd: DXMT's 64-bit d3d11.dll compiled from the dxmt submodule
       # with SwapDeviceContextState implemented (tools/patch-dxmt-context-state-
@@ -595,7 +651,10 @@ jobs:
       # which stays the default; a game opts in with env.MADEIRA_D3D11_SRC = 1
       # (WineProcessBridge.m). Runs before every DXMT patch step, so it compiles
       # the pristine pin, and it reports whether the unpatched build reproduces
-      # upstream's binary. A failure only warns: nothing is shipped.
+      # upstream's binary. A failure only warns: nothing is shipped. Since
+      # 2026-10-09 the DXMT core is compiled from a copy as well, with
+      # tools/patch-d3d11-src-small-rings.py: 4 MB staging ring blocks for the
+      # programs env.DXMT_SMALL_RINGS names (a failed patch only warns).
       - name: Build d3d11-src.dll (DXMT d3d11 from source, SwapDeviceContextState)
         continue-on-error: true
         run: bash tools/build-d3d11-dll.sh
@@ -1039,6 +1098,25 @@ jobs:
       - name: Patch winemetal sampler reduction
         run: python3 tools/patch-winemetal-sampler-reduction.py
 
+      # A lazy D3D12 pipeline's first draw compiles it: 35-47 ms the first time
+      # this device sees it, 0.3-0.5 ms from Metal's cache afterwards (GTA V,
+      # builds 447-451; bursts froze the game for 100-400 ms). With
+      # madeira.cfg / a game's config pso-warm = N, madeira-d3d12 hands each
+      # lazy pipeline to MadeiraCtl op 8 at creation and winemetal compiles it
+      # once on N utility queues, keeping only the cached compile. Native only.
+      - name: Patch winemetal pipeline cache warm-up
+        run: python3 tools/patch-winemetal-pso-warm.py
+
+      # Metal aborts on a mesh pipeline with rasterization on and no fragment
+      # function; D3D allows a pipeline with no pixel shader. Horizon Zero
+      # Dawn's vertex + geometry shader pipelines killed its pipeline thread
+      # and the game hung after its first frame (build 469). Such a pipeline
+      # now gets an empty fragment function and no colour writes (madeira.cfg
+      # gs-null-fragment = 0 refuses it instead). Pipelines that have a
+      # fragment function are untouched. Native only.
+      - name: Patch winemetal empty fragment function
+        run: python3 tools/patch-winemetal-null-fragment.py
+
       # Is God of War at 1080p GPU-bound? The logs had no GPU timing. The
       # [frame] instrument (server_ios.c, MADEIRA_FRAME_STATS=1, off by
       # default) gets each command buffer's GPU start/end, so it can print the
@@ -1125,6 +1203,86 @@ jobs:
           cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
           echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
 
+      # madeira.cfg indirect-fast = 1 (opt-in): ExecuteIndirect records after
+      # the first are encoded without per-record setup. fullscreen-window = 1
+      # (opt-in): entering full screen moves the window over the monitor.
+      # dxbc-register-spaces = 1 (opt-in): shader model 5.1 resources outside
+      # register space 0 are converted instead of refused. The metal-gap line
+      # (logging only) says what Metal's allocated total is made of.
+      - name: Check the opt-in ExecuteIndirect fast path, full-screen window, DXBC register spaces and the Metal census
+        run: |
+          python3 tests/host/check-indirect-fast.py
+          python3 tests/host/check-fullscreen-window.py
+          python3 tests/host/check-dxbc-register-spaces.py
+          python3 tests/host/check-metal-gap.py
+
+      # A mesh pipeline without a fragment function gets an empty one instead
+      # of Metal's abort (gs-null-fragment, on). The converter's code 4 names
+      # no resource: the D3D12 runtime logs which bindings no root-signature
+      # entry covers (logging only).
+      - name: Check the empty fragment function and the root-signature miss log
+        run: |
+          python3 tests/host/check-null-fragment.py
+          python3 tests/host/check-rsig-miss.py
+
+      # Horizon Zero Dawn's refused shaders (build 475): a code-4 retry with
+      # sized unbounded ranges, a session memo of refusals and placeholder
+      # pipelines (msc-unbounded-retry, msc-fail-memo, pso-placeholder; all off).
+      - name: Check the refused-shader retry, memo and placeholder
+        run: python3 tests/host/check-msc-unbounded-retry.py
+
+      # madeira-bcd: Horizon Zero Dawn on build 480 (20:28): 23,045 shader
+      # libraries kept for 52,570 pipelines (iOS closed it at 8,189 MB), and
+      # clears with rectangles cleared whole targets. Both opt-in.
+      - name: Check shader libraries only for pipelines in use and rectangle clears
+        run: |
+          python3 tests/host/check-pso-lazy-libs.py
+          python3 tests/host/check-clear-rects.py
+
+      # madeira-bcd: Horizon Zero Dawn's compute-skinned characters lose faces,
+      # hair or whole bodies every few frames on build 481 (gpu-sync or not):
+      # skin-check and view-census log what those draws read and which buffer
+      # views fall back. Both diagnostics, off by default.
+      - name: Check the skin-check and view-census diagnostics
+        run: python3 tests/host/check-skin-check.py
+
+      # madeira-bcd: Horizon Zero Dawn's walls, trees and plants vanish for
+      # single frames on build 486: aligned copies of offset typed views
+      # (typed-view-shadow), the per-frame draw and culling-readback trace
+      # (vis-trace) and the empty-readback experiment (readback-far). All off
+      # by default.
+      - name: Check typed-view-shadow, vis-trace and readback-far
+        run: python3 tests/host/check-vis-trace.py
+
+      # madeira-bcd: A/B switches for the same corruption, all off by default:
+      # d3d12-wave-ops = 0, d3d12-binding-tier = 3, d3d12-raw-typed-views = 1,
+      # and ignore-volatile-metadata = 1 (FEX's x86 ordering for whole images).
+      - name: Check the opt-in switches for the Sony ports' corrupted meshes
+        run: python3 tests/host/check-nixxes-optins.py
+
+      # madeira-bcd: RDR2 froze on build 476 (16:55:52) when the guest RIP
+      # profile took libpthread's thread-list lock with a thread suspended.
+      - name: Check that no sampler takes a lock with a thread suspended
+        run: python3 tests/host/check-suspend-windows.py
+
+      # madeira-bcd: Horizon Zero Dawn got no input (build 471): XInput pads as
+      # Windows.Gaming.Input gamepads (MADEIRA_WGI_HOST_PADS=1) and the opt-in
+      # foreground for a process when no window is foreground
+      # (MADEIRA_INPUT_FOREGROUND=1).
+      - name: Check XInput pads in Windows.Gaming.Input and the input foreground
+        run: |
+          python3 tests/host/check-wgi-host-pads.py
+          python3 tests/host/check-input-foreground.py
+
+      # madeira-bcd: Red Dead Redemption 2 kept 1.5 GB of argument-ring chunks (build 470);
+      # ring-share = 1 returns them per batch. Also the ExecuteIndirect fast-path tallies.
+      - name: Check the shared argument ring
+        run: python3 tests/host/check-ring-share.py
+
+      # madeira-bcd: static-cbv (Horizon Zero Dawn): table constant buffers as each draw was recorded.
+      - name: Check static-cbv
+        run: python3 tests/host/check-static-cbv.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
@@ -1132,7 +1290,7 @@ jobs:
       # and the run still went green, so a broken build could reach the phone.
       - name: Build madeira_d3d12.dll from source
         env:
-          MAD_PACK_ID: ipa ${{ github.run_number }}
+          MAD_BUILD_ID: ipa ${{ github.run_number }}
         run: bash tools/build-madeira-d3d12-dll.sh
 
       # DXMT's NVAPI (dxmt/src/nvapi), which its DXMT build leaves
@@ -1222,6 +1380,8 @@ jobs:
               raise SystemExit('Required ARM64EC branch-history module was not built; refusing the fallback IPA')
           if b'launcher-smc-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
+          if b'smc-store-fastpath-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC SMC store fast-path module was not built; refusing the fallback IPA')
           print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
@@ -1236,7 +1396,9 @@ jobs:
             echo "::warning::d3d11-src.dll missing: this IPA has only upstream's d3d11.dll (no SwapDeviceContextState); env.MADEIRA_D3D11_SRC = 1 does nothing"
           fi
 
-      # tools/fetch-vcruntime.md: the twelve VC++ runtime DLLs are Microsoft's
+      # tools/fetch-vcruntime.md: the VC++ runtime DLLs (twelve, and since
+      # 2026-10-09 MFC's mfc140.dll and mfc140u.dll from the same package:
+      # Horizon Zero Dawn imports mfc140.dll) are Microsoft's
       # and are not redistributable under this project's license, so they are
       # gitignored and "you supply them yourself". Fetching them straight from
       # Microsoft at build time honours that -- nothing Microsoft-authored ever
@@ -1254,6 +1416,9 @@ jobs:
       #
       # cabextract is built for exactly this: it scans a file for embedded
       # cabinet headers rather than trusting its container format.
+      - name: Check the VC++ runtime list and the MFC switch
+        run: python3 tests/host/check-vcruntime-mfc.py
+
       - name: Fetch the VC++ runtime DLLs from Microsoft
         shell: bash
         run: |
@@ -1263,7 +1428,8 @@ jobs:
           WANT="concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll
                 msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll vcamp140.dll
                 vccorlib140.dll vcomp140.dll vcruntime140.dll vcruntime140_1.dll
-                vcruntime140_threads.dll"
+                vcruntime140_threads.dll mfc140.dll mfc140u.dll"
+          NWANT=$(echo $WANT | wc -w | tr -d ' ')
           command -v cabextract >/dev/null 2>&1 || brew install cabextract
           command -v msiextract >/dev/null 2>&1 || brew install msitools
 
@@ -1334,7 +1500,7 @@ jobs:
             done
           }
 
-          # Peel containers until all twelve turn up, or nothing new appears.
+          # Peel containers until all of them turn up, or nothing new appears.
           for pass in 1 2 3 4; do
             BEFORE=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
             find /tmp/vcx -type f -size +20k 2>/dev/null | while IFS= read -r f; do
@@ -1347,14 +1513,14 @@ jobs:
             done
             AFTER=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
             collect
-            echo "pass $pass: $BEFORE -> $AFTER files, $FOUND of 12 recovered"
-            [ "$FOUND" -eq 12 ] && break
+            echo "pass $pass: $BEFORE -> $AFTER files, $FOUND of $NWANT recovered"
+            [ "$FOUND" -eq "$NWANT" ] && break
             [ "$BEFORE" = "$AFTER" ] && break
           done
 
-          echo "::notice::vcruntime :: recovered $FOUND of 12$([ -n "$MISSING" ] && echo " -- missing:$MISSING")"
+          echo "::notice::vcruntime :: recovered $FOUND of $NWANT$([ -n "$MISSING" ] && echo " -- missing:$MISSING")"
 
-          if [ "$FOUND" -lt 12 ]; then
+          if [ "$FOUND" -lt "$NWANT" ]; then
             echo "-- what the installer actually unpacked to (biggest 40) --"
             find /tmp/vcx -type f -size +20k -exec ls -S {} + 2>/dev/null \
               | head -40 | sed "s|/tmp/vcx/||"
@@ -1379,8 +1545,8 @@ jobs:
         run: |
           shopt -s nullglob
           DLLS=(app/Madeira/x86_64-vcruntime/*.dll)
-          echo "x86_64-vcruntime DLLs present: ${#DLLS[@]} of 12"
-          if [ "${#DLLS[@]}" -lt 12 ]; then
+          echo "x86_64-vcruntime DLLs present: ${#DLLS[@]} of 14 (12 C++ runtime + MFC's 2)"
+          if [ "${#DLLS[@]}" -lt 14 ]; then
             echo "::warning::IPA will build, but games built with MSVC will not \
           start until the VC++ runtime DLLs are added -- see tools/fetch-vcruntime.md"
           fi
@@ -1437,20 +1603,18 @@ jobs:
             -c "Set :CFBundleVersion ${{ github.run_number }}" \
             app/Madeira/Info.plist
           echo "::notice::version 0.1.${{ github.run_number }} (build ${{ github.run_number }})"
-          # madeira-bcd update packs: what a pack must match to be installed
-          # over this app (tools/native-abi.sh), the shader cache identity its
-          # DLL should use, and where to look for packs.
-          ABI=$(bash tools/native-abi.sh)
+          # madeira-bcd: which commit and run this IPA is; the D3D12 shader
+          # cache identity (tools/build-madeira-d3d12-dll.sh) is only printed:
+          # a new one means every D3D12 game converts its shaders once again.
           SCID=$(cat build/madeira-d3d12/out-pe/scid.txt 2>/dev/null || true)
           P=app/Madeira/Info.plist
-          for kv in "MadeiraNativeABI:$ABI" "MadeiraShaderCacheID:$SCID" \
-                    "MadeiraCommit:${GITHUB_SHA}" "MadeiraRepo:${GITHUB_REPOSITORY}" \
+          for kv in "MadeiraCommit:${GITHUB_SHA}" "MadeiraRepo:${GITHUB_REPOSITORY}" \
                     "MadeiraBuilt:$(date -u +%Y-%m-%dT%H:%M:%SZ)"; do
             k=${kv%%:*}; v=${kv#*:}
             /usr/libexec/PlistBuddy -c "Delete :$k" "$P" > /dev/null 2>&1 || true
             /usr/libexec/PlistBuddy -c "Add :$k string $v" "$P"
           done
-          echo "::notice::native ABI $ABI, shader cache identity ${SCID:-none}"
+          echo "::notice::shader cache identity ${SCID:-none}"
 
       # Upstream's prebuilt StikJIT.xcframework (Built-in StikJIT, read by the
       # MadeiraJITHelper extension) was built with Swift 6.4; its interface
@@ -1571,17 +1735,6 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: bash tools/sign-and-publish-ota.sh build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa ${{ github.run_number }} build-out/Madeira2-0.1.${{ github.run_number }}-unsigned.ipa
-
-      # Update packs (tools/pack-index.py): record this build's native ABI in
-      # the packs index -- metadata only, the IPA itself is not published --
-      # so the app can tell which build a newer pack needs.
-      - name: Record the app build in the update-pack index
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 tools/pack-index.py add-app ${{ github.run_number }} "$(bash tools/native-abi.sh)" \
-            "$GITHUB_SHA" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       # Owner's decision (2026-10-02): no IPA artifact on GitHub at all. The
       # repository and its Actions are public, so an artifact is downloadable by

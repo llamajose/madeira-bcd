@@ -206,6 +206,66 @@ static void winios_bg_observe(void) {
                     wfz_bg_exit = winios_now_mono(); wfz_bg_now = 0; }];
 }
 
+/* madeira-bcd: [main-stall] IS THE iOS MAIN THREAD RUNNING? winemetal applies a
+ * Metal layer's drawable size and format in a block it runs on the main thread
+ * and waits for (execute_on_main: dispatch_sync), and a desktop session's
+ * swapchain gets its window layer the same way (winios_metal_layer_for_hwnd).
+ * So a swapchain creation or ResizeBuffers cannot return while the main thread
+ * is blocked -- one candidate for Red Dead Redemption 2 hanging when its Screen
+ * Type is switched to Windowed Borderless (owner, 2026-10-08). The freeze
+ * watcher keeps one no-op block queued on the main queue and reports when it
+ * has waited 2 s (then 5, 10, 20 ... s), dumps every thread's stack once per
+ * stall at 5 s (4 dumps per run at most), and says when the main thread ran
+ * again. Not while the app is in the background, and a watcher that was itself
+ * stopped (a task suspension, see GAP) starts the wait over. Logging only. */
+extern void ios_dump_all_thread_stacks(void);
+static _Atomic double wms_queued;        /* mono time the pending heartbeat was queued; 0 = none pending */
+static _Atomic int wms_reported;         /* this stall was reported: the main block says when it ran */
+static double wms_next_report;           /* watcher thread only, from here down */
+static double wms_last_queue;            /* when the last heartbeat was queued: one a second */
+static int wms_dumped;                   /* this stall's stacks were dumped */
+static unsigned wms_stalls, wms_dumps;
+
+static void winios_main_heartbeat(double now, double slept, double t0) {
+    double queued = atomic_load(&wms_queued), waited;
+    if (queued == 0.0) {
+        if (now - wms_last_queue < 1.0) return;
+        wms_last_queue = now;
+        atomic_store(&wms_queued, now);
+        wms_next_report = 2.0;
+        wms_dumped = 0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            double q = atomic_load(&wms_queued);
+            if (atomic_exchange(&wms_reported, 0) && q > 0.0)
+                dprintf(STDERR_FILENO, "[main-stall] the iOS main thread ran again after %.1f s\n",
+                        winios_now_mono() - q);
+            atomic_store(&wms_queued, 0.0);
+        });
+        return;
+    }
+    if (wfz_bg_now || slept > 1.0) {   /* backgrounded, or this watcher was stopped too: start over */
+        atomic_store(&wms_queued, now);
+        wms_next_report = 2.0;
+        return;
+    }
+    waited = now - queued;
+    if (waited < wms_next_report) return;
+    if (!atomic_exchange(&wms_reported, 1)) wms_stalls++;
+    if (wms_stalls <= 32)
+        dprintf(STDERR_FILENO, "[main-stall] #%u the iOS main thread has not run a queued block for %.1f s "
+                "(queued at t+%.1fs); a dispatch_sync to it (Metal layer setup, desktop window layer) waits as long\n",
+                wms_stalls, waited, queued - t0);
+    if (waited >= 5.0 && !wms_dumped && wms_dumps < 4) {
+        wms_dumped = 1;
+        wms_dumps++;
+        dprintf(STDERR_FILENO, "[main-stall] #%u every thread's stack (dump %u of at most 4 per run):\n",
+                wms_stalls, wms_dumps);
+        /* off this thread: a long dump here would read as a GAP of the watcher */
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_dump_all_thread_stacks(); });
+    }
+    wms_next_report = wms_next_report < 5.0 ? 5.0 : wms_next_report * 2.0;
+}
+
 static void *winios_freeze_watch(void *arg) {
     const double SLEEP_S = 0.25;
     const double GAP_S   = 2.0;    /* well above any scheduling delay */
@@ -234,6 +294,8 @@ static void *winios_freeze_watch(void *arg) {
 
         double slept = now - last;
         double wall  = (double)(w1.tv_sec - w0.tv_sec) + (double)(w1.tv_usec - w0.tv_usec) / 1e6;
+
+        winios_main_heartbeat(now, slept, t0);   /* madeira-bcd: [main-stall] */
 
         {   /* ml522: report transitions immediately, with t+ so they can be
              * placed exactly against the gap boundaries. Which SIDE of a gap
@@ -366,6 +428,76 @@ BOOL winios_pCreateWindow(HWND hwnd) {
      * per HWND yet. */
     WLOG("pCreateWindow hwnd=%p", hwnd);
     return TRUE;
+}
+
+/* ============================================================ *
+ * [swap-win] windows a swapchain presents into
+ * ============================================================
+ *
+ * madeira-bcd: Red Dead Redemption 2 hangs when its Screen Type is switched
+ * to Windowed Borderless (owner, 2026-10-08). The switch restyles, moves and
+ * re-shows the window its swapchain presents into, and nothing in the log said
+ * what happened to that window. IOSDisplayShim reports every HWND a D3D9/11/12
+ * swapchain makes its Metal view for; the driver hooks then log that window's
+ * style changes, position changes, shows, activations and destruction as
+ * [swap-win] lines (driver_ios.c, and below). Logging only. Each window has its
+ * own budget per kind of line -- the first 32, then every 100th -- so a
+ * launcher's windows cannot use up the game's. A slot holds the HWND, 0 =
+ * free; lock-free, any thread. A new session starts with an empty table (HWND
+ * values are reused). */
+#define WINIOS_SWAP_HWNDS 32
+#define WINIOS_SWAP_KINDS 8   /* style, pos-begin, pos, activate (driver_ios.c); show, layer (here) */
+static _Atomic(uintptr_t) g_swap_hwnds[WINIOS_SWAP_HWNDS];
+static _Atomic unsigned g_swap_said[WINIOS_SWAP_HWNDS][WINIOS_SWAP_KINDS];
+enum { WINIOS_SWAP_SHOW = 4, WINIOS_SWAP_LAYER = 5 };
+
+/* The window's slot + 1, or 0 when no swapchain presents into it. */
+int winios_swapchain_hwnd(void *hwnd) {
+    uintptr_t h = (uintptr_t)hwnd;
+    if (!h) return 0;
+    for (int i = 0; i < WINIOS_SWAP_HWNDS; i++)
+        if (atomic_load_explicit(&g_swap_hwnds[i], memory_order_relaxed) == h) return i + 1;
+    return 0;
+}
+
+/* Whether to log this line of `kind` for the window in `slot1` (from
+ * winios_swapchain_hwnd): the first 32 of its kind, then every 100th. */
+int winios_swapchain_take(int slot1, int kind, unsigned *seq) {
+    unsigned k;
+    if (slot1 < 1 || slot1 > WINIOS_SWAP_HWNDS || kind < 0 || kind >= WINIOS_SWAP_KINDS) return 0;
+    k = atomic_fetch_add_explicit(&g_swap_said[slot1 - 1][kind], 1, memory_order_relaxed) + 1;
+    *seq = k;
+    return k <= 32 || (k % 100) == 0;
+}
+
+/* IOSDisplayShim.m, on the Wine thread that creates the swapchain. */
+void winios_note_swapchain_hwnd(void *hwnd) {
+    uintptr_t h = (uintptr_t)hwnd;
+    if (!h || winios_swapchain_hwnd(hwnd)) return;
+    for (int i = 0; i < WINIOS_SWAP_HWNDS; i++) {
+        uintptr_t empty = 0;
+        if (atomic_compare_exchange_strong(&g_swap_hwnds[i], &empty, h)) {
+            for (int k = 0; k < WINIOS_SWAP_KINDS; k++) atomic_store(&g_swap_said[i][k], 0);
+            fprintf(stderr, "[swap-win] hwnd=%p presents through a swapchain: its style, position, show, activation "
+                            "and destruction are logged as [swap-win] lines\n", hwnd);
+            fflush(stderr);
+            return;
+        }
+    }
+}
+
+static int winios_forget_swapchain_hwnd(void *hwnd) {
+    uintptr_t h = (uintptr_t)hwnd;
+    int found = 0;
+    for (int i = 0; h && i < WINIOS_SWAP_HWNDS; i++) {
+        uintptr_t want = h;
+        if (atomic_compare_exchange_strong(&g_swap_hwnds[i], &want, 0)) found = 1;
+    }
+    return found;
+}
+
+static void winios_swapchain_hwnds_reset(void) {
+    for (int i = 0; i < WINIOS_SWAP_HWNDS; i++) atomic_store(&g_swap_hwnds[i], 0);
 }
 
 static void winios_remove_layer(HWND hwnd);   /* compositor, below */
@@ -566,6 +698,10 @@ void winios_pDestroyWindow(HWND hwnd) {
     uintptr_t pending = (uintptr_t)hwnd;
     atomic_compare_exchange_strong(&g_restore_foreground, &pending, 0);
     winios_census_forget(hwnd);
+    if (winios_forget_swapchain_hwnd(hwnd)) {   /* madeira-bcd: [swap-win] */
+        fprintf(stderr, "[swap-win] hwnd=%p destroyed (pDestroyWindow) while a swapchain had presented into it\n", hwnd);
+        fflush(stderr);
+    }
     winios_remove_layer(hwnd);
 }
 
@@ -624,6 +760,14 @@ UINT winios_pShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp) {
                      "[show-win] #%d hwnd=%p cmd=%d swp_in=%08x -> returning ~0 "
                      "(pre-ml528 returned 0, which destroyed SWP_SHOWWINDOW) rev=ml529\n",
                      n, hwnd, cmd, (unsigned)swp );
+    }
+    {   /* madeira-bcd: [swap-win], the window's own budget */
+        int slot = winios_swapchain_hwnd(hwnd);
+        unsigned seq;
+        if (slot && winios_swapchain_take(slot, WINIOS_SWAP_SHOW, &seq))
+            dprintf( STDERR_FILENO, "[swap-win] #%u show hwnd=%p cmd=%d swp=%08x (ShowWindow; the default "
+                     "placement is kept) mach_tid=%u\n", seq, hwnd, cmd, (unsigned)swp,
+                     (unsigned)pthread_mach_thread_np( pthread_self() ) );
     }
     return ~0u;
 }
@@ -690,6 +834,8 @@ static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags
     pthread_mutex_unlock(&g_input_q.lock);
 }
 
+static void winios_game_cursor_touch(int x, int y);   /* cursor section, below */
+
 /* Public C entry points for Swift / UIKit gesture handlers.
  * Coordinates are in iOS view-local pixels; we scale to a fixed
  * 1024×768 logical surface inside winios_pProcessEvents to match
@@ -697,6 +843,7 @@ static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags
 void winios_post_touch_down(int x, int y) {
     fprintf(stderr, "[winios] post_touch_down x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_game_cursor_touch(x, y);
 }
 
 void winios_post_touch_move(int x, int y) {
@@ -705,11 +852,13 @@ void winios_post_touch_move(int x, int y) {
         fprintf(stderr, "[winios] post_touch_move x=%d y=%d (n=%u)\n", x, y, cnt); fflush(stderr);
     }
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_game_cursor_touch(x, y);
 }
 
 void winios_post_touch_up(int x, int y) {
     fprintf(stderr, "[winios] post_touch_up x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_game_cursor_touch(x, y);
 }
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
@@ -794,6 +943,7 @@ static NSNumber *g_fit_key;
 static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
 static CGRect g_fit_view_pt;     /* where it is shown, compositor-view points */
 static void winios_place_metal_layer(NSNumber *key);
+static void winios_metal_hud_pick(void);   /* MADEIRA_METAL_HUD_MAIN, below */
 
 /* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
  * Crop the layer contents to the window's actual size or everything
@@ -1011,6 +1161,7 @@ static BOOL winios_covers_desktop(CGRect px) {
 }
 
 static void winios_forget_cursor_layer(void);   /* cursor section, below */
+static void winios_game_cursor_refresh(void);   /* cursor section, below */
 
 /* main thread only. Removes the compositor view and every window layer. */
 static void winios_drop_compositor(const char *why) {
@@ -1045,6 +1196,7 @@ static BOOL winios_game_window_shown(NSNumber *key) {
         fprintf(stderr, "[winios] game window hwnd=0x%llx not drawn (%s)\n", key.unsignedLongLongValue,
                 metal ? "presents through Metal" : rv ? "covers the guest desktop" : "no position yet");
         fflush(stderr);
+        winios_game_cursor_refresh();
     }
     return NO;
 }
@@ -1066,9 +1218,11 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 /* Called at every Wine session start (WineProcessBridge): a game session
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
+    winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
         if (g_comp_game) winios_drop_compositor("new session");
+        winios_metal_hud_pick();   /* the window-level layer's HUD follows the session kind */
     });
 }
 
@@ -1192,6 +1346,7 @@ static void winios_remove_layer(HWND hwnd) {
             [l removeFromSuperlayer];
             [g_layers removeObjectForKey:key];
             [g_px_rects removeObjectForKey:key];
+            winios_game_cursor_refresh();
         }
         CAMetalLayer *ml = g_metal_layers[key];
         if (ml) {
@@ -1201,6 +1356,7 @@ static void winios_remove_layer(HWND hwnd) {
             if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
             fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
             fflush(stderr);
+            winios_metal_hud_pick();
         }
     });
 }
@@ -1282,6 +1438,188 @@ static void winios_place_metal_layer(NSNumber *key) {
     winios_desktop_fit(key, ml, c);
 }
 
+/* madeira-bcd: A HIDDEN WINDOW PRESENTS SLOWLY. A desktop window's swapchain
+ * keeps presenting after Wine hides the window: the Rockstar Games
+ * Launcher's Chromium layer (hwnd 0x100f6, hidden when GTA V Enhanced
+ * started) presented 44-60 frames a second for the whole game (log
+ * 2026-10-07 22:06, build 435, DXMT [gpu-perf] up to 27% GPU busy), and its
+ * GPU, renderer and compositor threads took ~0.4 of a core from a game
+ * that was CPU-bound at 17 fps. Nobody sees a hidden layer, so its
+ * nextDrawable waits until 1/N s after the previous one: the swapchain's
+ * Present slows down and the program renders less. The window's own state
+ * comes from winios_sync_metal_hidden (main thread); a shown window is not
+ * paced. MADEIRA_HIDDEN_LAYER_FPS=N (default 10), 0 turns it off. */
+static unsigned long long winios_hidden_present_interval_ns(void) {
+    static long long ns = -1;
+    if (ns < 0) {
+        const char *e = getenv("MADEIRA_HIDDEN_LAYER_FPS");  /* frames a second a hidden desktop window's Metal layer may present (default 10); 0 = no limit */
+        long fps = e && *e ? strtol(e, NULL, 10) : 10;
+        ns = fps > 0 ? 1000000000LL / fps : 0;
+    }
+    return (unsigned long long)ns;
+}
+
+@interface MadeiraWindowMetalLayer : CAMetalLayer
+@property (nonatomic) uintptr_t madeiraHwnd;
+- (void)madeiraSetWindowHidden:(BOOL)hidden;
+@end
+
+@implementation MadeiraWindowMetalLayer {
+    int _windowHidden;                /* __atomic: set on the main thread, read on DXMT's */
+    unsigned long long _lastDrawableNs;
+    int _firstDrawableSaid;           /* __atomic: the [metal-hud] line below was written */
+}
+- (void)madeiraSetWindowHidden:(BOOL)hidden {
+    __atomic_store_n(&_windowHidden, hidden ? 1 : 0, __ATOMIC_RELAXED);
+}
+- (nullable id<CAMetalDrawable>)nextDrawable {
+    if (!__atomic_exchange_n(&_firstDrawableSaid, 1, __ATOMIC_RELAXED)) {
+        @autoreleasepool {   /* once per layer: what Apple's Metal HUD is drawn into (MADEIRA_METAL_HUD_MAIN, below) */
+            CGSize d = self.drawableSize, b = self.bounds.size;
+            NSString *hud = [self.developerHUDProperties[@"mode"] description];
+            fprintf(stderr, "[metal-hud] hwnd=0x%llx first drawable %.0fx%.0f px on %.0fx%.0f pt, "
+                            "contentsScale %.1f, HUD mode %s\n",
+                    (unsigned long long)self.madeiraHwnd, d.width, d.height, b.width, b.height,
+                    (double)self.contentsScale, hud ? hud.UTF8String : "default");
+        }
+    }
+    unsigned long long interval = winios_hidden_present_interval_ns();
+    if (interval && __atomic_load_n(&_windowHidden, __ATOMIC_RELAXED)) {
+        unsigned long long now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        unsigned long long last = __atomic_load_n(&_lastDrawableNs, __ATOMIC_RELAXED);
+        if (last && now - last < interval) {
+            static _Atomic unsigned said;
+            if (atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) < 8)
+                fprintf(stderr, "[hidden-present] hwnd=0x%llx is hidden: its Metal layer presents at "
+                                "%llu fps at most (MADEIRA_HIDDEN_LAYER_FPS=0 disables)\n",
+                        (unsigned long long)self.madeiraHwnd, 1000000000ULL / interval);
+            usleep((useconds_t)((interval - (now - last)) / 1000));
+            now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        }
+        __atomic_store_n(&_lastDrawableNs, now, __ATOMIC_RELAXED);
+    }
+    return [super nextDrawable];
+}
+@end
+
+/* madeira-bcd: ONE METAL HUD LAYER (opt-in). Apple's Metal Performance HUD
+ * (Settings › Developer › Graphics HUD) is drawn per CAMetalLayer that
+ * presents, sized in that layer's drawable pixels, and takes its frame
+ * metrics from one "main" layer: unless a layer's developerHUDProperties
+ * says mode=main, the first layer the app created. In a Madeira Dock
+ * session that is MetalHostView's window-level layer (made at app start),
+ * which presents nothing there; the launcher, its hidden Chromium layer
+ * (still presenting, see MADEIRA_HIDDEN_LAYER_FPS) and the game each
+ * present into a window layer of their own, and libMTLHud reports each new
+ * one's frame-interval, present-delay and fps metrics as already existing
+ * ("Metric com.apple.hud-stat.fps already exist" at the first present of
+ * every window layer; log 2026-10-08 10:41:34, build 447, GTA V Enhanced's
+ * Present #1). The launcher showed the full panel; the game showed only a
+ * large FPS figure (build 447), or a HUD box frozen at 58.06 (builds
+ * 427/433). MADEIRA_METAL_HUD_MAIN=1 makes the largest shown window layer
+ * the HUD's main layer and turns the HUD off on every other window layer
+ * and, in a desktop session, on the window-level layer. Apple documents
+ * `mode` as turning the HUD on or off for the layer, so with the switch on
+ * the HUD may show even while Developer settings has it off. Main thread
+ * only. */
+static int winios_metal_hud_main_enabled(void) {
+    /* Read on every call, not once: the first pick runs at session reset, before
+     * WineProcessBridge applies the game's env lines (log 2026-10-08 12:58:50,
+     * build 451: the switch was in GTA's config and never took effect). */
+    const char *e = getenv("MADEIRA_METAL_HUD_MAIN");   /* 1: Apple's Metal HUD only on the largest shown desktop window's Metal layer (its main layer), off on the other layers; default: Apple's own choice */
+    return e && e[0] == '1';
+}
+
+/* IOSDisplayShim.m: the window-level layer (MetalHostView) */
+extern CAMetalLayer *madeira_display_layer(void);
+
+static void winios_metal_hud_set(CAMetalLayer *ml, NSDictionary *want) {
+    NSDictionary *have = ml.developerHUDProperties;
+    if (have != want && ![have isEqual:want]) ml.developerHUDProperties = want;
+}
+
+static void winios_metal_hud_pick(void) {
+    static BOOL applied;   /* modes were set by an earlier pick; a session without the switch gets Apple's default back */
+    if (!winios_metal_hud_main_enabled()) {
+        if (applied) {
+            for (NSNumber *key in g_metal_layers) winios_metal_hud_set(g_metal_layers[key], nil);
+            winios_metal_hud_set(madeira_display_layer(), nil);
+            applied = NO;
+        }
+        return;
+    }
+    applied = YES;
+    NSDictionary *off = @{ @"mode": @"disabled" };
+    NSNumber *main_key = nil;
+    CGFloat main_area = 0;
+    for (NSNumber *key in g_metal_layers) {
+        CALayer *win = g_layers[key];
+        CGSize sz = g_metal_layers[key].bounds.size;
+        if (!win || win.hidden || sz.width * sz.height <= main_area) continue;
+        main_key = key;
+        main_area = sz.width * sz.height;
+    }
+    for (NSNumber *key in g_metal_layers)
+        winios_metal_hud_set(g_metal_layers[key], [key isEqual:main_key] ? @{ @"mode": @"main" } : off);
+    BOOL desk = winios_desktop_session();
+    winios_metal_hud_set(madeira_display_layer(), desk ? off : nil);   /* a game session presents there */
+    static NSNumber *said_key;
+    static unsigned said;
+    if (main_key != said_key && ![main_key isEqual:said_key] && said < 32) {
+        said++;
+        if (main_key)
+            fprintf(stderr, "[metal-hud] main layer hwnd=0x%llx (%.0fx%.0f pt); HUD off on %lu other window "
+                            "layer(s)%s (MADEIRA_METAL_HUD_MAIN=1)\n", main_key.unsignedLongLongValue,
+                    g_metal_layers[main_key].bounds.size.width, g_metal_layers[main_key].bounds.size.height,
+                    (unsigned long)g_metal_layers.count - 1, desk ? " and the window-level layer" : "");
+        else
+            fprintf(stderr, "[metal-hud] no shown window layer: HUD off on %lu window layer(s)%s "
+                            "(MADEIRA_METAL_HUD_MAIN=1)\n", (unsigned long)g_metal_layers.count,
+                    desk ? " and the window-level layer" : "");
+        fflush(stderr);
+    }
+    said_key = main_key;
+}
+
+/* main thread: the window layer of `key` was just shown or hidden */
+static void winios_sync_metal_hidden(NSNumber *key, CALayer *l) {
+    CAMetalLayer *ml = g_metal_layers[key];
+    if ([ml isKindOfClass:[MadeiraWindowMetalLayer class]])
+        [(MadeiraWindowMetalLayer *)ml madeiraSetWindowHidden:l.hidden];
+    winios_metal_hud_pick();
+}
+
+/* madeira-bcd: [swap-win] main thread, desktop sessions. The layers of a window
+ * a swapchain presents into, logged when they change: the window layer's frame
+ * and hidden state (a hidden window's Metal layer presents at
+ * MADEIRA_HIDDEN_LAYER_FPS), the Metal layer's frame and drawable size, and
+ * whether it is fitted to the desktop. Logging only. */
+static void winios_swap_layer_note(NSNumber *key, const char *why) {
+    static NSMutableDictionary<NSNumber *, NSString *> *said;
+    unsigned seq;
+    int slot = g_comp_game ? 0 : winios_swapchain_hwnd((void *)(uintptr_t)key.unsignedLongLongValue);
+    if (!slot) return;
+    CALayer *l = g_layers[key];
+    CAMetalLayer *ml = g_metal_layers[key];
+    if (!l) return;
+    CGRect f = l.frame, mf = ml ? ml.frame : CGRectZero;
+    CGSize ds = ml ? ml.drawableSize : CGSizeZero;
+    BOOL fit = g_fit_key && [g_fit_key isEqual:key];
+    NSString *state = [NSString stringWithFormat:@"%.0f %.0f %.0f %.0f %d %d %.0f %.0f %.0f %.0f %.0f %.0f %d",
+                       f.origin.x, f.origin.y, f.size.width, f.size.height, (int)l.hidden, ml != nil,
+                       mf.origin.x, mf.origin.y, mf.size.width, mf.size.height, ds.width, ds.height, (int)fit];
+    if (!said) said = [NSMutableDictionary new];
+    if ([said[key] isEqualToString:state]) return;
+    said[key] = state;
+    if (!winios_swapchain_take(slot, WINIOS_SWAP_LAYER, &seq)) return;
+    fprintf(stderr, "[swap-win] #%u layer hwnd=0x%llx (%s): window layer (%.0f,%.0f %.0fx%.0f pt) hidden=%d, "
+                    "metal layer %s(%.0f,%.0f %.0fx%.0f pt) drawable %.0fx%.0f px%s\n", seq,
+            key.unsignedLongLongValue, why, f.origin.x, f.origin.y, f.size.width, f.size.height, (int)l.hidden,
+            ml ? "" : "none ", mf.origin.x, mf.origin.y, mf.size.width, mf.size.height, ds.width, ds.height,
+            fit ? ", fitted to the desktop" : "");
+    fflush(stderr);
+}
+
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
  * view for an HWND in desktop mode. Returns the (unretained) CAMetalLayer;
  * the shim CFRetains it for DXMT's lifetime handling. */
@@ -1295,7 +1633,10 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
         CAMetalLayer *ml = g_metal_layers[key];
         if (!ml) {
             CALayer *win = winios_layer_for(hwnd, true);
-            ml = [CAMetalLayer layer];
+            MadeiraWindowMetalLayer *wml = [MadeiraWindowMetalLayer layer];
+            wml.madeiraHwnd = (uintptr_t)hwnd;
+            [wml madeiraSetWindowHidden:win.hidden];
+            ml = wml;
             ml.anchorPoint = CGPointMake(0, 0);
             ml.device = MTLCreateSystemDefaultDevice();
             ml.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -1310,6 +1651,8 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
                     ml.frame.size.width, ml.frame.size.height);
             fflush(stderr);
             winios_census_note_metal((HWND)hwnd);
+            winios_metal_hud_pick();
+            winios_swap_layer_note(key, "metal layer created");
         }
         result = ml;
     };
@@ -1330,6 +1673,9 @@ void winios_window_visibility(HWND hwnd, int visible) {
         [CATransaction setDisableActions:YES];
         l.hidden = hidden;
         [CATransaction commit];
+        winios_sync_metal_hidden(@((uintptr_t)hwnd), l);
+        winios_swap_layer_note(@((uintptr_t)hwnd), "parent shown or hidden");
+        winios_game_cursor_refresh();
         static unsigned n;
         if (++n <= 64 || (n % 128) == 0) {
             fprintf(stderr, "[winios] inherited visibility hwnd=%p visible=%d\n", hwnd, !hidden);
@@ -1356,6 +1702,7 @@ void winios_window_geometry(HWND hwnd, int x, int y, int w, int h,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
+        winios_swap_layer_note(key, "parent moved");
         static unsigned n;
         if (++n <= 64 || (n % 128) == 0)
             fprintf(stderr, "[winios] inherited frame hwnd=%p screen=(%d,%d %dx%d)\n", hwnd, x, y, w, h);
@@ -1392,6 +1739,9 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
+        winios_sync_metal_hidden(key, l);
+        winios_swap_layer_note(key, "window frame");
+        winios_game_cursor_refresh();
     });
 }
 
@@ -1838,7 +2188,7 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
             NSNumber *key = @((uintptr_t)hwnd);
             l.opaque = !pixelAlpha;
             l.contents = (__bridge id)img;
-            if (pending) l.hidden = YES;   /* winios_window_frame decides */
+            if (pending) { l.hidden = YES; winios_sync_metal_hidden(key, l); }   /* winios_window_frame decides */
             else atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);
             g_surf_sizes[key] = [NSValue valueWithCGSize:CGSizeMake(sw, sh)];
             if (!pending && CGRectIsEmpty(l.frame)) {
@@ -1892,6 +2242,24 @@ static UIImage *winios_cursor_image(void) {
 static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
 static CGPoint g_cursor_pos_px;
 
+/* madeira-bcd: the game-mode dialog cursor. A game session draws no cursor:
+ * the finger is the pointer. Over a launcher or message box that the game-mode
+ * overlay draws, that left the owner looking for a pointer that was not there
+ * (Horizon Zero Dawn's warning box, build 469, log 13:57: the finger went down
+ * on the text, was dragged and lifted below the box, so nothing was clicked).
+ * While such a window is on screen the arrow (or the program's cursor image)
+ * is drawn where the finger last touched, which is where the click lands, and
+ * it goes away with the last such window or when the program hides its
+ * cursor. env.MADEIRA_GAME_DIALOG_CURSOR = 0 turns it off. */
+static BOOL g_game_cursor_seen;          /* a touch placed it since the overlay appeared */
+static BOOL g_game_cursor_prog_hidden;   /* the program hid its cursor */
+static _Atomic int g_game_cursor_drawn;  /* it is on screen; read off the main thread by winios_pointer */
+
+static int winios_game_cursor_enabled(void) {
+    const char *e = getenv("MADEIRA_GAME_DIALOG_CURSOR");
+    return !(e && *e == '0');
+}
+
 /* Both Wine bitmaps and the built-in fallback have a desktop-pixel size.
  * A fixed 21-point fallback grows relative to a 1080p desktop fitted into a
  * portrait view. Keep the arrow's shape and use a normal 32-pixel height. */
@@ -1906,11 +2274,14 @@ static void winios_forget_cursor_layer(void) {
     [g_cursor_layer removeFromSuperlayer];
     g_cursor_layer = nil;
     g_cur_w = g_cur_h = g_cur_hx = g_cur_hy = 0;
+    g_game_cursor_seen = NO;
+    g_game_cursor_prog_hidden = NO;
+    atomic_store_explicit(&g_game_cursor_drawn, 0, memory_order_relaxed);
 }
 
 /* main thread only */
 static void winios_ensure_cursor_layer(void) {
-    if (g_cursor_layer || !g_compositor_view || g_comp_game) return;
+    if (g_cursor_layer || !g_compositor_view || (g_comp_game && !winios_game_cursor_enabled())) return;
     UIImage *img = winios_cursor_image();
     g_cursor_layer = [CALayer layer];
     g_cursor_layer.zPosition = 10000;   /* above every window layer */
@@ -1918,6 +2289,7 @@ static void winios_ensure_cursor_layer(void) {
     g_cursor_layer.contents = (id)img.CGImage;
     g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
     g_cursor_layer.magnificationFilter = kCAFilterNearest;
+    if (g_comp_game) g_cursor_layer.hidden = YES;   /* winios_game_cursor_refresh shows it */
     [g_compositor_view.layer addSublayer:g_cursor_layer];
 }
 
@@ -1968,10 +2340,14 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
     if (w <= 0 || h <= 0 || !bgra) return;
     NSData *data = [NSData dataWithBytes:bgra length:(size_t)w * h * 4];
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!winios_desktop_session()) return;   /* game sessions: no drawn arrow */
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
+        if (!winios_desktop_session()) {   /* game sessions: only the dialog cursor */
+            if (!winios_game_cursor_enabled() || !g_comp_game || !g_compositor_view) return;
+        } else {
+            winios_ensure_compositor();
+            if (!g_compositor_view) return;
+        }
         winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
         CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs,
@@ -1988,12 +2364,66 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
         }
         CGDataProviderRelease(dp);
         CGColorSpaceRelease(cs);
+        winios_game_cursor_refresh();
     });
 }
 
 void winios_cursor_show(int show) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_comp_game) {   /* the dialog cursor shows only over a dialog */
+            g_game_cursor_prog_hidden = !show;
+            winios_game_cursor_refresh();
+            return;
+        }
         if (g_cursor_layer) g_cursor_layer.hidden = !show;
+    });
+}
+
+/* main thread only: a window the game-mode overlay draws (a launcher or a
+ * message box) is on screen. Its layers are the only ones in g_layers there;
+ * a game window parked off screen before it presents does not count. */
+static BOOL winios_game_dialog_visible(void) {
+    if (!g_compositor_view) return NO;
+    CGRect view = g_compositor_view.bounds;
+    for (CALayer *l in g_layers.allValues)
+        if (!l.hidden && CGRectIntersectsRect(l.frame, view)) return YES;
+    return NO;
+}
+
+/* main thread only: the game-mode cursor is drawn while a dialog is on screen,
+ * a touch has placed it and the program shows its cursor. */
+static void winios_game_cursor_refresh(void) {
+    if (!g_comp_game || !g_cursor_layer) return;
+    BOOL show = g_game_cursor_seen && !g_game_cursor_prog_hidden && winios_game_dialog_visible();
+    if (g_cursor_layer.hidden == !show) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g_cursor_layer.hidden = !show;
+    [CATransaction commit];
+    atomic_store_explicit(&g_game_cursor_drawn, show ? 1 : 0, memory_order_relaxed);
+    static unsigned said;
+    if (said++ < 8) {
+        fprintf(stderr, "[winios] game-mode dialog cursor %s (MADEIRA_GAME_DIALOG_CURSOR=0 turns it off)\n",
+                show ? "shown" : "hidden");
+        fflush(stderr);
+    }
+}
+
+/* A touch in a game session (desktop pixels, as posted to Wine): the dialog
+ * cursor goes where the finger is, while a dialog is on screen. */
+static void winios_game_cursor_touch(int x, int y) {
+    if (winios_desktop_session() || !winios_game_cursor_enabled()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_comp_game || !g_compositor_view || !winios_game_dialog_visible()) return;
+        winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
+        g_game_cursor_seen = YES;
+        g_cursor_pos_px = CGPointMake(x, y);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_cursor_place();
+        [CATransaction commit];
+        winios_game_cursor_refresh();
     });
 }
 
@@ -2001,6 +2431,13 @@ void winios_cursor_show(int show) {
  * engine owns the cursor position. */
 void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, flags, data);
+    /* a mouse or trackpad took over from the finger: its own cursor
+     * (HardwareInput's DirectCursorOverlay) is the one to see, not two */
+    if (atomic_load_explicit(&g_game_cursor_drawn, memory_order_relaxed))
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_game_cursor_seen = NO;
+            winios_game_cursor_refresh();
+        });
     /* ml641: ONLY an ABSOLUTE move carries a position. A relative move carries a
      * DELTA, so handing it to the cursor layer would fling the drawn arrow to the
      * top-left corner on every event. Relative mode is mouse-look, where the game

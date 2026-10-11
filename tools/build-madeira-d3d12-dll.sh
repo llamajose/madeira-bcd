@@ -52,21 +52,34 @@ scid_inputs() {
 }
 SCID=$(cd "$R" && scid_inputs | shasum -a 256 | cut -c1-16)
 echo "  shader cache converter identity $SCID"
-# madeira-bcd: the IPA build stamps it into Info.plist (MadeiraShaderCacheID);
-# the app exports it as MADEIRA_SC_ID, which wins over the compiled-in value,
-# so an update pack's DLL keeps the cache of the app it is installed into.
+# The IPA build prints it in its notices.
 echo "$SCID" > "$OUT/scid.txt"
-# MAD_PACK_ID (set by the workflow) names this build in the device log.
-PACKDEF=()
-[ -n "${MAD_PACK_ID:-}" ] && PACKDEF=(-DMAD_PACK_ID="\"$MAD_PACK_ID\"")
+# MAD_BUILD_ID (set by the workflow) names this build in the device log.
+BUILDDEF=()
+[ -n "${MAD_BUILD_ID:-}" ] && BUILDDEF=(-DMAD_BUILD_ID="\"$MAD_BUILD_ID\"")
 
 # madeira-bcd: helper kernels (mad_kernels.metal) as an embedded metallib. A
 # build without xcrun (or a failed compile) leaves them out; the runtime then
 # skips the draws that need them, as before.
 echo "=== helper kernels (metallib) ==="
 KDEF=""
+# madeira-bcd clear-rects: should its clear functions not compile, the file is
+# compiled again without them, so the other kernels never depend on them. The
+# typed-view-align texture-buffer probe goes first the same way.
+mad_kernels_metal() {
+    xcrun -sdk iphoneos metal -std=metal3.0 "$@" -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"
+}
 if command -v xcrun > /dev/null 2>&1 &&
-   xcrun -sdk iphoneos metal -std=metal3.0 -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"; then
+   { mad_kernels_metal ||
+     { echo "::warning::helper kernels: the first compile failed -- trying without the texture-buffer probe"
+       head -20 "$OUT/mad_kernels.err"
+       mad_kernels_metal -DMAD_NO_TEXBUF_PROBE; } ||
+     { echo "::warning::helper kernels: trying without the clear-rects functions"
+       head -20 "$OUT/mad_kernels.err"
+       mad_kernels_metal -DMAD_NO_CLEAR_RECTS; } ||
+     { echo "::warning::helper kernels: trying without the probe and the clear-rects functions"
+       head -20 "$OUT/mad_kernels.err"
+       mad_kernels_metal -DMAD_NO_TEXBUF_PROBE -DMAD_NO_CLEAR_RECTS; }; }; then
     (cd "$OUT" && xxd -i mad_kernels.metallib > mad_kernels_metallib.h)
     KDEF="-DMAD_HAVE_KERNELS"
     echo "  $(wc -c < "$OUT/mad_kernels.metallib" | tr -d ' ') bytes"
@@ -76,7 +89,7 @@ else
 fi
 
 echo "=== madeira_d3d12.dll (arm64ec) ==="
-"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall -DMAD_SC_CONVERTER_ID="\"$SCID\"" $KDEF ${PACKDEF[@]+"${PACKDEF[@]}"} \
+"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall -DMAD_SC_CONVERTER_ID="\"$SCID\"" $KDEF ${BUILDDEF[@]+"${BUILDDEF[@]}"} \
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$SRC/d3d12.def" \
     -I"$SRC" -I"$OUT" -I"$R/madeira-d3d12/src" -I"$R/dxmt/src/winemetal" \
     -L"$OUT" -lwinemetal -luuid -lole32 2> "$OUT/madeira_d3d12.err" \

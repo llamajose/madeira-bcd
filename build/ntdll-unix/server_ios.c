@@ -997,7 +997,17 @@ static void ios_guest_rip_profile( int gen )
         for (k = 0; k < tc && ntg < ML979_MAXTHREADS; k++) {
             arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
             uint64_t bb = 0;
+            pthread_t pt;
             if (tl[k] == self_port) continue;
+            /* madeira-bcd: look the pthread up BEFORE the suspend, as the ml876
+             * sampler does. pthread_from_mach_thread_np takes libpthread's thread
+             * list lock; a thread suspended while it held that lock (creating or
+             * ending a thread) was never resumed, because this profile blocked on
+             * the lock with the thread still suspended. Every later thread start
+             * and exit, the [xp] probe and the stack dumps then blocked behind it:
+             * RDR2 on build 476 froze at 16:55:52, the moment a profile began.
+             * Nothing between thread_suspend and thread_resume may take a lock. */
+            pt = pthread_from_mach_thread_np( tl[k] );
             if (thread_suspend( tl[k] ) != KERN_SUCCESS) continue;
             /* ml981: a guest thread is one whose frame yields a plausible RIP at
              * x28+0x18 -- the same test the sampling loop uses, so a thread can
@@ -1006,7 +1016,7 @@ static void ios_guest_rip_profile( int gen )
             if (thread_get_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
                 && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
                 && bb > 0x10000 && bb < 0x8000000000ull
-                && (teb_k = ios_ts_teb( pthread_from_mach_thread_np( tl[k] ) )))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
+                && (teb_k = ios_ts_teb( pt )))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
             {
                 if (!rp_teb) rp_teb = teb_k;
                 tg[ntg] = tl[k];
@@ -1705,6 +1715,252 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     }
 }
 
+/* madeira-bcd: [bg-qos] the launcher's processes leave the performance cores
+ * while the game presents. Every Wine thread runs at USER_INTERACTIVE
+ * (start_thread), so in build 442's GTA V gameplay SocialClubHelper.exe,
+ * dockhost.exe, RockstarService.exe and Launcher.exe took ~55 ms of P-core time
+ * per 320 ms [xp-t] sample next to the game's ~223, while the efficiency cores
+ * were ~86 % idle and ~2.7 threads waited for a core ([xp] run=). The [xp]
+ * sampler marks the game as presenting whenever its presenting thread (role P)
+ * ran in a sample; the threads of the processes named in MADEIRA_BG_QOS_PROCS
+ * then drop to QOS_CLASS_UTILITY at their next server call, and return to
+ * USER_INTERACTIVE once the game has not presented for IOS_BG_QOS_HOLD_NS.
+ * Not before the game has presented for MADEIRA_BG_QOS_DELAY_S (default 60 s):
+ * its first minute is when it talks to the launcher and Social Club (sign-in,
+ * entitlement), which must not slow down. Never the game's own process.
+ * Default list below; an empty value turns it off. Needs the [xp] sampler
+ * (MADEIRA_PROBES not 0). */
+#include <pthread/qos.h>
+#define IOS_BG_QOS_HOLD_NS (2000ull * 1000 * 1000)
+static volatile uint64_t ios_bg_game_seen_ns;   /* 0: no game has presented */
+static volatile uint64_t ios_bg_game_since_ns;  /* when this run of presents began */
+static volatile uint32_t ios_bg_game_pid;
+static unsigned long ios_bg_qos_moves;
+static uint64_t ios_bg_qos_delay_ns;
+
+static uint64_t ios_bg_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static char ios_bg_qos_names[512];   /* lower-case, ';'-separated */
+static pthread_key_t ios_bg_qos_key;     /* per thread: 0 unknown, 1 not listed, 3 listed, 7 listed and demoted */
+static int ios_bg_qos_key_ok;
+static pthread_once_t ios_bg_qos_once = PTHREAD_ONCE_INIT;
+static void ios_bg_qos_init( void );
+
+/* the [xp] sampler saw the game's presenting thread run */
+static void ios_bg_game_note( uint32_t pid, uint32_t wtid )
+{
+    uint64_t now = ios_bg_now_ns(), last;
+
+    if (!pid) return;
+    last = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_RELAXED );
+    if (__atomic_exchange_n( &ios_bg_game_pid, pid, __ATOMIC_RELAXED ) != pid)
+    {
+        pthread_once( &ios_bg_qos_once, ios_bg_qos_init );
+        __atomic_store_n( &ios_bg_game_since_ns, now, __ATOMIC_RELAXED );
+        wine_log_write( "[bg-qos] the game is process %04x (presenting thread %04x); %s run at utility QoS once "
+                        "it has presented for %llu s (MADEIRA_BG_QOS_PROCS, MADEIRA_BG_QOS_DELAY_S)", (unsigned)pid,
+                        (unsigned)wtid, ios_bg_qos_key_ok ? ios_bg_qos_names : "nothing (off)",
+                        (unsigned long long)(ios_bg_qos_delay_ns / 1000000000ull) );
+    }
+    else if (!last || now - last >= IOS_BG_QOS_HOLD_NS)
+        __atomic_store_n( &ios_bg_game_since_ns, now, __ATOMIC_RELAXED );   /* presents resumed */
+    __atomic_store_n( &ios_bg_game_seen_ns, now, __ATOMIC_RELEASE );   /* publishes since and pid */
+}
+
+static void ios_bg_qos_init( void )
+{
+    /* ';'-separated exe names demoted to utility QoS while the game presents; empty = off */
+    const char *e = getenv( "MADEIRA_BG_QOS_PROCS" );
+    size_t i;
+
+    if (!e) e = "SocialClubHelper.exe;Launcher.exe;RockstarService.exe;dockhost.exe";
+    for (i = 0; e[i] && i < sizeof(ios_bg_qos_names) - 1; i++)
+        ios_bg_qos_names[i] = (e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i];
+    ios_bg_qos_names[i] = 0;
+    {
+        /* seconds the game must present before the listed processes are demoted (default 60) */
+        const char *d = getenv( "MADEIRA_BG_QOS_DELAY_S" );
+        unsigned long s = d && *d ? strtoul( d, NULL, 10 ) : 60;
+        ios_bg_qos_delay_ns = (uint64_t)(s > 86400 ? 86400 : s) * 1000000000ull;
+    }
+    /* a TSD slot, not __thread: its first use allocates nothing */
+    ios_bg_qos_key_ok = ios_bg_qos_names[0] && !pthread_key_create( &ios_bg_qos_key, NULL );
+}
+
+/* Is the calling thread's process on the list? (its PEB's image name) */
+static int ios_bg_qos_listed_self( void )
+{
+    TEB *teb = NtCurrentTeb();
+    RTL_USER_PROCESS_PARAMETERS *pp = teb && teb->Peb ? teb->Peb->ProcessParameters : NULL;
+    const WCHAR *path;
+    const char *n;
+    size_t len, base = 0, k;
+
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (n = ios_bg_qos_names; *n; )
+    {
+        size_t m = 0;
+        while (n[m] && n[m] != ';') m++;
+        if (m && m == len - base)
+        {
+            for (k = 0; k < m; k++)
+            {
+                WCHAR c = path[base + k];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)(unsigned char)n[k]) break;
+            }
+            if (k == m) return 1;
+        }
+        n += m;
+        if (*n == ';') n++;
+    }
+    return 0;
+}
+
+/* At each server call: move this thread between utility and user-interactive. */
+static inline void ios_bg_qos_check( void )
+{
+    uint64_t seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_ACQUIRE );
+    uintptr_t st;
+    int want;
+
+    if (!seen) return;   /* no game has presented yet, so nothing was ever demoted */
+    pthread_once( &ios_bg_qos_once, ios_bg_qos_init );
+    if (!ios_bg_qos_key_ok) return;
+    if (!(st = (uintptr_t)pthread_getspecific( ios_bg_qos_key )))
+    {
+        st = ios_bg_qos_listed_self() ? 3 : 1;
+        pthread_setspecific( ios_bg_qos_key, (void *)st );
+    }
+    if (st == 1) return;
+    {
+        /* both stamps before the clock: the sampler stores a stamp after reading its
+         * clock, so one we loaded can never be later than our own `now` */
+        uint64_t since = __atomic_load_n( &ios_bg_game_since_ns, __ATOMIC_RELAXED );
+        uint64_t now = ios_bg_now_ns();
+        want = now - seen < IOS_BG_QOS_HOLD_NS && now - since >= ios_bg_qos_delay_ns &&
+               HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) != __atomic_load_n( &ios_bg_game_pid, __ATOMIC_RELAXED );
+    }
+    if (want == (st == 7)) return;
+    if (pthread_set_qos_class_self_np( want ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0 ))
+    {
+        pthread_setspecific( ios_bg_qos_key, (void *)(uintptr_t)1 );   /* refused (fixed priority): leave it */
+        return;
+    }
+    pthread_setspecific( ios_bg_qos_key, (void *)(uintptr_t)(want ? 7 : 3) );
+    {
+        unsigned long n = __atomic_add_fetch( &ios_bg_qos_moves, 1, __ATOMIC_RELAXED );
+        if (n <= 24 || !(n % 256))
+            wine_log_write( "[bg-qos] #%lu process %04x thread %04x -> %s", n,
+                            (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
+                            (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                            want ? "utility (the game presents)" : "user-interactive (the game stopped presenting)" );
+    }
+}
+
+/* madeira-bcd: [xp-t] shows a native thread (no TEB) as m<thread id> only,
+ * and in build 442 two of them were 30-50 ms a sample with nothing to say what
+ * they were. Name each once, the first time it is busy enough to be listed. */
+static void ios_xp_name_native( pthread_t pt, uint64_t tid )
+{
+    static uint64_t named[128];
+    static int n;
+    char name[64] = "";
+    int i;
+
+    for (i = 0; i < n; i++) if (named[i] == tid) return;
+    if (n == (int)(sizeof(named) / sizeof(named[0]))) return;
+    named[n++] = tid;
+    pthread_getname_np( pt, name, sizeof(name) );
+    wine_log_write( "[xp-names] m%llu \"%s\"", (unsigned long long)tid, name[0] ? name : "(unnamed)" );
+}
+
+/* madeira-bcd: CPU power governor (opt-in: env.MADEIRA_POWER_GOV_MW = target in mW).
+ * The SoC clamps the CPU once a budget of energy spent above ~2.3 W is used up:
+ * ml1133 (sync.c, above ios_eco_gen) measured ~250 J in six runs within 3 %, and in
+ * builds 442/447 (2026-10-08) GTA V Enhanced was clamped at the start of play to P
+ * 1.31 / E 1.70 GHz and 0.5-0.9 W of process CPU power, 404-462 J into the session,
+ * after loading screens at 3-5 W. Bursting and then running clamped wastes the budget,
+ * so while a game presents this holds the process's CPU power ([xp]'s ri_energy_nj)
+ * at the target on average: a running balance of (power - target) x time turns ECO on
+ * (guest threads at utility QoS: efficiency cores, lower clocks) when it exceeds
+ * +MADEIRA_POWER_GOV_BAND_MJ (default 1000) and off when it falls below -BAND, at most
+ * one switch per 500 ms. When no game presents, ECO goes back to what it was before.
+ * [power-gov] summarises every 10 s. */
+extern void madeira_set_eco( int on );
+extern int madeira_get_eco( void );
+
+static void ios_power_gov_step( uint64_t now, double dt_ms, double mj )
+{
+    static int target_mw = -1, band_mj, base, active;
+    static double balance, sum_mj, sum_ms, eco_ms;
+    static unsigned switches;
+    static uint64_t last_switch, last_report;
+    uint64_t seen;
+    int eco;
+
+    if (target_mw < 0)
+    {
+        const char *e = getenv( "MADEIRA_POWER_GOV_MW" );   /* process CPU power target (mW) while a game presents; unset/0 = off */
+        const char *b = getenv( "MADEIRA_POWER_GOV_BAND_MJ" );   /* energy (mJ) the running balance may drift before ECO switches (1000) */
+        target_mw = e ? atoi( e ) : 0;
+        if (target_mw < 0 || target_mw > 20000) target_mw = 0;
+        band_mj = b ? atoi( b ) : 1000;
+        if (band_mj < 50 || band_mj > 100000) band_mj = 1000;
+        if (target_mw)
+            wine_log_write( "[power-gov] on: process CPU power held at %d mW while a game presents (band %d mJ; "
+                            "MADEIRA_POWER_GOV_MW, MADEIRA_POWER_GOV_BAND_MJ)", target_mw, band_mj );
+    }
+    if (!target_mw || dt_ms <= 0) return;
+    seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_ACQUIRE );
+    if (!seen || now - seen >= IOS_BG_QOS_HOLD_NS)
+    {
+        if (active)   /* the game stopped presenting: ECO back to what it was */
+        {
+            active = 0;
+            if (madeira_get_eco() != base) madeira_set_eco( base );
+            wine_log_write( "[power-gov] the game stopped presenting: ECO back %s", base ? "on" : "off" );
+        }
+        return;
+    }
+    eco = madeira_get_eco();   /* re-read: the ECO pill may have moved it */
+    if (!active)
+    {
+        active = 1;
+        base = eco;
+        balance = sum_mj = sum_ms = eco_ms = 0;
+        switches = 0;
+        last_switch = last_report = now;
+    }
+    balance += mj - target_mw * dt_ms / 1000.0;
+    if (balance > 3.0 * band_mj) balance = 3.0 * band_mj;     /* a long burst buys no long ECO stretch */
+    if (balance < -3.0 * band_mj) balance = -3.0 * band_mj;   /* nor a long idle stretch a long burst */
+    sum_mj += mj;
+    sum_ms += dt_ms;
+    if (eco) eco_ms += dt_ms;
+    if (now - last_switch >= 500000000ull && ((!eco && balance > band_mj) || (eco && balance < -band_mj)))
+    {
+        madeira_set_eco( !eco );
+        last_switch = now;
+        switches++;
+    }
+    if (now - last_report >= 10000000000ull && sum_ms > 0)
+    {
+        wine_log_write( "[power-gov] last %.0f s: %.2f W average (target %.2f W), ECO on %.0f%% of the time, %u switches",
+                        sum_ms / 1000.0, sum_mj / sum_ms, target_mw / 1000.0, 100.0 * eco_ms / sum_ms, switches );
+        last_report = now;
+        sum_mj = sum_ms = eco_ms = 0;
+        switches = 0;
+    }
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -1768,10 +2024,17 @@ static void ios_xprobe_main( void )
                                 uint64_t teb = pt_ ? ios_ts_teb( pt_ ) : 0; uint32_t w = 0;
                                 if (teb) ios_ts_read( teb + 0x48, &w, 4 );
                                 r->tid = idi.thread_id; r->wtid = w; r->p_ms = pt; r->e_ms = et;
+                                if (!w && pt_ && pt + et >= 2.0) ios_xp_name_native( pt_, idi.thread_id );
                                 r->p_ghz = pt > 0 ? pcy / (pt * 1e6) : 0; r->e_ghz = et > 0 ? ecy / (et * 1e6) : 0;
                                 r->minst = (double)((cur[0].instr - pv->c[0].instr) + (cur[1].instr - pv->c[1].instr)) / 1e6;
                                 r->role = NULL;
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
+                                if (r->role && strchr( r->role, 'P' ) && teb && pt + et >= 1.0)
+                                {
+                                    uint32_t gp = 0;
+                                    ios_ts_read( teb + 0x40, &gp, 4 );   /* ClientId.UniqueProcess */
+                                    ios_bg_game_note( gp, w );
+                                }
                                 if (r->role && teb && (strchr( r->role, 'P' ) || strchr( r->role, 'E' ))) ios_xp_game_teb = teb;   /* ml1131 */
                                 if (teb && !ios_xp_nroles) ios_xp_fallback_add( teb, pt + et );   /* ml1131c */
                                 sum_thr_ms += pt + et; nrows++;
@@ -1800,6 +2063,7 @@ static void ios_xprobe_main( void )
             double pcy = (double)(ru.ri_pcycles - pru.ri_pcycles), cy = (double)(ru.ri_cycles - pru.ri_cycles);
             double ins = (double)(ru.ri_instructions - pru.ri_instructions);
             double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
+            ios_power_gov_step( ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6 );
             gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );
             snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
             n = snprintf( line, sizeof(line),
@@ -2219,14 +2483,17 @@ unsigned int server_call_unlocked( void *req_ptr )
 #ifdef WINE_IOS
     /* killed inside a section (ios_defer_section_abort): no more requests */
     if (ios_section_state() & IOS_SECTION_ABORT) return STATUS_THREAD_IS_TERMINATING;
+    ios_bg_qos_check();   /* madeira-bcd: [bg-qos] */
 #endif
     if ((ret = send_request( req ))) return ret;
     /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
      * tick sleep so the request is picked up in ~50us instead of waiting
      * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
     {
-        extern void ios_wineserver_wake(void);
-        ios_wineserver_wake();
+        /* madeira-bcd doorbell: name the thread, so the loop reads only its
+         * request fd (fd_ios.c ios_srv_bell); a ring also wakes the loop */
+        extern void ios_wineserver_ring( unsigned int tid );
+        ios_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
     }
     return wait_reply( req );
 }
@@ -4927,6 +5194,11 @@ void server_init_process_done(void)
                 mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
                 kern_return_t kr = thread_get_state(wine_mach_thread, ARM_THREAD_STATE64,
                                                     (thread_state_t)&state, &state_count);
+                /* madeira-bcd: resume before logging. wine_log_write allocates and
+                 * crosses into Swift (locks); a thread suspended inside malloc or
+                 * the log store would never be resumed. The guest-stack reads below
+                 * are vm_read_overwrite of memory, which needs no suspend. */
+                thread_resume(wine_mach_thread);
                 if (kr == KERN_SUCCESS) {
                     wine_log_write("[Wine WATCHDOG %ds] PC=0x%llx LR=0x%llx SP=0x%llx FP=0x%llx",
                         secs,
@@ -5026,8 +5298,6 @@ void server_init_process_done(void)
                 } else {
                     wine_log_write("[Wine WATCHDOG %ds] thread_get_state failed: %d", secs, kr);
                 }
-
-                thread_resume(wine_mach_thread);
             };
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),

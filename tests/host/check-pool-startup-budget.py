@@ -62,6 +62,7 @@ static size_t ios_jit_low_size_global, ios_jit_pool_size_global;
 static volatile size_t ios_jit_low_reserved;
 static size_t jit_pool_offset, ios_jit_tail_reserved, ios_pool_head_reserve;
 static size_t ios_jit_hole_off_eff, ios_jit_hole_end_eff;
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;
 static int ios_jit_low_full_logged, wow, lose_race;
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -92,6 +93,7 @@ static void reset(void *memory)
     ios_jit_pool_size_global = 864 * MB;
     jit_pool_offset = 600 * MB;
     ios_jit_tail_reserved = ios_jit_hole_off_eff = ios_jit_hole_end_eff = 0;
+    ios_jit_hole2_off = ios_jit_hole2_end = 0;
     ios_pool_head_reserve = 128 * MB;
     ios_jit_low_full_logged = wow = lose_race = 0;
     ios_tail_carve_n = 1;
@@ -216,8 +218,9 @@ assert 'b + size > ceiling' in take and 'gapHitsWindow' in take
 assert 'VM_FLAGS_OVERWRITE' not in take
 low = function(swift, 'private static func takeLowRegion(', '\n    }')
 assert 'Int(marginText) ?? 128' in low
-assert 'let available = best.map { $0.size > margin ? $0.size - margin : 0 } ?? 0' in low
-assert 'let size = poolRunSize(available: available, wanted: available, pageFit: pageFit)' in low
+assert 'let available = r.size > keep ? r.size - keep : 0' in low
+assert 'poolRunSize(available: available, wanted: available, pageFit: pageFit)' in low
+assert 'runs.contains(where: { $0.base < r.base && $0.size >= margin }) ? 0 : margin' in low
 assert 'guard let best = best, size >= 64 << 20' in low
 assert 'exeWindow: (exeWinBase, exeWinSize), pageFit: pageFit)' in swift
 allocator = (root / 'app/Madeira/JITAllocator.c').read_text()

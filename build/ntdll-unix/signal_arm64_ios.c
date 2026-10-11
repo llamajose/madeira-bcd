@@ -34,11 +34,14 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
 #ifdef WINE_IOS
 #include <dlfcn.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 
 /* iOS-Madeira ml674: XZR/WZR AS A STORE SOURCE MUST READ ZERO.
  *
@@ -1439,6 +1442,33 @@ static int ios_x18_derived_base( uint64_t fault_pc, int rn )
  * ran and hit the 4096MB jetsam limit four seconds later. Pages mincore()
  * reports neither resident nor paged out were never written; they stay holes,
  * so file offsets still equal pool offsets (head copies and tail CodeBuffers). */
+/* madeira-bcd: the dump is opt-in now. A mach UNHANDLED is any fault the handler
+ * passes on to Wine's own exception path, i.e. every guest access violation a game
+ * or the Rockstar Games Launcher catches itself, so the old default fired in every
+ * licensed session long before anything failed (build 460, log 2026-10-08
+ * 23:59:11: the launcher's first one, at start-up) and wrote ~930 MB of pool to
+ * Documents each time, for a file too large to send. */
+static int ios_jit_dump_enabled( void )
+{
+    /* 1: write Documents/fex-jit-dump.bin (the JIT pool, sparse) on the first mach UNHANDLED / SIGILL (ml1242); default 0. */
+    const char *jd = getenv( "MADEIRA_JIT_DUMP" );
+    return jd && jd[0] == '1';
+}
+
+/* Without the switch, remove a dump an earlier session left in Documents. */
+static void ios_jit_dump_remove_stale( void )
+{
+    const char *docs = getenv( "MADEIRA_DOCS_DIR" );
+    char path[512];
+    struct stat st;
+
+    if (ios_jit_dump_enabled() || !docs || !*docs) return;
+    if (snprintf( path, sizeof(path), "%s/fex-jit-dump.bin", docs ) >= (int)sizeof(path)) return;
+    if (stat( path, &st ) || unlink( path )) return;
+    dprintf( 2, "[jit-dump] removed %s (%lld MB) left by an earlier session; MADEIRA_JIT_DUMP=1 writes it again\n",
+             path, (long long)(st.st_size >> 20) );
+}
+
 static void ios_dump_jit_pool( const char *why )
 {
     extern void *ios_jit_rw_base_global;
@@ -1449,10 +1479,7 @@ static void ios_dump_jit_pool( const char *why )
     char path[512], vec[256];   /* one byte per page of a 1MB chunk, down to 4KB pages */
     int fd;
 
-    const char *jd = getenv( "MADEIRA_JIT_DUMP" );
-    /* 0: no Documents/fex-jit-dump.bin; by default the JIT pool is written (sparse) on the
-     * first mach UNHANDLED / SIGILL, and pulled with the log (ml1242) */
-    if ((jd && jd[0] == '0') || !ios_jit_rw_base_global || !total) return;
+    if (!ios_jit_dump_enabled() || !ios_jit_rw_base_global || !total) return;
     docs = getenv( "MADEIRA_DOCS_DIR" );
     snprintf( path, sizeof(path), "%s/fex-jit-dump.bin", docs ? docs : "/tmp" );
     if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 )) < 0)
@@ -1498,6 +1525,7 @@ static void *ios_mach_exception_thread( void *arg )
     pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
 
     ios_exc_thread_alive = 1;
+    ios_jit_dump_remove_stale();
 
     for (;;)
     {
@@ -2359,6 +2387,17 @@ static void *ios_mach_exception_thread( void *arg )
                                              "hottest in the last 100000:%s\n", total, n ? line : " (none above 50)" );
                                     memset( top, 0, sizeof(top) );
                                 }
+                            }
+                            /* madeira-bcd: an EC import stub that reached this
+                             * PE address through check_icall gets the copy
+                             * address in its AuxiliaryIAT slot, so its next
+                             * call does not fault (virtual_ios.c aux-IAT heal) */
+                            {
+                                extern int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr,
+                                                                 void *thread_peb, uintptr_t jit_pc );
+                                ios_jit_heal_aux_iat( (uintptr_t)fault_pc,
+                                                      (uintptr_t)__darwin_arm_thread_state64_get_lr(state),
+                                                      fault_owner_peb, (uintptr_t)jit_pc );
                             }
                             __darwin_arm_thread_state64_set_pc_fptr(state, jit_pc);
                             ios_exc_x18_fixes++;
@@ -7526,6 +7565,11 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
  * declared here because the Mach path must run the SAME emulator — see the
  * [unaligned-atomic] block below for why the two paths may not disagree. */
 static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, uintptr_t addr);
+/* madeira-bcd: the same for an ordered/exclusive/LSE access in the app's own
+ * code, which FEX cannot handle (defined after ios_emulate_store_rel); the
+ * executable's __TEXT bounds it checks, filled on first use. */
+static int ios_native_unaligned_emulate( ucontext_t *ctx, uint32_t insn, uintptr_t addr, uint64_t pc );
+static uint64_t ios_app_text_lo, ios_app_text_hi;
 
 static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
                                                    arm_neon_state64_t *neon, int have_neon,
@@ -7874,6 +7918,26 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                                 "handled by emulation (plain ld/st) emu=%lu to-fex=%lu rev=2026-09-19\n",
                              (unsigned long long)pc, a_insn, (unsigned long long)fault_addr,
                              ua_emu, ua_fex );
+                return 1;
+            }
+            /* madeira-bcd: an ordered/exclusive/LSE access in the app's own code
+             * (ios_native_unaligned_emulate: the Launcher's `stlr` of build 454).
+             * dladdr names the function for the first few. */
+            if (ios_native_unaligned_emulate( &uc, a_insn, fault_addr, (uint64_t)pc ))
+            {
+                static unsigned long ua_native;
+                PC_sig(&uc) += 4;
+                *state = mc.__ss;
+                if (++ua_native <= 16 || (ua_native % 4096) == 0)
+                {
+                    Dl_info di = { 0 };
+                    const char *fn = dladdr( (const void *)(uintptr_t)pc, &di ) && di.dli_sname ? di.dli_sname : "?";
+                    uint64_t at = di.dli_saddr && fn[0] != '?' ? (uint64_t)pc - (uint64_t)(uintptr_t)di.dli_saddr : 0;
+                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx, %s+0x%llx) insn=0x%08x "
+                                "addr=0x%llx emulated in place, not handed to FEX (#%lu)\n",
+                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo), fn,
+                             (unsigned long long)at, a_insn, (unsigned long long)fault_addr, ua_native );
+                }
                 return 1;
             }
 
@@ -11760,6 +11824,81 @@ static int ios_emulate_store_rel( ucontext_t *ctx, uint32_t insn, uintptr_t addr
     return 0;
 }
 
+/***********************************************************************
+ *		ios_native_unaligned_emulate                    (madeira-bcd)
+ *
+ * An alignment fault in the app's OWN code (the Madeira executable's __TEXT:
+ * the unix side, DXMT's native half, the app itself), not in FEX's
+ * translations or a PE image. GTA V Enhanced's Rockstar Games Launcher died
+ * on build 454 twice in a row (logs 2026-10-08 15:41:42 and 15:44:14): a
+ * launcher thread ran `stlr w21, [x19]` (0x889ffe75) at Madeira+0xb5310c on
+ * 0x14dac5b3f, then 0x118c86bcf -- a 4-byte release store that crosses a
+ * 16-byte boundary, which faults even with LSE2. Both delivery paths handed
+ * it to FEX as 80000002 ("[unaligned-atomic] mach-path ... to-fex",
+ * "[unaligned-guest] REFUSED-OTHER"); FEX took the pc for guest code (NoExec
+ * at pc+4), the thread raised c0000005, the Launcher exited and PlayGTAV.exe
+ * showed its "Error" box, so the game never started. FEX's unaligned machinery
+ * only knows its own code; for ours it can only fail.
+ *
+ * Here the access is done byte-wise between two full barriers and the thread
+ * goes on at the next instruction: the release store, the acquire load, the
+ * exclusive pair (the store always succeeds, as in ios_emulate_store_rel) and
+ * the LSE read-modify-write family, none with base-register writeback. A
+ * crossing access cannot be single-copy atomic on ARM anyway; x86, whose
+ * pointers these are, does not promise it either. Returns 1 when emulated.
+ * FEX's translations keep their own path: the pc must lie in the executable's
+ * __TEXT. Safe on the exception-server thread: no wine log macros, and the
+ * __TEXT bounds are read from the loaded Mach-O header once. */
+static int ios_pc_in_app_text( uint64_t pc )
+{
+    if (!__atomic_load_n( &ios_app_text_hi, __ATOMIC_ACQUIRE ))
+    {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header( 0 );
+        unsigned long size = 0;
+        uint8_t *text = mh ? getsegmentdata( mh, "__TEXT", &size ) : NULL;
+
+        if (!text || !size) return 0;
+        ios_app_text_lo = (uint64_t)(uintptr_t)text;
+        __atomic_store_n( &ios_app_text_hi, (uint64_t)(uintptr_t)text + size, __ATOMIC_RELEASE );
+    }
+    return pc >= ios_app_text_lo && pc < __atomic_load_n( &ios_app_text_hi, __ATOMIC_RELAXED );
+}
+
+/* The load side of the ordered and exclusive accesses: LDAR, LDLAR, LDAXR,
+ * LDXR, LDAPR (RCpc) and LDAPUR (LRCPC2, zero-extending). Rt gets the value
+ * zero-extended, as the instructions do. */
+static int ios_emulate_load_acq( ucontext_t *ctx, uint32_t insn, uintptr_t addr )
+{
+    const int rt = insn & 0x1F;
+    const int nbytes = 1 << ((insn >> 30) & 3);
+    uint64_t v = 0;
+
+    if ((insn & 0x3FFFFC00) == 0x08DFFC00 ||     /* LDAR*  */
+        (insn & 0x3FFFFC00) == 0x08DF7C00 ||     /* LDLAR* */
+        (insn & 0x3FFFFC00) == 0x085FFC00 ||     /* LDAXR* */
+        (insn & 0x3FFFFC00) == 0x085F7C00 ||     /* LDXR*  */
+        (insn & 0x3FFFFC00) == 0x38BFC000 ||     /* LDAPR* */
+        (insn & 0x3FE00C00) == 0x19400000)       /* LDAPUR* */
+    {
+        memcpy( &v, (const void *)addr, nbytes );
+        if (rt != 31) REGn_sig(rt, ctx) = v;
+        return 1;
+    }
+    return 0;
+}
+
+static int ios_native_unaligned_emulate( ucontext_t *ctx, uint32_t insn, uintptr_t addr, uint64_t pc )
+{
+    int done;
+
+    if (!insn || !ios_pc_in_app_text( pc )) return 0;
+    if ((insn & 0x3E000000) == 0x2C000000) return 0;   /* SIMD pairs: writeback forms, not ours */
+    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+    done = ios_emulate_store_rel( ctx, insn, addr ) || ios_emulate_load_acq( ctx, insn, addr );
+    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+    return done;
+}
+
 /*
  * Apply base-register writeback for the pre/post-index forms, in the GUEST
  * (sub-floor) domain -- Rn holds a low address and must keep holding one.
@@ -13110,6 +13249,22 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         ERR("[unaligned-guest] emulated insn=0x%08x addr=%p pc=%p "
                             "(emu=%lu simd=%lu other=%lu) rev=ml498\n",
                             a_insn, siginfo->si_addr, pc, ua_emu_n, ua_simd_n, ua_other_n);
+                    PC_sig(bus_ctx) += 4;
+                    ios_fixup_x18_for_return( bus_ctx );
+                    return;
+                }
+                /* madeira-bcd: an ordered/exclusive/LSE access in the app's own
+                 * code -- ios_native_unaligned_emulate (the Launcher's `stlr` of
+                 * build 454, which FEX took for guest code). */
+                if (ios_native_unaligned_emulate( bus_ctx, a_insn, (uintptr_t)siginfo->si_addr,
+                                                  (uint64_t)(uintptr_t)pc ))
+                {
+                    static unsigned long ua_native_sig;
+                    if (++ua_native_sig <= 16 || (ua_native_sig % 4096) == 0)
+                        ERR("[unaligned-native] signal-path pc=%p (app+0x%llx) insn=0x%08x addr=%p "
+                            "emulated in place, not handed to FEX (#%lu)\n", pc,
+                            (unsigned long long)((uint64_t)(uintptr_t)pc - ios_app_text_lo), a_insn,
+                            siginfo->si_addr, ua_native_sig);
                     PC_sig(bus_ctx) += 4;
                     ios_fixup_x18_for_return( bus_ctx );
                     return;

@@ -20,9 +20,11 @@ import Combine
 // madeira.cfg turns it off.
 // ============================================================================
 
-/// Thermal state, Low Power Mode and screen capture every 10 s while a session
-/// runs: the three device conditions that explain a slow run in a log.
-/// MADEIRA_DEVICE_STATS=0 turns the line off.
+/// Thermal state, Low Power Mode, screen capture, battery and brightness every
+/// 10 s while a session runs: the device conditions that explain a slow run in
+/// a log (447: the CPU was held at 1.31/1.70 GHz from the start of play with
+/// thermal=nominal; charging and screen recording also draw from the power
+/// budget). MADEIRA_DEVICE_STATS=0 turns the line off.
 enum DeviceLoadDiagnostics {
     private static var lastReport = 0.0
     private static var timer: Timer?
@@ -30,6 +32,7 @@ enum DeviceLoadDiagnostics {
     /// session is a diagnostic, so it is off by default.
     static func start() {
         guard timer == nil, MadeiraConfig.flag("MADEIRA_DEVICE_STATS", fallback: false) else { return }
+        UIDevice.current.isBatteryMonitoringEnabled = true
         let value = Timer(timeInterval: 10, repeats: true) { _ in report() }
         timer = value
         RunLoop.main.add(value, forMode: .common)
@@ -41,7 +44,18 @@ enum DeviceLoadDiagnostics {
         lastReport = now
         let process = ProcessInfo.processInfo
         let thermal = thermalName(process.thermalState)
-        fputs("[device-load] thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0)\n", stderr)
+        let device = UIDevice.current
+        if !device.isBatteryMonitoringEnabled { device.isBatteryMonitoringEnabled = true }   // the HUD turns it off when it closes
+        let level = device.batteryLevel < 0 ? "?" : String(Int((device.batteryLevel * 100).rounded()))
+        let battery: String
+        switch device.batteryState {
+        case .charging: battery = "charging"
+        case .full: battery = "full"
+        case .unplugged: battery = "unplugged"
+        default: battery = "unknown"
+        }
+        fputs("[device-load] thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0) "
+              + "battery=\(level)% \(battery) brightness=\(String(format: "%.2f", UIScreen.main.brightness))\n", stderr)
     }
     static func thermalName(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
@@ -685,6 +699,20 @@ final class LibraryModel: ObservableObject {
             }
         }
         resetPhoneResolution()
+        applyRecommendations()
+    }
+
+    /// madeira-bcd: games already in the library get Madeira's recommended settings
+    /// when they are due (GameRecommendationsApply.swift); the entries' own fields
+    /// are saved here.
+    private func applyRecommendations() {
+        guard !readOnly else { return }
+        var next = entries
+        var changed = false
+        for i in next.indices {
+            if GameRecommendations.prepare(&next[i]) { changed = true }
+        }
+        if changed { persist(next) }
     }
 
     /// ml1172: every new entry used to get 1408x648, a 19.5:9 phone's shape.
@@ -719,6 +747,10 @@ final class LibraryModel: ObservableObject {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
         var next = entries
         var entry = entry
+        // madeira-bcd: a game seen for the first time gets Madeira's recommended settings
+        // (GameRecommendationsApply.swift): a finished Steam download, a new or saved entry.
+        let isNew = !next.contains { $0.id == entry.id || (entry.steamAppID != nil && $0.steamAppID == entry.steamAppID) }
+        GameRecommendations.prepare(&entry, new: isNew)
         // A Steam game has one entry: a details page opened before its card first saved
         // one (refreshSteamMetadata) updates that entry.
         if let i = next.firstIndex(where: { $0.id == entry.id }) ??
@@ -2744,7 +2776,8 @@ struct LibraryView: View {
         }
         .sheet(isPresented: $browser) {
             NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
-                model.save(entry); browser = false; selected = entry
+                // madeira-bcd: the page shows the entry as stored, with its recommended settings.
+                model.save(entry); browser = false; selected = model.entries.first { $0.id == entry.id } ?? entry
             } }
         }
         .sheet(item: $selected) { entry in
@@ -2883,6 +2916,10 @@ struct LibraryDetail: View {
     @State private var bcd = BCDGameValues()
     @State private var findCover = false
     @State private var remove = false
+    /// madeira-bcd: Madeira's recommended settings for this game, nil for none
+    /// (GameRecommendations.swift), and the question before Reset to Recommended.
+    @State private var recommended: GameRecommendation?
+    @State private var confirmReset = false
     @State private var leaving = false
     @State private var error: String?
     @State private var copiedLink = false
@@ -2931,6 +2968,20 @@ struct LibraryDetail: View {
         entry.avx = nil; entry.reportNVIDIA = nil; entry.frameGeneration = nil; entry.metalFXUpscale = nil; entry.config = nil
         model.save(entry)
         LogStore.shared.log("[bcd] \(entry.title): moved \(moved.joined(separator: ",")) into the game's own settings")
+    }
+    /// madeira-bcd: a game seen for the first time gets Madeira's recommended settings,
+    /// which this page then shows (GameRecommendationsApply.swift).
+    private func prepareRecommendation() {
+        recommended = GameRecommendations.recommendation(for: entry)
+        // A copy the library has not stored (a Steam game's first page) is a new entry.
+        let isNew = !model.entries.contains { $0.id == entry.id }
+        if GameRecommendations.prepare(&entry, new: isNew) { model.save(entry) }
+    }
+    /// Reset to Recommended: the recommendation's config and switches, written at once.
+    private func resetToRecommended() {
+        recommended = GameRecommendations.reset(&entry)
+        model.save(entry)
+        reloadBCD()
     }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
@@ -3232,6 +3283,17 @@ struct LibraryDetail: View {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                     Section { Button("Remove from library", role: .destructive) { remove = true } }
                 }
+                // madeira-bcd: always last, for every game (GameRecommendationsApply.swift).
+                if entry.desktop != true {
+                    Section {
+                        Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
+                            .confirmationDialog(GameRecommendations.question(recommended), isPresented: $confirmReset, titleVisibility: .visible) {
+                                Button("Reset", role: .destructive) { resetToRecommended() }
+                            }
+                    } footer: {
+                        Text(GameRecommendations.note(recommended))
+                    }
+                }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
             }
             .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
@@ -3259,10 +3321,10 @@ struct LibraryDetail: View {
             .task {
                 if entry.graphicsAPI == nil, entry.desktop != true, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
             }
-            .onAppear { migrateEntryOptions(); reloadBCD() }
+            .onAppear { migrateEntryOptions(); prepareRecommendation(); reloadBCD() }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
-                guard !leaving, !findCover, !importCover, !remove else { return }
+                guard !leaving, !findCover, !importCover, !remove, !confirmReset else { return }
                 if command == "back" { model.save(entry); dismiss() }
                 if command == "accept" { start() }
             }

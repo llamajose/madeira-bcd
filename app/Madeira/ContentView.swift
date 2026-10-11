@@ -88,10 +88,19 @@ final class MetalHostView: UIView {
 /// sent while the landscape overlay shows at least one controller mapping,
 /// unless touch is set to work as a trackpad. A hardware mouse or trackpad is
 /// not affected.
+///
+/// madeira-bcd: the game's own file (Game details › This game's config) is
+/// read first, as for the pad mode, so a per-game line applies. And by
+/// default a desktop (Dock) session keeps touches as the mouse: there the
+/// pointer is how windows are used. Build 433, Grand Theft Auto V through the
+/// Rockstar Games Launcher: with the Xbox layout shown every tap on the game
+/// was dropped, so its window never got the click that would also have
+/// brought it to the front (log 2026-10-07 19:27).
 @MainActor enum TouchMouseGate {
     enum Mode: String { case auto, on, off }
     static let mode: Mode = {
-        let v = MadeiraConfig.get("env.MADEIRA_TOUCH_MOUSE")  // 1: touches always reach the program as a mouse, 0: never; default: not while touch controller mappings are shown
+        let v = MadeiraConfig.gameValue("env.MADEIRA_TOUCH_MOUSE")
+            ?? MadeiraConfig.get("env.MADEIRA_TOUCH_MOUSE")  // 1: touches always reach the program as a mouse, 0: never; default: not while touch controller mappings are shown
             ?? ProcessInfo.processInfo.environment["MADEIRA_TOUCH_MOUSE"]
         let m: Mode = v == "1" ? .on : (v == "0" ? .off : .auto)
         LogStore.shared.log("[touch-mouse] mode=\(m.rawValue)")
@@ -100,11 +109,11 @@ final class MetalHostView: UIView {
     /// Set by TouchControlsOverlay.configureGamepad: the landscape overlay is
     /// visible, not editing, and has at least one controller mapping.
     static var padOverlay = false
-    static func suppressing(touchpad: Bool) -> Bool {
+    static func suppressing(touchpad: Bool, desktop: Bool) -> Bool {
         switch mode {
         case .on: return false
         case .off: return true
-        case .auto: return padOverlay && !touchpad
+        case .auto: return padOverlay && !touchpad && !desktop
         }
     }
 }
@@ -562,7 +571,7 @@ final class MetalBackedView: UIView {
     private func tmgFilter(_ touches: Set<UITouch>, _ phase: UITouch.Phase) -> Set<UITouch>? {
         if phase == .began {
             _ = TouchMouseGate.mode   // logs the mode once
-            guard TouchMouseGate.suppressing(touchpad: touchPointerMode) else { return touches }
+            guard TouchMouseGate.suppressing(touchpad: touchPointerMode, desktop: desktopMode) else { return touches }
             let direct = touches.filter { $0.type == .direct }
             guard !direct.isEmpty else { return touches }
             for t in direct { tmgSwallowed.insert(ObjectIdentifier(t)) }
@@ -2765,6 +2774,11 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        // madeira-bcd: a game seen for the first time starts with Madeira's recommended
+        // settings (GameRecommendationsApply.swift).
+        var entry = entry
+        let isNew = !library.entries.contains { $0.id == entry.id }
+        if GameRecommendations.prepare(&entry, new: isNew) { library.save(entry) }
         // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
         // unless its Game details page chose "The game": then its own program starts below, like
         // any library game (SteamDirectStart).
@@ -2816,7 +2830,7 @@ struct ContentView: View {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
-        // madeira-bcd: update pack, the game's own options (LibraryBCD.swift); this run's
+        // madeira-bcd: the game's own options (LibraryBCD.swift); this run's
         // log is named below, by upstream's rule (the program a launch starts).
         BCDLaunch.applyLibrary(entry, sessionLog: false)
         exportBCDDesktopProfile(entry)
@@ -3427,6 +3441,13 @@ struct ContentView: View {
                     setenv("WINE_IOS_JIT_HOLE", String(format: "%lx:%lx", hole.off, hole.end), 1)
                 } else {
                     unsetenv("WINE_IOS_JIT_HOLE")
+                }
+                // madeira-bcd pool-mid (pool-mid = 1): the second hole, when a free run
+                // between the split regions became a third region (StikJITHelper.poolHole2).
+                if let hole2 = StikJITHelper.poolHole2 {
+                    setenv("WINE_IOS_JIT_HOLE2", String(format: "%lx:%lx", hole2.off, hole2.end), 1)
+                } else {
+                    unsetenv("WINE_IOS_JIT_HOLE2")
                 }
                 // madeira-bcd pool-low (pool-low = 1): region C below the executable window,
                 // RW alias at the pool's distance; ntdll carves FEX's code buffers from it
