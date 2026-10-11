@@ -745,7 +745,9 @@ static int unit(int argc, char **argv) {
         }
         free(w);
         for (int t = 0; t < 8; t++) pthread_create(&th[t], NULL, t < 4 ? u_writer : u_reader, (void *)(uintptr_t)h);
-        usleep(400000); u_stop = 1;
+        /* at least 400 ms, then until the readers have seen 200 entries (a loaded or sanitized host is slow), at most 20 s */
+        for (int ms = 0; ms < 20000 && (ms < 400 || u_whole < 200); ms += 10) usleep(10000);
+        u_stop = 1;
         for (int t = 0; t < 8; t++) pthread_join(th[t], NULL);
         CHECK(u_absent == 0, "an entry was missing while it was being replaced (%ld times)", (long)u_absent);
         CHECK(u_whole > 50, "readers saw too few entries (%ld)", (long)u_whole);
