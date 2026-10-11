@@ -1287,6 +1287,10 @@ jobs:
       - name: Check ucrt-x64-math
         run: python3 tests/host/check-ucrt-x64-math.py
 
+      # madeira-bcd: quiet-log (madeira-d3d12) and MADEIRA_SRV_FGETPATH (wineserver).
+      - name: Check quiet-log
+        run: python3 tests/host/check-quiet-log.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked

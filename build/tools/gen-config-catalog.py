@@ -106,6 +106,14 @@ OVERLAY = {
                         "separated by commas (e.g. RDR2.exe): threads of these programs get the stack they ask for, "
                         "at least 2 MB, so their stacks take less of the shared memory space. Never list Chromium "
                         "programs (SocialClubHelper.exe, Launcher.exe, steamwebhelper.exe). Read when a thread starts."},
+    "quiet-log": {"category": "Direct3D 12", "title": "Cheaper Direct3D 12 logging (no census frames)",
+                "kind": "bool", "default": "0",
+                "note": "1: the Direct3D 12 runtime's log lines skip OutputDebugString (an exception and a server "
+                        "request each, ~0.5 ms a line on the device) and reach the log through Wine's own debug "
+                        "output and stderr only; the census frames between presents 1500 and 3000 and the list "
+                        "12000-12400 draw dumps are off (each froze the game for 1-2 s); the per-shader "
+                        "\"converted at runtime\" line is kept for the first 64 shaders and then every 1000th. "
+                        "A manual frame capture still works. Default off: the logging as before."},
     "replay-split": {"category": "Direct3D 12", "title": "Log where Direct3D 12 submission time goes",
                 "kind": "bool", "default": "0",
                 "note": "Default off, logging only. 1: every 5 seconds a [perf] replay split line divides the time "
@@ -542,6 +550,16 @@ OVERLAY = {
                         "upstream's DXMT d3d11 plus SwapDeviceContextState, which Wine's Direct2D (d2d1) calls and "
                         "upstream's aborts in (Rockstar Games Launcher exited with code 3). Off (default): upstream's "
                         "committed d3d11.dll. Set it in the game's own file, not for every game; read at session start."},
+    # madeira-bcd: the wineserver names an opened file with F_GETPATH (build/wineserver/fd_ios.c).
+    "env.MADEIRA_SRV_FGETPATH": {"category": "Wine core (ntdll)", "title": "Name opened files with one call (server)",
+                "kind": "bool", "default": "0",
+                "sources": ["app/Madeira/WineProcessBridge.m", "build/wineserver/fd_ios.c"],
+                "note": "1: the Wine server takes the path of a file it has just opened from its descriptor "
+                        "(fcntl F_GETPATH) instead of realpath, which checks the path one folder at a time "
+                        "(~0.5 ms a file on the device). Same resolved path; realpath stays the fallback. For "
+                        "games that open many files a second (Horizon Zero Dawn's shader cache in its menu). "
+                        "Off (default): realpath as before. Read at each launch; a later game of the same app run does not "
+                        "inherit it."},
     # madeira-bcd: ucrtbase-x64math.dll (tools/patch-wine-ucrtbase-x64-math.py, linked by WineProcessBridge.m).
     "env.MADEIRA_UCRT_X64_MATH": {"category": "Wine core (ntdll)", "title": "floor and sqrt as x64 code (ucrtbase)",
                 "kind": "bool", "default": "0",

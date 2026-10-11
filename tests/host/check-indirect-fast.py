@@ -92,7 +92,7 @@ struct mad_exec {
     enum WMTIndexType ib_type; D3D12_PRIMITIVE_TOPOLOGY topo; unsigned draws, pass_draws;
     unsigned cap_after; struct mad_resource *cap_after_cs; unsigned ncap_after_buf, ncap_after_tex;
 };
-static int g_census_on, g_capture_on, g_skip_ps_state = -1, g_sd_state;
+static int g_census_on, g_capture_on, g_skip_ps_state = -1, g_sd_state, g_quiet_log;
 static volatile LONG g_fault_diag;
 static unsigned g_list_seq = 100, g_dump_draws;
 static long long cfg_value, cfg_reads;
@@ -159,6 +159,7 @@ int main(void) {
     g_sd_state = -1; EXPECT(!exec_indirect_fast_ok(&e, &c), "sync diagnostics not read yet: refused"); g_sd_state = 0;
     g_list_seq = 3; EXPECT(!exec_indirect_fast_ok(&e, &c), "first lists (draw dumps) refused");
     g_list_seq = 12100; EXPECT(!exec_indirect_fast_ok(&e, &c), "mid-run draw-dump window refused");
+    g_quiet_log = 1; EXPECT(exec_indirect_fast_ok(&e, &c), "quiet-log: no mid-run draw-dump window, allowed"); g_quiet_log = 0;
     g_dump_draws = 40000; EXPECT(exec_indirect_fast_ok(&e, &c), "dump budget spent: allowed"); g_dump_draws = 0; g_list_seq = 100;
     e.cap_after = 1; EXPECT(!exec_indirect_fast_ok(&e, &c), "pending draw capture refused"); e.cap_after = 0;
     e.ncap_after_buf = 1; EXPECT(!exec_indirect_fast_ok(&e, &c), "pending buffer capture refused"); e.ncap_after_buf = 0;

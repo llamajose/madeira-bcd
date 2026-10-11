@@ -291,6 +291,10 @@ extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
+/* madeira-bcd: env.MADEIRA_SRV_FGETPATH of the launch in progress, read by the in-app
+ * wineserver (build/wineserver/fd_ios.c), which is running before a game's env lines
+ * are set. Set after they are applied, cleared when the session ends. */
+volatile int g_madeira_srv_fgetpath = 0;
 
 /* Session exit report for the library front end. The app marks one process as
  * its own: the program it hands to __wine_main below, which is the session's
@@ -1256,6 +1260,12 @@ static void *wine_process_thread(void *arg) {
                     LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
+                {   /* madeira-bcd: for the wineserver (g_madeira_srv_fgetpath) */
+                    const char *fp = getenv("MADEIRA_SRV_FGETPATH");
+                    g_madeira_srv_fgetpath = (fp && fp[0] == '1') ? 1 : 0;
+                    if (g_madeira_srv_fgetpath)
+                        fprintf(stderr, "[madeira-env] MADEIRA_SRV_FGETPATH=1: the server names the files it opens with F_GETPATH\n");
+                }
                 /* Fastsync is the default sync engine: with neither inproc-sync nor
                  * env.MADEIRA_FASTSYNC in madeira.cfg, Wine gets MADEIRA_FASTSYNC=auto,
                  * the value Settings > Sync engine > Fastsync writes. Never overrides a
@@ -1913,6 +1923,10 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
         unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
         unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
+        /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
+         * of this app run (GTA V Enhanced runs without them). */
+        unsetenv("MADEIRA_UCRT_X64_MATH"); unsetenv("MADEIRA_SRV_FGETPATH");
+        g_madeira_srv_fgetpath = 0;
 
         // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
         dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");

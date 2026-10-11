@@ -366,9 +366,16 @@ enum GameRecommendations {
     /// rendered without a fault (19:28). Two runs then showed what matters: the
     /// list without fence-strict, static-cbv, readback-swap and the trace
     /// diagnostics stayed clean (19:58), and without typed-view-shadow the
-    /// vanishing came back (20:01). That list is version 15.
+    /// vanishing came back (20:01). That list is version 15. Build 494's list
+    /// (version 16) adds two lines for frame rate (493, 2026-10-11): our
+    /// runtime's log lines no longer go through OutputDebugString, whose
+    /// exception and server request cost ~0.5 ms a line, and the census frames
+    /// that froze the game for 1.5-2 s every ~10 s in its first minutes are
+    /// off (quiet-log); the server names the shader-cache files it opens with
+    /// one call instead of realpath, which kept it busy on a performance core
+    /// in the menu (MADEIRA_SRV_FGETPATH).
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 15,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 16,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -381,6 +388,7 @@ enum GameRecommendations {
         typed-view-align = 16
         typed-view-shadow = 1
         view-census = 1
+        quiet-log = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
@@ -389,6 +397,7 @@ enum GameRecommendations {
         env.MADEIRA_INPUT_FOREGROUND = 1
         env.MADEIRA_WGI_HOST_PADS = 1
         env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_SRV_FGETPATH = 1
         env.WINEDEBUG = fixme-input
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
