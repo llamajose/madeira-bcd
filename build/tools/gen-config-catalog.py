@@ -560,6 +560,22 @@ OVERLAY = {
                         "games that open many files a second (Horizon Zero Dawn's shader cache in its menu). "
                         "Off (default): realpath as before. Read at each launch; a later game of the same app run does not "
                         "inherit it."},
+    # madeira-bcd: the yield primitive (tools/patch-wine-yield-mode.py, wine/dlls/ntdll/unix/sync.c).
+    "yield-mode": {"category": "Synchronisation", "title": "Yield primitive (SwitchToThread, Sleep(0))",
+                "kind": "choice", "default": "", "sources": ["tools/patch-wine-yield-mode.py"],
+                "choices": [("", "sched_yield (default)"), ("switch", "Switch, no priority drop"),
+                            ("depress", "Bounded priority drop")],
+                "note": "What a game thread's yield does. Default: sched_yield, which on iOS drops the thread to the "
+                        "lowest priority until it runs again or 10 ms pass. switch hands the core to another "
+                        "runnable thread and keeps the yielder's priority; depress keeps the drop but ends it after "
+                        "yield-depress-ms. An experiment for games whose threads wait in yield loops (Horizon Zero "
+                        "Dawn: 1-2.6 thousand yields a second, 14-18 % of runnable-thread samples in the yield "
+                        "trap under the power clamp). The adaptive sleep (yield-streak, yield-sleep-us) still "
+                        "comes first. Read once per app run."},
+    "yield-depress-ms": {"category": "Synchronisation", "title": "Yield priority drop (ms)",
+                "kind": "int", "default": "1", "sources": ["tools/patch-wine-yield-mode.py"],
+                "note": "yield-mode = depress only: how long a yielding thread stays at the lowest priority at "
+                        "most, 1-10 ms (default 1; sched_yield's drop lasts up to 10 ms)."},
     # madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py), mapped by build/ntdll-unix/loader_ios.c.
     "env.MADEIRA_NTDLL_SYNC": {"category": "Wine core (ntdll)", "title": "Cheaper locks (ntdll-sync.dll)",
                 "kind": "choice", "default": "",

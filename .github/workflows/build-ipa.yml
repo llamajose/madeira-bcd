@@ -425,6 +425,12 @@ jobs:
           python3 tests/host/check-lock-orphan.py
           python3 tools/patch-wine-lock-orphan.py wine/dlls/ntdll/unix/sync.c
 
+      # madeira-bcd: madeira.cfg yield-mode (opt-in): the yield primitive behind
+      # SwitchToThread / Sleep(0) (switch or a bounded depress instead of
+      # swtch_pri). Unset, nothing changes. Checked by "Check yield-mode".
+      - name: Patch wine with the opt-in yield mode
+        run: python3 tools/patch-wine-yield-mode.py wine/dlls/ntdll/unix/sync.c
+
       # madeira.cfg avail-phys = 1 (opt-in): GlobalMemoryStatusEx's available
       # physical memory is what remains before this app's memory limit, so
       # Chromium (Social Club, Steam) sees memory pressure before iOS kills the
@@ -1296,6 +1302,10 @@ jobs:
       # critical sections.
       - name: Check ntdll-sync
         run: python3 tests/host/check-ntdll-sync.py
+
+      # madeira-bcd: madeira.cfg yield-mode (tools/patch-wine-yield-mode.py), opt-in.
+      - name: Check yield-mode
+        run: python3 tests/host/check-yield-mode.py
 
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
