@@ -2488,16 +2488,18 @@ static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int 
 {
     struct iovec vec[__SERVER_MAX_DATA];
     unsigned int i;
+    int ret, err = errno;   /* the handler's own system calls must not change this thread's errno */
 
     for (i = 0; i < req->data_count; i++)
     {
         vec[i].iov_base = (void *)req->data[i].ptr;
         vec[i].iov_len = req->data[i].size;
     }
-    if (ios_srv_direct_call( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
-                             (client_ptr_t)(ULONG_PTR)NtCurrentTeb(), &req->u.req, vec, req->data_count,
-                             &req->u.reply, req->reply_data ) <= 0)
-        return FALSE;
+    ret = ios_srv_direct_call( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                               (client_ptr_t)(ULONG_PTR)NtCurrentTeb(), &req->u.req, vec, req->data_count,
+                               &req->u.reply, req->reply_data );
+    errno = err;
+    if (ret <= 0) return FALSE;
     *status = req->u.reply.reply_header.error;
     return TRUE;
 }

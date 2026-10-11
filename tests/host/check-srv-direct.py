@@ -79,7 +79,9 @@ exit_ = func_body(FD, "static void ios_srv_loop_exit(void)")
 level = func_body(REQ, "static int ios_srv_direct_level( enum request req )")
 run = func_body(REQ, "static int ios_srv_run_direct( struct thread *thread, union generic_reply *reply, void *reply_data )")
 call = func_body(REQ, "int ios_srv_direct_call( unsigned int tid, client_ptr_t teb, const union generic_request *request,")
-check(all((enter, leave, exit_, level, run, call)), "the loop's lock helpers and the direct-request functions are found")
+try_direct = func_body(NTDLL, "static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status )")
+check(all((enter, leave, exit_, level, run, call, try_direct)), "the loop's lock helpers, the direct-request functions "
+      "and the client's ios_srv_try_direct are found")
 g0 = REQ.find("os_unfair_lock ios_srv_lock = OS_UNFAIR_LOCK_INIT;")
 g1 = REQ.find("extern volatile int g_madeira_srv_direct;  /* WineProcessBridge.m */")
 check(0 <= g0 < g1, "the direct-request globals are found")
@@ -171,6 +173,26 @@ static int ios_srv_loop_locked;
 @RUN@
 @CALL@
 
+/* ---- the client (build/ntdll-unix/server_ios.c) --------------------------------- */
+#include <errno.h>
+typedef int BOOL;
+#define TRUE 1
+#define FALSE 0
+typedef unsigned long ULONG_PTR;
+#define __SERVER_MAX_DATA 5
+struct __server_request_info
+{
+    union { union generic_request req; union generic_reply reply; } u;
+    unsigned int data_count;
+    void *reply_data;
+    struct { const void *ptr; data_size_t size; } data[__SERVER_MAX_DATA];
+};
+struct fake_teb { struct { void *UniqueProcess, *UniqueThread; } ClientId; };
+static __thread struct fake_teb *fake_teb_now;
+static struct fake_teb *NtCurrentTeb(void) { return fake_teb_now; }
+#define HandleToULong(h) ((unsigned long)(unsigned long long)(h))
+@TRY@
+
 /* ---- the model ---------------------------------------------------------------- */
 static long shared;                 /* server state, deliberately unprotected */
 static volatile int inside;         /* 1 the loop, 2 a handler */
@@ -261,6 +283,7 @@ static void handler_data( const void *req, void *reply )
     current->reply_size = 5;
     ((union generic_reply *)reply)->reply_header.error = 0x1234;   /* overwritten from current->error */
     set_error( 0x55 );
+    errno = ENOENT;   /* as a failed open() in a real handler would */
 }
 static void handler_kill( const void *req, void *reply ) { (void)req; (void)reply; kill_thread( current, 0 ); }
 struct timer_flag;
@@ -390,6 +413,36 @@ int main( int argc, char **argv )
             "a timer added before the loop's wake wakes it once and clears the flag" );
     expect( one( 5, REQ_event_op, NULL, 0, 0, NULL, rd, 8 ) == 1 && wake_n == 1, "no timer: no wake" );
 
+    {   /* the client's own entry point, end to end */
+        struct fake_teb teb6;
+        struct __server_request_info rq;
+        unsigned int status = 0;
+        char out[16];
+        memset( &rq, 0, sizeof(rq) );
+        teb6.ClientId.UniqueThread = (void *)(unsigned long)threads[6].id;
+        threads[6].teb = (client_ptr_t)(unsigned long)&teb6;
+        fake_teb_now = &teb6;
+        req_handlers[REQ_event_op] = handler_data;
+        rq.u.req.request_header.req = REQ_event_op;
+        rq.u.req.request_header.request_size = 10;
+        rq.u.req.request_header.reply_size = 8;
+        rq.data[0].ptr = "01234"; rq.data[0].size = 5;
+        rq.data[1].ptr = "56789"; rq.data[1].size = 5;
+        rq.data_count = 2;
+        rq.reply_data = out;
+        errno = 1234;
+        expect( ios_srv_try_direct( &rq, &status ) == TRUE && status == 0x55 && rq.u.reply.reply_header.reply_size == 5
+                && !memcmp( out, "abcde", 5 ) && !memcmp( seen_data, "0123456789", 10 ),
+                "ios_srv_try_direct: the request and its two data pieces in, the status and reply data out" );
+        expect( errno == 1234, "the caller's errno survives the handler's system calls" );
+        rq.u.req.request_header.req = REQ_new_thread;
+        rq.data_count = 0;
+        rq.u.req.request_header.request_size = 0;
+        expect( ios_srv_try_direct( &rq, &status ) == FALSE && rq.u.req.request_header.req == REQ_new_thread,
+                "ios_srv_try_direct: a request it does not take is left for the pipe, unchanged" );
+        fake_teb_now = NULL;
+    }
+
     g_madeira_srv_direct = 0;
     expect( one( 5, REQ_event_op, NULL, 0, 0, NULL, rd, 8 ) == 0, "switch off: the pipe at once" );
     ios_srv_loop_enter();
@@ -406,7 +459,7 @@ int main( int argc, char **argv )
 
 harness = (harness.replace("@NAMES@", ", ".join(n for n in names if n not in ("REQ_new_thread", "REQ_terminate_thread", "REQ_suspend_thread")))
            .replace("@GLOBALS@", globals_block).replace("@ENTER@", enter).replace("@LEAVE@", leave)
-           .replace("@EXIT@", exit_).replace("@LEVEL@", level).replace("@RUN@", run).replace("@CALL@", call))
+           .replace("@EXIT@", exit_).replace("@LEVEL@", level).replace("@RUN@", run).replace("@CALL@", call).replace("@TRY@", try_direct))
 
 cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
 if not cc:
@@ -490,9 +543,11 @@ i_send = cu.find("if ((ret = send_request( req ))) return ret;")
 check(0 <= i_abort < i_bg < i_direct < i_send, "the client tries a direct request after the abort and [bg-qos] checks, "
       "before writing to its pipe, and only with the switch on")
 td = func_body(NTDLL, "static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status )")
-check("<= 0)\n        return FALSE;" in td and "*status = req->u.reply.reply_header.error;" in td and
+check("if (ret <= 0) return FALSE;" in td and "*status = req->u.reply.reply_header.error;" in td and
       "(client_ptr_t)(ULONG_PTR)NtCurrentTeb()" in td,
       "anything not taken (or a request that ended the thread) goes on to the pipe; the TEB names the caller")
+check(td.find("int ret, err = errno;") < td.find("ios_srv_direct_call(") < td.find("errno = err;") < td.find("if (ret <= 0) return FALSE;"),
+      "the caller's errno is the same after a direct request as after a pipe round trip")
 
 check("volatile int g_madeira_srv_direct = 0;" in BRIDGE, "the bridge defines g_madeira_srv_direct, off")
 i_env = BRIDGE.find('fprintf(stderr, "[madeira-env] game %s=%s\\n", k.UTF8String, v.UTF8String);')
