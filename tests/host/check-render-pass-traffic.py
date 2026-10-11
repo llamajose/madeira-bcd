@@ -23,6 +23,14 @@ command lists through a loop that carries the real loop's hooks, and checks:
   - rp-discard (default off): a whole DiscardResource makes the next pass's
     Load of that texture DontCare only with the switch on, counted either way;
     a barrier or an open pass in between, or a partial discard, keeps the Load;
+    a pass with a texture the game discards says Unknown store actions only
+    when winemetal answers op 24, and exec_end sets DontCare exactly when the
+    next use (this list, then the call's later lists) is a whole discard or a
+    whole clear of the aspect, Store otherwise; the traffic moves to "not
+    stored"; the decision follows a carried pass into the next list;
+  - tools/patch-winemetal-rp-store.py: applies once to winemetal_unix.c,
+    op 24 sits in _madeira_ctl (not forwarded to i386), and its code, compiled
+    with a recording encoder, answers a probe and sets only the actions given;
   - rp-carry (default off): a pass open at a list end goes on into the next
     list of the same call when that list's first draw has the same targets
     and views and only state (viewport and scissor set again) comes between:
@@ -115,6 +123,76 @@ for name, sig in (("exec_flush_clear", "static void exec_flush_clear(struct mad_
     check(f"{name} counts its pass", "mad_tr_pass(&rpi," in func(sig))
 census = func("static void f7_store_census(")
 check("the ml1137 census sees a whole discard after a store", "case MC_DISCARD:" in census and "&g_ac_st_discarded" in census)
+check("late stores: only with rp-discard, no capture, a discarded texture attached and op 24 answering",
+      "if (mad_rp_discard_on() && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {" in begin
+      and "if (e->rp_late) exec_rp_late_store(e);   /* madeira-bcd rp-discard: the store actions the pass left open */\n"
+          "        MTLCommandEncoder_endEncoding(e->renc);" in func("static void exec_end(struct mad_exec *e) {")
+      and "if (c->u.discard.whole && mad_rp_discard_on()) mad_rp_dset_add(r);" in disc
+      and "q->rp_lists = lists; q->rp_nlists = count;" in run and "rp_want = q->rp_next; q->rp_idx = i;" in run)
+patch = root / "tools/patch-winemetal-rp-store.py"
+wm_src = root / "dxmt/src/winemetal/unix/winemetal_unix.c"
+check("the winemetal patch is applied by CI", "- name: Patch winemetal late render-pass store actions\n        run: python3 tools/patch-winemetal-rp-store.py" in
+      (root / ".github/workflows/build-ipa.yml").read_text())
+patched = None
+if wm_src.exists():
+    with tempfile.TemporaryDirectory(prefix="madeira-rp-store-") as d:
+        t = Path(d) / "dxmt/src/winemetal/unix/winemetal_unix.c"
+        t.parent.mkdir(parents=True)
+        shutil.copy(wm_src, t)
+        r1 = subprocess.run([sys.executable, str(patch)], cwd=d, capture_output=True, text=True)
+        r2 = subprocess.run([sys.executable, str(patch)], cwd=d, capture_output=True, text=True)
+        check("the patch applies once and is idempotent", r1.returncode == 0 and r2.returncode == 0 and "already applied" in r2.stdout)
+        patched = t.read_text()
+    ctl = patched[patched.index("static NTSTATUS _madeira_ctl(void *args) {"):]
+    ctl = ctl[:ctl.index("\n}\n") + 3]
+    cases = re.findall(r"^\s*case (\d+):", ctl, re.M)
+    wow = patched[patched.index("static NTSTATUS _madeira_ctl_wow64(void *args) {"):]
+    wow = wow[:wow.index("\n}\n") + 3]
+    check("op 24 in _madeira_ctl, once, local mode only; the i386 entry does not forward it",
+          cases.count("24") == 1 and len(cases) == len(set(cases)) and "wmtr_enabled()" in ctl[ctl.index("case 24:"):]
+          and "if (!a->ptr || a->len < sizeof(struct madeira_rp_store_req) || wmtr_enabled()) break;" in ctl
+          and "op == 24" not in wow)
+    helper = patched[patched.index("/* madeira-bcd: late render-pass store actions"):patched.index("static NTSTATUS _madeira_ctl(void *args) {")]
+    c_code = helper.replace("id<MTLRenderCommandEncoder> enc;", "uintptr_t enc;")
+    c_code = c_code.replace("enc = (id<MTLRenderCommandEncoder>)(uintptr_t)r->enc;", "enc = (uintptr_t)r->enc;")
+    c_code = c_code.replace("[enc setColorStoreAction:(MTLStoreAction)r->color[i] atIndex:i]", "fake_color(enc, r->color[i], i)")
+    c_code = c_code.replace("[enc setDepthStoreAction:(MTLStoreAction)r->depth]", "fake_depth(enc, r->depth)")
+    c_code = c_code.replace("[enc setStencilStoreAction:(MTLStoreAction)r->stencil]", "fake_stencil(enc, r->stencil)")
+    check("the patch's code has no Objective-C left after translation", "[enc" not in c_code and "id<" not in c_code)
+    wm_harness = r'''
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+static int calls[16][3], ncalls;
+static void fake_color(uintptr_t e, int a, unsigned i) { calls[ncalls][0] = 'c' + (int)e; calls[ncalls][1] = a; calls[ncalls++][2] = (int)i; }
+static void fake_depth(uintptr_t e, int a) { calls[ncalls][0] = 'd' + (int)e; calls[ncalls][1] = a; calls[ncalls++][2] = -1; }
+static void fake_stencil(uintptr_t e, int a) { calls[ncalls][0] = 's' + (int)e; calls[ncalls][1] = a; calls[ncalls++][2] = -1; }
+''' + c_code + r'''
+int main(void) {
+    struct madeira_rp_store_req r;
+    int bad = 0;
+    memset(&r, 0, sizeof r);
+    if (madeira_rp_store(&r) != 1 || ncalls) { printf("probe\n"); bad = 1; }
+    memset(&r, 0xff, sizeof r); r.enc = 0x50; r.color[0] = 1; r.color[2] = 0; r.depth = 0;
+    if (madeira_rp_store(&r) != 1 || ncalls != 3 || calls[0][0] != 'c' + 0x50 || calls[0][1] != 1 || calls[0][2] != 0 ||
+        calls[1][0] != 'c' + 0x50 || calls[1][1] != 0 || calls[1][2] != 2 || calls[2][0] != 'd' + 0x50 || calls[2][1] != 0) { printf("set\n"); bad = 1; }
+    if (sizeof r != 24) { printf("size\n"); bad = 1; }
+    if (!bad) printf("ok\n");
+    return bad;
+}
+'''
+    cc0 = shutil.which("clang") or shutil.which("gcc")
+    if cc0:
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "w.c").write_text(wm_harness)
+            r = subprocess.run([cc0, "-Wall", "-o", str(Path(d) / "w"), str(Path(d) / "w.c")], capture_output=True, text=True)
+            out = subprocess.run([str(Path(d) / "w")], capture_output=True, text=True).stdout if r.returncode == 0 else r.stderr
+            check("op 24 run: a probe sets nothing and answers 1; only the actions given are set; the request is 24 bytes",
+                  out.strip() == "ok")
+            if out.strip() != "ok":
+                print(out[:2000])
+else:
+    print("note: no dxmt sources; the patch's own checks are skipped")
 cat = (root / "app/Madeira/ConfigCatalog.generated.swift").read_text()
 for key, dflt in (("clear-defer", "1"), ("rp-carry", "0"), ("rp-discard", "0")):
     check(f"catalog lists {key}, default {dflt}",
@@ -126,6 +204,7 @@ check("CI runs this check", "- name: Check render-pass traffic\n        run: pyt
 cmd_struct = between("struct mad_cmd {", "\n};\n") + "\n};\n"
 exec_struct = between("struct mad_exec {", "\n};\n") + "\n};\n"
 rp_last = re.search(r"    struct \{ struct mad_resource \*rt\[8\], \*depth;[^\n]*\} rp_last;\n", src).group(0)
+rp_lists = re.search(r"    ID3D12CommandList \*const \*rp_lists; UINT rp_nlists, rp_idx;[^\n]*\n", src).group(0)
 bc_enum = re.search(r"enum \{ BC_RAR, [^\n]*\};\n", src).group(0)
 rtvp = re.search(r"struct mad_rtvp \{[^\n]*\};\n", src).group(0)
 tr_globals = between("/* madeira-bcd gpu-traffic: what every render pass moves", "static int g_census_on;")
@@ -142,7 +221,7 @@ harness = r'''
 #include <stdarg.h>
 #include "winemetal.h"
 typedef uint64_t UINT64; typedef unsigned UINT; typedef uint32_t UINT32; typedef uint16_t UINT16; typedef uint8_t UINT8;
-typedef int INT; typedef long LONG; typedef long long LONG64; typedef int BOOL;
+typedef int INT; typedef long LONG; typedef long long LONG64; typedef int BOOL; typedef uintptr_t ULONG_PTR;
 typedef struct { float TopLeftX, TopLeftY, Width, Height, MinDepth, MaxDepth; } D3D12_VIEWPORT;
 typedef struct { LONG left, top, right, bottom; } D3D12_RECT;
 typedef int D3D12_PRIMITIVE_TOPOLOGY;
@@ -166,10 +245,21 @@ struct mad_list { struct mad_cmd *cmds; unsigned ncmds; int closed; struct mad_a
 struct mad_rp_carry;
 struct mad_queue { struct mad_device *device; struct mad_vis_batch *vis; unsigned open_lists; UINT64 batches; obj_handle_t open_cb;
                    struct mad_rp_carry *rp_carry; const struct mad_list *rp_next;
-''' + rp_last + r'''};
+''' + rp_lists + rp_last + r'''};
 ''' + exec_struct + r'''
 /* ---- stand-ins ---- */
 static LONG InterlockedIncrement(volatile LONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+static void *InterlockedCompareExchangePointer(void *volatile *p, void *x, void *cmp) {
+    void *e = cmp; __atomic_compare_exchange_n(p, &e, x, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+/* MadeiraCtl op 24 as tools/patch-winemetal-rp-store.py answers it (op24_ok = 0: a winemetal without it) */
+static int op24_ok, op24_probes, n24; static struct { UINT64 enc; UINT8 color[8], depth, stencil, pad[6]; } r24[64];
+void MadeiraCtl(struct madeira_ctl_args *a) {
+    const UINT8 *p = (const UINT8 *)(uintptr_t)a->ptr;
+    a->ret = 0;
+    if (a->op != 24 || !op24_ok || !p || a->len < 24) return;
+    if (!*(const UINT64 *)p) op24_probes++; else if (n24 < 64) memcpy(&r24[n24++], p, 24);
+    a->ret = 1;
+}
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 static LONG64 InterlockedExchange64(volatile LONG64 *p, LONG64 v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
@@ -218,6 +308,7 @@ static struct mad_vis_batch *mad_vis_get(struct mad_exec *e) { (void)e; return N
 static obj_handle_t mad_vis_chunk(struct mad_exec *e, struct mad_vis_batch *v, UINT64 slot, void **cpu_out) { (void)e; (void)v; (void)slot; (void)cpu_out; return 0; }
 static LONG64 f7_att_bytes(const struct mad_resource *r, UINT level) { (void)r; (void)level; return 0; }
 static void mad_label(obj_handle_t enc, const char *fmt, ...) { (void)enc; (void)fmt; }
+static void exec_rp_late_store(struct mad_exec *e);
 ''' + func("static void exec_end(struct mad_exec *e) {") + helpers + block + flush_add + \
     func("static void exec_attachless_area(") + func("static int exec_same_targets(struct mad_exec *e) {") + begin + r'''
 /* ---- a replay with the real loop's hooks (mode 1: barriers end compute and blit encoders) ---- */
@@ -261,10 +352,11 @@ static void flush(struct mad_queue *q) { q->batches++; q->open_lists = 0; }
 static void ecl(struct mad_queue *q, unsigned count, struct mad_list **lists) {
     struct mad_rp_carry rp_k; const struct mad_list *rp_want = NULL; unsigned i;
     memset(&rp_k, 0, sizeof rp_k); q->rp_carry = &rp_k; q->rp_next = NULL;
+    q->rp_lists = (ID3D12CommandList *const *)lists; q->rp_nlists = count;
     for (i = 0; i < count; i++) {
         struct mad_list *l = lists[i];
         if (rp_k.renc && l != rp_want) mad_rp_close(q);
-        q->rp_next = mad_rp_next(q, count, (ID3D12CommandList *const *)lists, i); rp_want = q->rp_next;
+        q->rp_next = mad_rp_next(q, count, (ID3D12CommandList *const *)lists, i); rp_want = q->rp_next; q->rp_idx = i;
         replay(q, l);
         q->open_lists++;
         if (q->open_lists >= 48) { mad_rp_close(q); flush(q); }
@@ -313,7 +405,11 @@ static void reset(int defer, int carry, int disc, int mode) {
     memset((void *)g_rp_miss, 0, sizeof g_rp_miss); memset((void *)g_rp_miss_b, 0, sizeof g_rp_miss_b);
     cfg_defer = defer; cfg_carry = carry; cfg_discard = disc; g_clear_defer = g_rp_carry = g_rp_discard = -1; g_mode = mode;
     nev = 0; nlists = 0; memset(&Q, 0, sizeof Q); Q.device = &DEV; g_capture_on = 0;
+    g_rp_late = -1; op24_ok = 1; op24_probes = 0; n24 = 0; memset((void *)g_rp_dset, 0, sizeof g_rp_dset); g_rp_dset_full = 0;
 }
+/* the store actions op 24 set for the pass of event ev (-1: none was set) */
+static int late_color(int ev, int k) { int i; for (i = 0; i < n24; i++) if (r24[i].enc == evs[ev].h) return r24[i].color[k] == 0xff ? -2 : r24[i].color[k]; return -1; }
+static int late_ds(int ev, int stencil) { int i; for (i = 0; i < n24; i++) if (r24[i].enc == evs[ev].h) return stencil ? r24[i].stencil : r24[i].depth; return -1; }
 static int bad;
 #define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s (line %d)\n", what, __LINE__); bad = 1; } } while (0)
 static int count(char kind) { int i, n = 0; for (i = 0; i < nev; i++) n += evs[i].kind == kind; return n; }
@@ -503,6 +599,56 @@ int main(void) {
       EXPECT(k0.renc && evs[0].ended == 0, "carried at the list end");
       mad_rp_close(&Q);
       EXPECT(!k0.renc && evs[0].ended == 1 && evs[0].updates == 1, "mad_rp_close ends it with its fence update"); Q.rp_carry = NULL; }
+    /* 7. rp-discard's store side: decided at the pass end through op 24 */
+    { struct mad_resource *b1[1] = { &B };
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A);
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); discard(l1, &A, 1);
+    ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(op24_probes == 1 && evs[0].rpi.colors[0].store_action == WMTStoreActionUnknown && late_color(0, 0) == WMTStoreActionDontCare &&
+           late_color(0, 1) == -2 && g_tr_nostore == sz(&A, 0) && !g_tr_store, "discard after the last draw: not stored");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A);
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); rts(l1, 1, b1, NULL); draw(l1); rts(l1, 1, a1, NULL); draw(l1); discard(l1, &A, 1);
+    ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(count('R') == 3 && late_color(0, 0) == WMTStoreActionStore && late_color(2, 0) == WMTStoreActionDontCare &&
+           evs[1].rpi.colors[0].store_action == WMTStoreActionStore && late_color(1, 0) == -1, "a pass that loads it next: stored; B untouched");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A);   /* the next list of the call discards it; in the next call: kept */
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); l2 = L(); discard(l2, &A, 1);
+    ls[0] = l1; ls[1] = l2; ecl(&Q, 2, ls);
+    EXPECT(late_color(0, 0) == WMTStoreActionDontCare, "discarded by the next list of the call: not stored");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A);
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); ls[0] = l1; ecl(&Q, 1, ls);
+    l2 = L(); discard(l2, &A, 1); ls[0] = l2; ecl(&Q, 1, ls);
+    EXPECT(late_color(0, 0) == WMTStoreActionStore, "discarded only in the next call: stored");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A);
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); barrier(l1, &A); discard(l1, &A, 1);
+    ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(late_color(0, 0) == WMTStoreActionStore, "a barrier first: stored");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A);   /* ended by a dispatch, then drawn again with A still bound: stored */
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); push(l1, MC_DISPATCH); draw(l1); discard(l1, &A, 1);
+    ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(count('R') == 2 && late_color(0, 0) == WMTStoreActionStore && late_color(2, 0) == WMTStoreActionDontCare,
+           "a later pass still bound to it loads it: stored; that pass, discarded after: not stored");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A);   /* discarded right after its last draw, the pass ends later */
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); discard(l1, &A, 1); rts(l1, 1, b1, NULL); draw(l1);
+    ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(late_color(0, 0) == WMTStoreActionDontCare, "discard after the last draw, before the pass ends: not stored");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&A); op24_ok = 0;
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); discard(l1, &A, 1); ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(evs[0].rpi.colors[0].store_action == WMTStoreActionStore && !n24 && !g_rp_late, "winemetal without op 24: Store at creation");
+    reset(-1, -1, 0, 1); mad_rp_dset_add(&A);
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); discard(l1, &A, 1); ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(evs[0].rpi.colors[0].store_action == WMTStoreActionStore && !n24 && !op24_probes, "rp-discard off: no probe, Store");
+    reset(-1, -1, 1, 1); mad_rp_dset_add(&D);   /* a depth-only clear next: depth not stored, stencil and colour stored */
+    l1 = L(); rts(l1, 1, a1, &D); vpsc(l1); draw(l1);
+    { struct mad_cmd *c = push(l1, MC_CLEAR_DS); c->u.clear.res = &D; c->u.clear.v.layers = 1; c->u.clear.flags = D3D12_CLEAR_FLAG_DEPTH; }
+    draw(l1); ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(late_ds(0, 0) == WMTStoreActionDontCare && late_ds(0, 1) == WMTStoreActionStore && late_color(0, 0) == WMTStoreActionStore &&
+           evs[1].rpi.depth.load_action == WMTLoadActionClear && g_tr_nostore == sz(&D, 0), "depth-only clear next: only depth not stored");
+    reset(-1, 1, 1, 1); mad_rp_dset_add(&A);   /* a carried pass decides at its real end */
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); l2 = L(); rts(l2, 1, a1, NULL); vpsc(l2); draw(l2); discard(l2, &A, 1);
+    ls[0] = l1; ls[1] = l2; ecl(&Q, 2, ls);
+    EXPECT(g_rp_carried == 1 && count('R') == 1 && n24 == 1 && late_color(0, 0) == WMTStoreActionDontCare && all_ended_once(),
+           "carried pass: decided once, at its end in the next list"); }
     /* the prefix test itself */
     reset(-1, 1, -1, 1);
     l1 = L(); rts(l1, 4, GB, &D); vpsc(l1); push(l1, MC_DISCARD)->u.discard.res = &X; clear_rt(l1, &X, 0); draw(l1);

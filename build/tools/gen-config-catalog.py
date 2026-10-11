@@ -251,13 +251,14 @@ OVERLAY = {
                         "GTA V Enhanced its G-buffer in ~12. Opt-in: the second list's draws no longer wait for the "
                         "whole first pass, an ordering Direct3D 12 does not promise but a game might rely on. Read "
                         "once per game start; [perf] gpu-traffic lines show what it saves."},
-    "rp-discard": {"category": "Direct3D 12", "title": "Experiment: no load after DiscardResource",
-                "kind": "bool", "default": "0",
+    "rp-discard": {"category": "Direct3D 12", "title": "Experiment: no load after, no store before DiscardResource",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c", "tools/patch-winemetal-rp-store.py"],
                 "note": "Default off. 1: after a game discards a whole render target or depth buffer "
                         "(DiscardResource), the next render pass that draws to it does not read its old contents "
-                        "from memory, as tile-based GPUs do on Windows. Opt-in: a game that still reads what it "
-                        "discarded (desktop GPUs ignore discards) would show garbage there. Read once per game "
-                        "start; [perf] gpu-traffic lines show the bytes."},
+                        "from memory, and a pass whose target is discarded (or cleared whole) next, before any other "
+                        "use in the same submission, does not write it back -- as tile-based GPUs do on Windows. "
+                        "Opt-in: a game that still reads what it discarded (desktop GPUs ignore discards) would show "
+                        "garbage there. Read once per game start; [perf] gpu-traffic lines show the bytes."},
     "skin-check": {"category": "Direct3D 12", "title": "Diagnostic: check meshes skinned on the GPU",
                 "kind": "int", "default": "0",
                 "note": "Default 0 (off). N: windows of N frames (1 = 8) log every draw that reads a vertex buffer a "

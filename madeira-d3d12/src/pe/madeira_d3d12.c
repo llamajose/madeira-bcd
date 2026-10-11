@@ -1960,6 +1960,7 @@ struct mad_queue {
      * submit_lock): where an open render pass may be handed over, and the list
      * that follows in the same ExecuteCommandLists call and command buffer */
     struct mad_rp_carry *rp_carry; const struct mad_list *rp_next;
+    ID3D12CommandList *const *rp_lists; UINT rp_nlists, rp_idx;   /* madeira-bcd rp-discard: the call's lists, the one replaying */
     /* madeira-bcd gpu-traffic census: the targets of a pass left open at the end
      * of the last list of a call, compared with the first pass of the next list */
     struct { struct mad_resource *rt[8], *depth; struct mad_rtvp rtp[8], dp; UINT nrt; LONG64 bytes; UINT64 batch; int valid; } rp_last;
@@ -2078,6 +2079,8 @@ struct mad_exec {
     /* madeira-bcd rp-discard: textures a whole DiscardResource left undefined that
      * nothing has touched since (their next pass need not load them) */
     struct mad_resource *rp_disc[16]; unsigned rp_ndisc;
+    int rp_late;   /* madeira-bcd rp-discard: the open pass said Unknown store actions; exec_end decides them */
+    unsigned rp_from;   /* madeira-bcd rp-discard: the command after the open pass's last draw (0 for a pass carried in) */
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
                              struct mad_resource *depth, const struct mad_rtvp *dp, unsigned seq, unsigned draws);
@@ -2450,6 +2453,7 @@ done:
 }
 static volatile LONG g_fault_diag;   /* madeira-bcd: GPU fault attribution, below */
 static void mad_fault_label_render(struct mad_exec *e);
+static void exec_rp_late_store(struct mad_exec *e);   /* madeira-bcd rp-discard, below */
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
     if (e->renc) exec_fence_render(e, e->renc, 1);     /* ml1091 */
@@ -2464,6 +2468,7 @@ static void exec_end(struct mad_exec *e) {
     if (e->renc && g_fault_diag && e->diag_npso) mad_fault_label_render(e);   /* madeira-bcd */
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
+        if (e->rp_late) exec_rp_late_store(e);   /* madeira-bcd rp-discard: the store actions the pass left open */
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
         if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
@@ -3387,17 +3392,24 @@ static void exec_flush_named(struct mad_exec *e, const struct mad_cmd *c) {
 /* rp-discard (default 0; opt-in). DiscardResource is recorded (MC_DISCARD).
  * After a discard of the whole resource its contents are undefined in D3D12,
  * so with rp-discard = 1 the next pass that binds it does not load it
- * (DontCare), as a tile-based GPU's driver does. Opt-in because a game may read
+ * (DontCare), and a pass whose texture is discarded whole (or cleared whole)
+ * next, before any other use in this list or the later lists of the same
+ * ExecuteCommandLists call, does not store it -- as a tile-based GPU's driver
+ * does. The store is decided when the pass ends: a pass with a texture the
+ * game has discarded before says Unknown store actions and exec_end sets them
+ * through MadeiraCtl op 24 (tools/patch-winemetal-rp-store.py; without it, or
+ * in remote mode, the store side stays off). Opt-in because a game may read
  * what it discarded and get away with it on desktop GPUs, which ignore
  * discards: here it would read garbage. Whether or not it is on, the textures
- * a discard left undefined are tracked so gpu-traffic can say what it saves.
- * A texture leaves the set when anything names it (barrier, copy, clear) or a
- * pass binds it; a discard inside its own open pass is ignored (the draws after
- * it define the contents again). */
+ * a discard left undefined are tracked so gpu-traffic can say what the load
+ * side saves (the ml1137 census counts the store side). A texture leaves the
+ * set when anything names it (barrier, copy, clear) or a pass binds it; a
+ * discard inside its own open pass is ignored (the draws after it define the
+ * contents again). */
 static int mad_rp_discard_on(void) {
     if (g_rp_discard < 0) {
-        g_rp_discard = mad_cfg_int_pe("rp-discard", 0) ? 1 : 0;   /* experiment: the first pass after a whole DiscardResource does not load the texture */
-        if (g_rp_discard) d3d12_log("[madeira-d3d12] rp-discard = 1: the first render pass after a whole DiscardResource does not load that texture\n");
+        g_rp_discard = mad_cfg_int_pe("rp-discard", 0) ? 1 : 0;   /* experiment: no load after, no store before a whole DiscardResource */
+        if (g_rp_discard) d3d12_log("[madeira-d3d12] rp-discard = 1: no render-pass load after, and no store before, a whole DiscardResource\n");
     }
     return g_rp_discard;
 }
@@ -3451,6 +3463,127 @@ static UINT mad_discard_whole(const struct mad_resource *r, const D3D12_DISCARD_
     planes = r->is_depth && r->has_stencil ? 2 : 1;
     return region->FirstSubresource == 0 && region->NumSubresources >= mips * layers * planes;
 }
+/* The store side. Textures the game has discarded whole (recorded on its
+ * threads; a pass with one of them leaves its store actions open). Stale
+ * entries of freed textures only cost a lookahead. */
+static struct mad_resource *volatile g_rp_dset[1024];
+static volatile LONG g_rp_dset_full;
+static unsigned mad_rp_dset_slot(const struct mad_resource *r) { return (unsigned)((((UINT64)(ULONG_PTR)r >> 4) * 0x9E3779B97F4A7C15ull) >> 54); }
+static void mad_rp_dset_add(struct mad_resource *r) {
+    unsigned h = mad_rp_dset_slot(r), k;
+    for (k = 0; k < 8; k++, h = (h + 1) & 1023) {
+        struct mad_resource *cur = g_rp_dset[h];
+        if (cur == r) return;
+        if (!cur && InterlockedCompareExchangePointer((void *volatile *)&g_rp_dset[h], r, NULL) == NULL) return;
+        if (g_rp_dset[h] == r) return;
+    }
+    InterlockedExchange(&g_rp_dset_full, 1);   /* every texture is a candidate from now on */
+}
+static int mad_rp_dset_has(const struct mad_resource *r) {
+    unsigned h = mad_rp_dset_slot(r), k;
+    if (!r) return 0;
+    if (g_rp_dset_full) return 1;
+    for (k = 0; k < 8; k++, h = (h + 1) & 1023) if (g_rp_dset[h] == r) return 1;
+    return 0;
+}
+struct mad_rp_store_req { UINT64 enc; UINT8 color[8], depth, stencil, pad[6]; };   /* 0xff: not an attachment left open */
+static int g_rp_late = -1;
+/* MadeiraCtl op 24 answers a probe (encoder 0) with 1 when winemetal sets store actions late. */
+static int mad_rp_late_ok(void) {
+    if (g_rp_late < 0) {
+        struct madeira_ctl_args a; struct mad_rp_store_req r;
+        memset(&a, 0, sizeof a); memset(&r, 0, sizeof r);
+        a.op = 24; a.ptr = (UINT64)(ULONG_PTR)&r; a.len = sizeof r;
+        MadeiraCtl(&a);
+        g_rp_late = a.ret ? 1 : 0;
+        d3d12_log("[madeira-d3d12] rp-discard: stores before a discard are %s\n",
+                  g_rp_late ? "decided when the pass ends (MadeiraCtl op 24)" : "kept (this winemetal has no op 24, or remote mode)");
+    }
+    return g_rp_late;
+}
+static int exec_rp_late_want(const struct mad_exec *e) {
+    UINT i;
+    for (i = 0; i < e->nrt; i++) if (e->rt[i] && e->rt[i]->texture && mad_rp_dset_has(e->rt[i])) return 1;
+    return e->depth && e->depth->texture && mad_rp_dset_has(e->depth);
+}
+/* List i of the call being replayed, if the replay takes it (mad_rp_next's test). */
+static const struct mad_list *mad_rp_list_at(const struct mad_queue *q, UINT i) {
+    const struct mad_list *n;
+    if (!q->rp_lists || i >= q->rp_nlists) return NULL;
+    n = (const struct mad_list *)q->rp_lists[i];
+    if (!n || !n->closed || (n->alloc && n->recorded_generation != n->alloc->generation)) return NULL;
+    return n;
+}
+/* What the rest of this list, then the later lists of the same call, does to
+ * r (an attachment of the open pass) first, from the command after the pass's
+ * last draw: 1 = a whole discard, or a whole clear of this view covering the
+ * aspect (0 colour, 1 depth, 2 stencil), so the store is moot; 0 = a draw
+ * while it is bound (a pass loads it), a barrier, copy or partial discard or
+ * clear naming it, the end of the call, or 8192 commands. */
+static int exec_rp_dead(const struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v, int aspect) {
+    const struct mad_queue *q = e->q;
+    const struct mad_list *l = e->l;
+    unsigned j = e->rp_from, n = 0, li = q->rp_idx, k;
+    int bound = 1;   /* the pass's targets stay bound until an OMSetRenderTargets says otherwise */
+    while (l) {
+        for (; j < l->ncmds; j++) {
+            const struct mad_cmd *c = &l->cmds[j];
+            if (++n > 8192) return 0;
+            switch (c->kind) {
+            case MC_RTS:
+                bound = c->u.rts.depth == r;
+                for (k = 0; k < c->u.rts.n && k < 8; k++) if (c->u.rts.rt[k] == r) bound = 1;
+                break;
+            case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
+                if (bound) return 0;   /* a pass loads it */
+                break;
+            case MC_DISCARD:
+                if (c->u.discard.res == r) return c->u.discard.whole != 0;
+                break;
+            case MC_CLEAR_RT: case MC_CLEAR_DS:
+                if (c->u.clear.res != r) break;
+                if (c->u.clear.nrect || !mad_rtvp_eq(&c->u.clear.v, v)) return 0;
+                if (!aspect) return c->kind == MC_CLEAR_RT;
+                return c->kind == MC_CLEAR_DS && (c->u.clear.flags & (aspect == 1 ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_STENCIL)) != 0;
+            default:
+                if (mad_cmd_names(c, r)) return 0;
+                break;
+            }
+        }
+        for (l = NULL; !l && ++li < q->rp_nlists; ) l = mad_rp_list_at(q, li);
+        j = 0; bound = 0;   /* a list binds its own targets */
+    }
+    return 0;
+}
+/* exec_end, before endEncoding: the store actions the pass left open. */
+static void exec_rp_late_store(struct mad_exec *e) {
+    struct madeira_ctl_args a; struct mad_rp_store_req r;
+    LONG64 moved = 0;
+    UINT i;
+    e->rp_late = 0;
+    memset(&r, 0xff, sizeof r); r.enc = (UINT64)e->renc; memset(r.pad, 0, sizeof r.pad);
+    for (i = 0; i < e->enc_nrt && i < 8; i++) {
+        if (!e->enc_rt[i] || !e->enc_rt[i]->texture) continue;
+        r.color[i] = exec_rp_dead(e, e->enc_rt[i], &e->enc_rtp[i], 0) ? WMTStoreActionDontCare : WMTStoreActionStore;
+        if (r.color[i] == WMTStoreActionDontCare) moved += mad_tr_bytes(e->enc_rt[i], e->enc_rtp[i].level, e->enc_rtp[i].layers, 0);
+    }
+    if (e->enc_depth && e->enc_depth->texture) {
+        r.depth = exec_rp_dead(e, e->enc_depth, &e->enc_dp, 1) ? WMTStoreActionDontCare : WMTStoreActionStore;
+        if (r.depth == WMTStoreActionDontCare) moved += mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 0);
+        if (e->enc_depth->has_stencil) {
+            r.stencil = exec_rp_dead(e, e->enc_depth, &e->enc_dp, 2) ? WMTStoreActionDontCare : WMTStoreActionStore;
+            if (r.stencil == WMTStoreActionDontCare) moved += mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 1);
+        }
+    }
+    memset(&a, 0, sizeof a); a.op = 24; a.ptr = (UINT64)(ULONG_PTR)&r; a.len = sizeof r;
+    MadeiraCtl(&a);
+    if (!a.ret) {   /* cannot happen after a probe that answered; never use Unknown again */
+        g_rp_late = 0;
+        d3d12_log("[madeira-d3d12] rp-discard: MadeiraCtl op 24 refused a pass's store actions; stores kept from now on\n");
+        return;
+    }
+    if (moved) { InterlockedExchangeAdd64(&g_tr_store, -moved); InterlockedExchangeAdd64(&g_tr_nostore, moved); }   /* counted as stores at creation */
+}
 
 /* rp-carry (default 0; opt-in: it removes an encoder boundary, so an ordering
  * the runtime gave beyond what D3D12 promises). Horizon Zero Dawn records its
@@ -3476,7 +3609,7 @@ static UINT mad_discard_whole(const struct mad_resource *r, const D3D12_DISCARD_
 struct mad_rp_carry {
     obj_handle_t renc, vis_buf; unsigned seq, draws, nrt, w, h;
     struct mad_resource *rt[8], *depth; struct mad_rtvp rtp[8], dp;
-    int mode, f6_synced; unsigned f6_cur, f6_natt; struct mad_resource *f6_att[9];
+    int mode, f6_synced, late; unsigned f6_cur, f6_natt; struct mad_resource *f6_att[9];
     unsigned npend; unsigned char pend[sizeof(((struct mad_exec *)0)->pend)];
     LONG64 bytes;
 };
@@ -3553,6 +3686,7 @@ static void exec_rp_take(struct mad_exec *e, struct mad_rp_carry *k) {
     e->f6_enc_synced = k->f6_synced; e->f6_cur = k->f6_cur;
     memcpy(e->f6_att, k->f6_att, sizeof e->f6_att); e->f6_natt = k->f6_natt;
     memcpy(e->pend, k->pend, sizeof e->pend); e->npend = k->npend;
+    e->rp_late = k->late; e->rp_from = 0;   /* its last draw was in the list before */
     k->renc = 0;
 }
 /* At the start of a list: take over a pass the previous list left open, and
@@ -3597,9 +3731,9 @@ static void exec_rp_list_end(struct mad_exec *e) {
         memcpy(k->rtp, e->enc_rtp, sizeof k->rtp); k->dp = e->enc_dp; k->w = e->enc_w; k->h = e->enc_h;
         k->vis_buf = e->enc_vis_buf; k->mode = e->mode; k->f6_synced = e->f6_enc_synced; k->f6_cur = e->f6_cur;
         memcpy(k->f6_att, e->f6_att, sizeof k->f6_att); k->f6_natt = e->f6_natt;
-        memcpy(k->pend, e->pend, sizeof k->pend); k->npend = e->npend; k->bytes = b;
+        memcpy(k->pend, e->pend, sizeof k->pend); k->npend = e->npend; k->bytes = b; k->late = e->rp_late;
         e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0; e->enc_vis_buf = 0;
-        e->f6_natt = 0; e->pass_draws = 0; e->npend = 0;
+        e->f6_natt = 0; e->pass_draws = 0; e->npend = 0; e->rp_late = 0;
         InterlockedIncrement(&g_rp_carried); InterlockedExchangeAdd64(&g_rp_carried_b, b);
         return;
     }
@@ -4108,7 +4242,7 @@ static int exec_begin_render(struct mad_exec *e) {
     UINT i, w = 0, h = 0;
     unsigned k;
     int attachless = 0;
-    if (exec_same_targets(e)) { InterlockedIncrement(&g_pass_reused); return 1; }
+    if (exec_same_targets(e)) { InterlockedIncrement(&g_pass_reused); e->rp_from = e->cur + 1; return 1; }
     if (e->renc) InterlockedIncrement(&g_pass_end_rts);
     e->f7_next_rts = 1;   /* ml1137: the pass being closed hands over to the targets bound now */
     exec_end(e);
@@ -4191,6 +4325,13 @@ static int exec_begin_render(struct mad_exec *e) {
         for (i = 0; i < e->nrt; i++) if (e->rt[i]) exec_disc_forget(e, e->rt[i]);   /* this pass defines them again */
         if (e->depth) exec_disc_forget(e, e->depth);
     }
+    e->rp_late = 0;   /* madeira-bcd rp-discard: a texture the game discards: the store is decided when the pass ends */
+    if (mad_rp_discard_on() && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {
+        for (i = 0; i < e->nrt; i++) if (rpi.colors[i].texture) rpi.colors[i].store_action = WMTStoreActionUnknown;
+        if (rpi.depth.texture) rpi.depth.store_action = WMTStoreActionUnknown;
+        if (rpi.stencil.texture) rpi.stencil.store_action = WMTStoreActionUnknown;
+        e->rp_late = 1;
+    }
     if (!w) w = 1; if (!h) h = 1;
     rpi.render_target_width = w; rpi.render_target_height = h;
     rpi.default_raster_sample_count = (e->nrt && e->rt[0] && e->rt[0]->samples) ? e->rt[0]->samples
@@ -4210,6 +4351,7 @@ static int exec_begin_render(struct mad_exec *e) {
     }
     e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
     if (e->renc) mad_tr_pass(&rpi, e->rt, e->rtp, e->nrt, e->depth, &e->dp);   /* madeira-bcd gpu-traffic */
+    e->rp_from = e->cur + 1;   /* madeira-bcd rp-discard */
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
     e->diag_npso = 0; e->diag_more = 0;   /* madeira-bcd: GPU fault attribution */
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
@@ -9677,7 +9819,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd: sync diagnostics, read once */
     mad_prebuild_lists(count, lists);   /* madeira-bcd */
     if (rs) mad_rs_step(RS_PREBUILD, &rs_t);
-    memset(&rp_k, 0, sizeof rp_k); q->rp_carry = &rp_k; q->rp_next = NULL;
+    memset(&rp_k, 0, sizeof rp_k); q->rp_carry = &rp_k; q->rp_next = NULL; q->rp_lists = lists; q->rp_nlists = count;
     for (UINT i = 0; i < count; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
         if (l && !l->closed) {
@@ -9708,7 +9850,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             if (rs) mad_rs_step(RS_BATCH, &rs_t);
         }
         if (rp_k.renc && l != rp_want) mad_rp_close(q);   /* madeira-bcd rp-carry: handed to a list that is not this one */
-        q->rp_next = mad_rp_next(q, count, lists, i); rp_want = q->rp_next;
+        q->rp_next = mad_rp_next(q, count, lists, i); rp_want = q->rp_next; q->rp_idx = i;
         if (l) mad_exec_list(q, l, q->open_cb);   /* times itself */
         if (rs) rs_t = mad_tick();
         q->open_lists++;
@@ -9719,7 +9861,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             if (rs) mad_rs_step(RS_FLUSH, &rs_t);
         }
     }
-    mad_rp_close(q); q->rp_carry = NULL; q->rp_next = NULL;   /* madeira-bcd rp-carry: never past the call */
+    mad_rp_close(q); q->rp_carry = NULL; q->rp_next = NULL; q->rp_lists = NULL; q->rp_nlists = 0;   /* madeira-bcd rp-carry: never past the call */
     mad_es_finish(eb);   /* madeira-bcd encode-batch: anything still queued goes out under the queue's lock */
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (g_sd_state > 0 && g_gpu_sync && q) {   /* madeira-bcd: gpu-sync -- this submission runs to completion before the game goes on */
@@ -18063,6 +18205,7 @@ static void STDMETHODCALLTYPE list_DiscardResource(ID3D12GraphicsCommandList *Th
     if (!c) return;
     c->u.discard.res = r;
     c->u.discard.whole = mad_discard_whole(r, region);
+    if (c->u.discard.whole && mad_rp_discard_on()) mad_rp_dset_add(r);   /* its passes decide their store at the end */
 }
 static void STDMETHODCALLTYPE list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref) {
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_STENCIL_REF);
