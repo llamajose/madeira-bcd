@@ -1273,7 +1273,7 @@ static void *wine_process_thread(void *arg) {
                         fprintf(stderr, "[madeira-env] MADEIRA_SRV_FGETPATH=1: the server names the files it opens with F_GETPATH\n");
                 }
                 {   /* madeira-bcd: the server's other per-launch switches (fd_ios.c, request_ios.c) */
-                    const char *ef = getenv("MADEIRA_SRV_ECO_FOLLOW");   /* 1: the server thread takes ECO's QoS class while ECO is on */
+                    const char *ef = getenv("MADEIRA_SRV_ECO_FOLLOW");   /* 1: the server thread runs at utility QoS while ECO is on */
                     const char *dr = getenv("MADEIRA_SRV_DIRECT");       /* 1 or 2: listed requests run on the calling thread */
                     const char *iu = getenv("MADEIRA_SRV_IDLE_US");      /* the server loop's longest sleep, us (default 1000) */
                     const char *la = getenv("MADEIRA_SRV_LOG_ALL");      /* 1: every per-descriptor server log line, as before */
