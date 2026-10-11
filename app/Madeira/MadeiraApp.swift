@@ -23,6 +23,8 @@ struct MadeiraApp: App {
 
     var body: some Scene {
         WindowGroup {
+            // madeira-bcd FORK-ONLY: RootView (HomeView.swift) puts this fork's home
+            // screen in front of ContentView when Settings › Interface asks for it.
             RootView()
                 .modifier(ClaimGamepadEvents())
                 .onAppear {

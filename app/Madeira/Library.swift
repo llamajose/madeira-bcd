@@ -147,6 +147,7 @@ enum FrontendChoice {
     }()
     /// madeira-bcd: this run started on madeira-bcd's home screen (HomeView),
     /// which, like the developer interface, runs without the library.
+    /// madeira-bcd FORK-ONLY: the "bcd" choice, here and below.
     static let startupBCD: Bool = UserDefaults.standard.string(forKey: key) == "bcd"
     /// The interface the next start uses.
     static var preferNew: Bool { preferred == "new" }
@@ -2626,7 +2627,7 @@ struct LibraryView: View {
             }
             if settingsShow("interface", "developer") {
                 Section {
-                    // madeira-bcd: its own home screen is a third choice.
+                    // madeira-bcd FORK-ONLY: its own home screen is a third choice.
                     BCDInterfacePicker()
                     Button(importing ? "Adding games…" : "Add every game in drive_c", systemImage: "square.and.arrow.down.on.square") {
                         importing = true

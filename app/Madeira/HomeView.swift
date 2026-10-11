@@ -22,6 +22,13 @@
 //  badges, play buttons) and leaves the box art and cards opaque -- glass is
 //  for things that sit on top of content, and the covers are the content.
 //
+//  madeira-bcd FORK-ONLY (owner's decision, 2026-10-11): this home screen, the
+//  fork's second interface, never goes into a pull request to upstream, which
+//  keeps a single interface. That is RootView, HomeView with its cards and
+//  sheets, LaunchRequest, ExperimentalSettings, PEInfo and FilesApp. LibraryPrefs,
+//  CoverStore, CoverArt and LibraryGame are used by the library and the session
+//  view as well (CLAUDE.md).
+//
 
 import SwiftUI
 import PhotosUI
@@ -149,6 +156,7 @@ enum ExperimentalSettings {
 
 // MARK: - Root
 
+/// madeira-bcd FORK-ONLY: the switch between this fork's home screen and ContentView.
 struct RootView: View {
     private enum Screen {
         case home

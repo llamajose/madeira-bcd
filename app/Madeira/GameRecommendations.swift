@@ -69,6 +69,7 @@ struct GameRecommendation: Equatable {
 
     /// The same for the madeira-bcd home screen's settings, which have no fast
     /// semaphore or FPS switches and show fastsync as Safe thread sync.
+    /// madeira-bcd FORK-ONLY: the `home` variant (HomeView.swift).
     func summary(home: Bool) -> String {
         var parts: [String] = []
         if let avx { parts.append("AVX \(avx ? "on" : "off")") }
