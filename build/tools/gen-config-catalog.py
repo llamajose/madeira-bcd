@@ -616,6 +616,15 @@ OVERLAY = {
                         "check and allocation probe every minute instead of every 2 s; mprotect_exec's per-call ERR "
                         "line is kept for the first 200 calls, then every 1000th. [xp], [xp-t], [xp-api] and "
                         "[sync-census] keep their rates. Off (default): every diagnostic as before. Read at session start."},
+    # madeira-bcd: the runtime's native helper threads at utility QoS (build/ntdll-unix/thread_ios.c).
+    "env.MADEIRA_ECO_NATIVE": {"category": "Wine core (ntdll)", "title": "Runtime helper threads on efficiency cores",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/thread_ios.c", "build/ntdll-unix/virtual_ios.c",
+                            "build/ntdll-unix/signal_arm64_ios.c"],
+                "note": "1: the JIT-pool warmer (page warming and the periodic memory walks) and the stale-pointer "
+                        "healer run at utility QoS, on the efficiency cores, ECO on or off; neither does work a frame "
+                        "waits for. The wineserver thread, the exception thread, audio and the interface keep their "
+                        "QoS. Off (default): they keep the QoS they were created with. Read at session start."},
     # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],
