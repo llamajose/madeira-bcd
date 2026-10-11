@@ -608,7 +608,7 @@ int ios_srv_direct_call( unsigned int tid, client_ptr_t teb, const union generic
         for (i = 0; i < count; i++)
         {
             if (vec[i].iov_len > size - done) break;
-            memcpy( (char *)data + done, vec[i].iov_base, vec[i].iov_len );
+            if (vec[i].iov_len) memcpy( (char *)data + done, vec[i].iov_base, vec[i].iov_len );
             done += vec[i].iov_len;
         }
         if (i < count || done != size)

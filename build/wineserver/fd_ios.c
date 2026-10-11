@@ -20,7 +20,6 @@
 
 
 #include "config.h"
-#include "../madeira_cfg.h"   /* madeira-bcd: eco-qos for MADEIRA_SRV_ECO_FOLLOW */
 #include <os/log.h>
 #include <os/lock.h>
 #include <mach/mach_time.h>
@@ -115,12 +114,11 @@ int ios_srv_log_sample( unsigned long *count )
  * created at user-interactive QoS (WineServerBridge.m), so it keeps a performance core at
  * full clock while ECO holds every guest thread on the efficiency cores: Horizon Zero
  * Dawn's menu with eco = 1 (2026-10-11 11:10) ran it at 0.54 cores, all of it on P at
- * ~3.9 GHz, while every guest thread ran on E. With the switch the server thread takes the
- * guests' ECO class (madeira.cfg eco-qos: utility, or user-initiated for "initiated";
- * "background" is held at utility, a background server could stall every request for
- * seconds) while ECO is on, and user-interactive again when ECO goes off or the session
- * ends. ECO changes come from ntdll's generation counter (sync.c ios_eco_gen: the ECO
- * pill, the power governor), looked at once per loop pass. madeira_get_eco() reads
+ * ~3.9 GHz, while every guest thread ran on E. With the switch the server thread runs at
+ * utility QoS (ECO's default class; never background, which could stall every request
+ * for seconds) while ECO is on, and user-interactive again when ECO goes off or the
+ * session ends. ECO changes come from ntdll's generation counter (sync.c ios_eco_gen: the
+ * ECO pill, the power governor), looked at once per loop pass. madeira_get_eco() reads
  * madeira.cfg the first time it runs and keeps the answer, so it is called only once the
  * bridge has set the switch, which is after the game's configuration is in place. */
 extern volatile int ios_eco_gen;      /* wine/dlls/ntdll/unix/sync.c */
@@ -139,18 +137,12 @@ static void ios_srv_qos_follow(void)
     if (follow == ios_srv_qos_follow_seen && gen == ios_srv_qos_gen_seen) return;
     ios_srv_qos_follow_seen = follow;
     ios_srv_qos_gen_seen = gen;
-    if (follow && madeira_get_eco())
-    {
-        char v[32] = "";
-        want = (madeira_cfg_get( "eco-qos", v, sizeof(v) ) && !strcmp( v, "initiated" ))
-               ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
-    }
+    if (follow && madeira_get_eco()) want = QOS_CLASS_UTILITY;
     if (want == (ios_srv_qos_set ? ios_srv_qos_set : QOS_CLASS_USER_INTERACTIVE)) return;
     pthread_set_qos_class_self_np( want, 0 );
     ios_srv_qos_set = want == QOS_CLASS_USER_INTERACTIVE ? 0 : want;
     fprintf( stderr, "[srv-qos] server thread -> %s (ECO %s, MADEIRA_SRV_ECO_FOLLOW %s)\n",
-             want == QOS_CLASS_UTILITY ? "utility" : want == QOS_CLASS_USER_INITIATED ? "user-initiated"
-             : "user-interactive", want != QOS_CLASS_USER_INTERACTIVE ? "on" : "off or unknown",
+             want == QOS_CLASS_UTILITY ? "utility" : "user-interactive", want == QOS_CLASS_UTILITY ? "on" : "off",
              follow ? "on" : "off" );
 }
 
@@ -185,15 +177,16 @@ static int ios_srv_loop_locked;
 
 static void ios_srv_loop_enter(void)
 {
-    if (__atomic_load_n( &g_madeira_srv_direct, __ATOMIC_ACQUIRE ) > 0)
+    int level = __atomic_load_n( &g_madeira_srv_direct, __ATOMIC_ACQUIRE );
+
+    if (level > 0)
     {
         os_unfair_lock_lock( &ios_srv_lock );
         ios_srv_loop_locked = 1;
         if (!__atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
         {
             __atomic_store_n( &ios_srv_direct_live, 1, __ATOMIC_RELEASE );
-            fprintf( stderr, "[srv-direct] on (level %d): listed requests run on their own threads\n",
-                     g_madeira_srv_direct );
+            fprintf( stderr, "[srv-direct] on (level %d): listed requests run on their own threads\n", level );
         }
     }
     else if (__atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
