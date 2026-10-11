@@ -362,6 +362,11 @@ jobs:
           python3 tests/host/check-app-local-dll.py
           python3 tools/patch-wine-app-local-dll.py wine/dlls/ntdll/unix/file.c
 
+      # madeira-bcd: GetFileSizeEx and the other size/index/end-of-file queries from one
+      # fstat instead of fstat + two xattr reads (env.MADEIRA_FILE_INFO_FULL=1 undoes it).
+      - name: Patch wine with size queries from one fstat
+        run: python3 tools/patch-wine-file-info-fstat.py wine/dlls/ntdll/unix/file.c
+
       - name: Check opt-in graphics DLL lifetime
         run: python3 tests/host/check-graphics-pin.py
 
@@ -1304,6 +1309,10 @@ jobs:
       # (env.MADEIRA_SRV_ECO_FOLLOW, env.MADEIRA_SRV_IDLE_US).
       - name: Check srv-eco-follow
         run: python3 tests/host/check-srv-eco-follow.py
+
+      # madeira-bcd: size/index/end-of-file queries from one fstat (patched above, before ntdll-unix).
+      - name: Check file-info-fstat
+        run: python3 tests/host/check-file-info-fstat.py
 
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.

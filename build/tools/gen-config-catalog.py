@@ -593,6 +593,11 @@ OVERLAY = {
                         "(a copy the server makes; it shares this process's descriptor table), the same descriptor "
                         "without a sendmsg, a recvmsg, an fcntl and two server log lines per file. 1: through the "
                         "process socket, as before. Read once per app run."},
+    "env.MADEIRA_FILE_INFO_FULL": {"category": "Wine core (ntdll)", "title": "File size queries read attributes too",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-wine-file-info-fstat.py"],
+                "note": "Kill switch, default 0: a file's size, index or end-of-file query (GetFileSizeEx and the "
+                        "like) is answered from one fstat; the two extended-attribute reads that came after it fed "
+                        "only file attributes, which these queries do not return. 1: as before. Read once per app run."},
     "env.MADEIRA_SRV_LOG_ALL": {"category": "Wine server", "title": "Every per-descriptor server log line",
                 "kind": "bool", "default": "0",
                 "sources": ["build/wineserver/fd_ios.c", "build/wineserver/request_ios.c"],
