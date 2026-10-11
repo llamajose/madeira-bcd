@@ -733,7 +733,23 @@ static int g_eb_on = -1, g_dd_on = -1;   /* encode-batch, draw-dedup: read once 
 static LONG g_eb_tls = -1;               /* TLS index of the thread's struct mad_eb, -1 until made */
 static volatile LONG g_eb_chains, g_eb_calls, g_eb_alone, g_eb_why[EBF_N], g_dd_sets, g_dd_elided, g_dd_offsets;
 #ifndef MAD_EB_SLOT   /* TEB TlsSlots[i]: what TlsGetValue reads, without its SetLastError */
+#ifdef __arm64ec__
+/* The TEB through one load whose base register is x18 (NT_TIB.Self at +0x30).
+ * NtCurrentTeb() + 0x1480 + 8 * i compiled to `add x8, x18, x8, lsl #3`, which
+ * the x18 patcher (build/ntdll-unix/virtual_ios.c) can only run "via x18": iOS
+ * preempted the thread between the trampoline's reload of x18 and the add, x8
+ * became 8 * i, and the load faulted where the Mach handler would not repair it
+ * (HZD on build 500: madeira_d3d12.dll+0x15ed4 read 0x1508 = TEB 0 + slot 17).
+ * The patcher runs `ldr xT, [x18, #imm]` through xT itself, without x18. */
+static inline void *mad_teb_self(void) {
+    void *teb;
+    __asm__ volatile("ldr %0, [x18, #0x30]" : "=r"(teb));
+    return teb;
+}
+#define MAD_EB_SLOT(i) (((void *const *)((const char *)mad_teb_self() + 0x1480))[(i)])
+#else
 #define MAD_EB_SLOT(i) (((void *const *)((const char *)NtCurrentTeb() + 0x1480))[(i)])
+#endif
 #endif
 static struct mad_eb *mad_eb_cur(void) {   /* this thread's state while a replay runs on it */
     LONG i = g_eb_tls;

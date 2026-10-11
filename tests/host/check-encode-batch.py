@@ -21,7 +21,9 @@ same commands, with the same contents (setBytes as they were when handed over),
 on the same encoders, in the same order, interleaved with the same creations,
 ends, releases and labels; on, they must take far fewer encodeCommands calls.
 Also: on unless madeira.cfg says encode-batch = 0; a thread-local slot that
-cannot be read in place turns batching and draw-dedup off; a thread outside a
+cannot be read in place turns batching and draw-dedup off (on ARM64EC the slot
+is read through `ldr xT, [x18, #0x30]`, not an add off x18: HZD build 500
+died on one); a thread outside a
 replay and a switched-off batch send at once; the arena is per thread, nested
 replays end with the outermost, and mad_es_finish sends what is left.
 
@@ -58,6 +60,11 @@ check("encode wrappers and batch found", all(s in cut for s in (
 check("switches read once with mad_cfg_int_pe, on by default",
       "if (g_eb_on < 0 || g_dd_on < 0) {" in cut
       and 'g_eb_on = mad_cfg_int_pe("encode-batch", 1) ? 1 : 0;' in cut and 'g_dd_on = mad_cfg_int_pe("draw-dedup", 1) ? 1 : 0;' in cut)
+slot = cut[cut.index("#ifndef MAD_EB_SLOT"):cut.index("static struct mad_eb *mad_eb_cur(void)")]
+check("on ARM64EC the thread's slot is read through one load off x18 (TEB Self), which the x18 patcher runs without x18",
+      "#ifdef __arm64ec__" in slot and '__asm__ volatile("ldr %0, [x18, #0x30]" : "=r"(teb));' in slot
+      and "#define MAD_EB_SLOT(i) (((void *const *)((const char *)mad_teb_self() + 0x1480))[(i)])" in slot
+      and slot.index("#ifdef __arm64ec__") < slot.index("mad_teb_self() + 0x1480") < slot.index("#else"))
 for name, macro in (("render encodeCommands", "#define MTLRenderCommandEncoder_encodeCommands(e_, c_) mad_es_rce((e_), (c_))"),
                     ("compute encodeCommands", "#define MTLComputeCommandEncoder_encodeCommands(e_, c_) mad_es_cce((e_), (c_))"),
                     ("blit encodeCommands", "#define MTLBlitCommandEncoder_encodeCommands(e_, c_) mad_es_bce((e_), (c_))"),
