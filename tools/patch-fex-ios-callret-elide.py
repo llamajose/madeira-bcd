@@ -466,15 +466,18 @@ def patch(sources):
     """Patch {relative path: text}; returns the patched texts.
 
     A file whose every replacement is already present is left alone; a file
-    with some but not all of them, or with a moved anchor, raises ValueError."""
+    with some but not all of them, or with a moved anchor, raises ValueError.
+    A replacement counts as present only where its anchor is gone or is part
+    of it, so an insertion whose anchor survives inside it is not applied twice."""
     results = {}
     for rel, edits in EDITS.items():
         text = sources[rel]
-        if all(text.count(new) == 1 for _, new in edits):
+        done = [text.count(new) == 1 and (old in new or old not in text) for old, new in edits]
+        if all(done):
             results[rel] = text
             continue
-        for old, _ in edits:
-            if text.count(old) != 1:
+        for (old, new), present in zip(edits, done):
+            if present or text.count(old) != 1 or (new in text and new not in old):
                 first = old.strip().splitlines()[0] if old.strip() else old
                 raise ValueError(f"{rel}: anchor changed or partial overlay: {first[:80]!r}")
         for old, new in edits:
