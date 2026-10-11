@@ -148,6 +148,10 @@ fi
 #    with `blr` and its return enters the block with `ret` after an L1 probe
 #    (10 instructions instead of 22), so the return-address predictor stays
 #    balanced. MADEIRA_FEX_EC_RET=0 keeps `br` and the loop-top re-entry.
+#  - patch-fex-ios-ec-bitmap-cache.py: the loop top's EC code check loads
+#    PEB->EcCodeBitMap from the thread's frame instead of walking TPIDRRO_EL0,
+#    the TEB and the PEB (4 instructions less on every call into ARM64EC code
+#    through the import table). MADEIRA_FEX_EC_BITMAP_CACHE=0 keeps the walk.
 echo "=== with the map-notification, IntervalsLock and IRCapRIP fixes and the AVX opt-in ==="
 python3 "$R/tools/patch-fex-ios-mapview-selfshared.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-intervals-reentry.py" "$R/FEX/Source/Windows/Common"
@@ -168,6 +172,7 @@ python3 "$R/tools/patch-fex-ios-callret-8mb.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-smc-store-fastpath.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-callret-elide.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-ec-ret.py" "$R/FEX"
+python3 "$R/tools/patch-fex-ios-ec-bitmap-cache.py" "$R/FEX"
 build
 git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/include/FEXCore/Debug/InternalThreadState.h FEXCore/Source/Interface/Core/Core.cpp Source/Windows/Common/CallRetStack.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/JIT/JIT.cpp
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
