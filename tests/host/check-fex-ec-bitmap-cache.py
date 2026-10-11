@@ -221,6 +221,9 @@ restore = [line for line in build.splitlines() if line.startswith('git -C FEX ch
 assert len(restore) == 1 and all(f' {rel}' in restore[0] for rel in overlay.EDITS), 'every patched file must be restored'
 workflow = (root / '.github/workflows/build-ipa.yml').read_text()
 assert "b'ec-bitmap-cache-v1 madeira-bcd' not in module" in workflow
+catalog = (root / 'build/tools/gen-config-catalog.py').read_text()
+assert '"env.MADEIRA_FEX_EC_BITMAP_CACHE"' in catalog and '"tools/patch-fex-ios-ec-bitmap-cache.py"' in catalog
+assert 'key: "env.MADEIRA_FEX_EC_BITMAP_CACHE"' in (root / 'app/Madeira/ConfigCatalog.generated.swift').read_text()
 
 print(f'EC bitmap cache: overlay idempotent after {len(applied)} build overlays, drift refused; EmitDispatcher equal '
       f'switched off and on every other build; switched on only the bitmap pointer load differs; {len(FIELDS)} frame '

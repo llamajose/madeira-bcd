@@ -450,6 +450,9 @@ restore = [line for line in build.splitlines() if line.startswith('git -C FEX ch
 assert len(restore) == 1 and all(f' {rel}' in restore[0] for rel in overlay.EDITS), 'every patched file must be restored'
 workflow = (root / '.github/workflows/build-ipa.yml').read_text()
 assert "b'ec-exit-lean-v1 madeira-bcd' not in module" in workflow
+catalog = (root / 'build/tools/gen-config-catalog.py').read_text()
+assert '"env.MADEIRA_FEX_EC_EXIT_LEAN"' in catalog and '"tools/patch-fex-ios-ec-exit-lean.py"' in catalog
+assert 'key: "env.MADEIRA_FEX_EC_EXIT_LEAN"' in (root / 'app/Madeira/ConfigCatalog.generated.swift').read_text()
 
 print(f'lean JIT exit: overlay idempotent after {len(applied)} build overlays, drift refused; stub text and frame offsets '
       f'checked' + (f'; {emulated} states run through both stubs agree, 130 calls counted' if emulated else '') +

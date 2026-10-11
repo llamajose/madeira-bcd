@@ -601,6 +601,9 @@ restore = [line for line in build.splitlines() if line.startswith('git -C FEX ch
 assert len(restore) == 1 and all(f' {rel}' in restore[0] for rel in overlay.EDITS), 'every patched file must be restored'
 workflow = (root / '.github/workflows/build-ipa.yml').read_text()
 assert "b'callret-elide-v1 madeira-bcd' not in module" in workflow
+catalog = (root / 'build/tools/gen-config-catalog.py').read_text()
+assert '"env.MADEIRA_FEX_CALLRET_ELIDE"' in catalog and '"tools/patch-fex-ios-callret-elide.py"' in catalog
+assert 'key: "env.MADEIRA_FEX_CALLRET_ELIDE"' in (root / 'app/Madeira/ConfigCatalog.generated.swift').read_text()
 
 print(f'call-ret elision: overlay idempotent after {len(applied)} build overlays, drift refused; {compared} emitter '
       'comparisons equal with the stack kept and on every other build; no shadow-stack access when elided; '

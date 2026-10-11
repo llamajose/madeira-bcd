@@ -596,6 +596,32 @@ OVERLAY = {
                         "memory, performance data); with env.MADEIRA_DXGI_SRC = 1 DXGI's CheckInterfaceSupport gives "
                         "the same driver version. Off (default): no adapter is listed, as before. Set it in the game's "
                         "own file; read at session start."},
+    # madeira-bcd: the ARM64EC JIT's boundary with native code (tools/patch-fex-ios-*.py, all on by default).
+    "env.MADEIRA_FEX_CALLRET_ELIDE": {"category": "x86 emulation (FEX)", "title": "64-bit JIT without the call-return shadow stack",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-fex-ios-callret-elide.py"],
+                "note": "Default on. The 64-bit (ARM64EC) JIT no longer keeps FEX's call-return shadow stack, which "
+                        "nothing reads on iOS: 9 instructions less per guest CALL and per RET, and linked calls become "
+                        "`bl`, so the CPU's return predictor follows guest calls. 0: the stack as before. Read when a "
+                        "program starts."},
+    "env.MADEIRA_FEX_EC_RET": {"category": "x86 emulation (FEX)", "title": "Returns from native code through the return predictor",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-fex-ios-ec-ret.py"],
+                "note": "Default on. A guest call into native (ARM64EC) code leaves the JIT with BLR and its return "
+                        "comes back with RET after an L1 lookup (10 instructions instead of 22), so the CPU's "
+                        "return-address predictor stays in step with the guest's calls. 0: BR and the dispatcher loop "
+                        "as before. Read when a program starts."},
+    "env.MADEIRA_FEX_EC_BITMAP_CACHE": {"category": "x86 emulation (FEX)", "title": "Native-code check with the thread's bitmap pointer",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-fex-ios-ec-bitmap-cache.py"],
+                "note": "Default on. The 64-bit JIT's dispatcher tests the native-code bitmap through a pointer kept in "
+                        "the thread's state instead of walking TPIDRRO_EL0, the TEB and the PEB: 4 instructions less on "
+                        "every call into a system DLL through its import table. 0: the walk as before. Read when a "
+                        "program starts."},
+    "env.MADEIRA_FEX_EC_EXIT_LEAN": {"category": "x86 emulation (FEX)", "title": "Lean exit from the JIT into native code",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-fex-ios-ec-exit-lean.py"],
+                "note": "Default on while AFP is off (the default). Calls from the 64-bit JIT into native (ARM64EC) code "
+                        "use a shorter stub: no FPCR read, the CPU area and suspend doorbell from the thread's state, the "
+                        "call counted per thread instead of with an atomic, and the alias lookup starting at the thread's "
+                        "own last hit; 31 instructions instead of 44. [xp-api] x64->EC rates lag by under 64 calls per "
+                        "thread. 0: ExitFunctionEC as before. Read when a program starts."},
     "dxmt": {"title": "DXMT options (a=b;c=d)",
              "note": "Exported as DXMT_CONFIG with the options joined by ';', a library game's own dxmt options after these: "
                      "e.g. d3d11.mipClampBC=1;d3d11.preferredMaxFrameRate=30. DXMT reads at most 259 characters of it, "
