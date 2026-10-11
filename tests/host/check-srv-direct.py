@@ -105,7 +105,9 @@ typedef pthread_mutex_t os_unfair_lock;
 #define OS_UNFAIR_LOCK_INIT PTHREAD_MUTEX_INITIALIZER
 #define os_unfair_lock_lock(l) pthread_mutex_lock(l)
 #define os_unfair_lock_unlock(l) pthread_mutex_unlock(l)
-typedef int qos_class_t;
+#ifndef __APPLE__
+typedef int qos_class_t;   /* Apple's <pthread.h> declares it (sys/qos.h) */
+#endif
 typedef unsigned int data_size_t;
 typedef unsigned long long client_ptr_t;
 enum request { REQ_new_thread, REQ_terminate_thread, REQ_suspend_thread, @NAMES@, REQ_NB_REQUESTS };

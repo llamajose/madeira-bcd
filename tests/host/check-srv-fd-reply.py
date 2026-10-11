@@ -363,7 +363,8 @@ else:
                        capture_output=True, text=True)
     check(b.returncode == 0, "the harness compiles (ASan + UBSan)" + ("" if not b.returncode else ": " + b.stderr[-2000:]))
     if not b.returncode:
-        env = dict(os.environ, ASAN_OPTIONS="detect_leaks=1")
+        leaks = "0" if sys.platform == "darwin" else "1"   # LeakSanitizer does not run on macOS
+        env = dict(os.environ, ASAN_OPTIONS="detect_leaks=" + leaks)
         env.pop("MADEIRA_SRV_FD_SOCKET", None)
         for label, extra in (("default (reply)", {}), ("MADEIRA_SRV_FD_SOCKET=1", {"MADEIRA_SRV_FD_SOCKET": "1"})):
             r = subprocess.run([str(exe), "socket" if extra else "reply"], capture_output=True, text=True,
