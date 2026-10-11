@@ -2151,29 +2151,35 @@ unsigned long long ios_fps_cap_dxmt_pace( void )
  *    i.e. the whole device's power while unplugged, if the sandbox lets it be read.
  * One [power-t] line names the threads that used the most energy in those 5 s
  * ([xp]'s per-thread PROC_PIDTHREADCOUNTS energy, which [xp-t] does not print), so
- * the wineserver, Metal and app threads can be told apart from the game's. All
- * calls are made on the xprobe thread; nothing is resolved while the switch is off. */
+ * the wineserver, Metal and app threads can be told apart from the game's; a
+ * native thread (m<tid>) carries its base priority, which names its QoS class
+ * (47 user-interactive, 37 user-initiated, 31 default, 20 utility, 4 background,
+ * 97 real-time). All calls are made on the xprobe thread; nothing is resolved
+ * while the switch is off. */
 static int ios_power_probe_on;   /* read where the samplers are armed */
 
-struct ios_pp_thr { uint64_t tid; uint32_t wtid; char role[6]; double p_mj, e_mj; };
+struct ios_pp_thr { uint64_t tid; uint32_t wtid; char role[6]; int pri; double p_mj, e_mj; };
 static struct ios_pp_thr ios_pp_thr[256];
 static int ios_pp_nthr;
 
-static void ios_pp_thread( uint64_t tid, uint32_t wtid, const char *role, double p_mj, double e_mj )
+/* returns the entry, or NULL when the table is full; a new native entry has pri -2 (not yet asked) */
+static struct ios_pp_thr *ios_pp_thread( uint64_t tid, uint32_t wtid, const char *role, double p_mj, double e_mj )
 {
     int i;
     for (i = 0; i < ios_pp_nthr; i++) if (ios_pp_thr[i].tid == tid) break;
     if (i == ios_pp_nthr)
     {
-        if (ios_pp_nthr >= (int)(sizeof(ios_pp_thr) / sizeof(ios_pp_thr[0]))) return;
+        if (ios_pp_nthr >= (int)(sizeof(ios_pp_thr) / sizeof(ios_pp_thr[0]))) return NULL;
         memset( &ios_pp_thr[i], 0, sizeof(ios_pp_thr[i]) );
         ios_pp_thr[i].tid = tid;
+        ios_pp_thr[i].pri = wtid ? -1 : -2;
         ios_pp_nthr++;
     }
     ios_pp_thr[i].wtid = wtid;
     if (role) snprintf( ios_pp_thr[i].role, sizeof(ios_pp_thr[i].role), "%s", role );
     ios_pp_thr[i].p_mj += p_mj;
     ios_pp_thr[i].e_mj += e_mj;
+    return &ios_pp_thr[i];
 }
 
 /* struct coalition_resource_usage (xnu osfmk/mach/coalition.h) up to swapins; the
@@ -2433,6 +2439,10 @@ static void ios_power_probe_tick( const char *wall, uint64_t now_ns, double dt_m
             n += snprintf( line + n, sizeof(line) - n, " %s%04x:%.3f(%.3f/%.3f)", ios_pp_thr[b].role[0] ? ios_pp_thr[b].role : "-",
                            ios_pp_thr[b].wtid, (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms,
                            ios_pp_thr[b].e_mj / ms );
+        else if (ios_pp_thr[b].pri >= 0)
+            n += snprintf( line + n, sizeof(line) - n, " m%llu/%d:%.3f(%.3f/%.3f)", (unsigned long long)ios_pp_thr[b].tid,
+                           ios_pp_thr[b].pri, (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms,
+                           ios_pp_thr[b].e_mj / ms );
         else
             n += snprintf( line + n, sizeof(line) - n, " m%llu:%.3f(%.3f/%.3f)", (unsigned long long)ios_pp_thr[b].tid,
                            (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms, ios_pp_thr[b].e_mj / ms );
@@ -2512,8 +2522,16 @@ static void ios_xprobe_main( void )
                                 r->role = NULL;
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
                                 if (ios_power_probe_on)   /* madeira-bcd power probe: this thread's energy on P and E cores */
-                                    ios_pp_thread( idi.thread_id, w, r->role, (double)(cur[0].nj - pv->c[0].nj) / 1e6,
-                                                   (double)(cur[1].nj - pv->c[1].nj) / 1e6 );
+                                {
+                                    struct ios_pp_thr *pp = ios_pp_thread( idi.thread_id, w, r->role, (double)(cur[0].nj - pv->c[0].nj) / 1e6,
+                                                                           (double)(cur[1].nj - pv->c[1].nj) / 1e6 );
+                                    if (pp && pp->pri == -2)   /* a native thread, first time in this window: its base priority (QoS) */
+                                    {
+                                        thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT;
+                                        pp->pri = thread_info( th[k], THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc ) == KERN_SUCCESS
+                                                  ? xi.pth_priority : -1;
+                                    }
+                                }
                                 if (r->role && strchr( r->role, 'P' ) && teb && pt + et >= 1.0)
                                 {
                                     uint32_t gp = 0;

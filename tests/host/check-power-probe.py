@@ -207,9 +207,11 @@ int main( int argc, char **argv )
     for (i = 0; i < 4 * 16; i++)   /* 16 s of 250 ms samples */
     {
         now += 250000000ull;
-        ios_pp_thread( 3270754, 0, NULL, 150.0, 2.0 );      /* a native thread: 0.6 W on P cores */
-        ios_pp_thread( 4242, 0x24, "EP", 30.0, 45.0 );      /* the game's presenting thread */
+        struct ios_pp_thr *nat = ios_pp_thread( 3270754, 0, NULL, 150.0, 2.0 );   /* a native thread: 0.6 W on P cores */
+        struct ios_pp_thr *game = ios_pp_thread( 4242, 0x24, "EP", 30.0, 45.0 );  /* the game's presenting thread */
         ios_pp_thread( 4243, 0xf8, NULL, 0.0, 20.0 );
+        if (!nat || !game || game->pri != -1) return 3;   /* a Wine thread is never asked for its priority */
+        if (nat->pri == -2) nat->pri = 47;                 /* what the xprobe's THREAD_EXTENDED_INFO gives */
         ios_power_probe_tick( "12:00:00.000", now, 250.0, 500.0, 400.0, 25.0, 0.0 );
     }
     return 0;
@@ -244,8 +246,12 @@ with tempfile.TemporaryDirectory(prefix="madeira-power-probe-") as tmp:
         check("battery 3.85 V x -1250 mA = 4.81 W (discharging: the whole device)" in last, "battery: 3.85 V x 1.25 A = 4.81 W")
         check(allx.stdout.count("[power] IOReport Energy Model channels") == 1, "the IOReport channel list is logged once")
         pt = [l for l in allx.stdout.splitlines() if l.startswith("[power-t] ")]
-        check(len(pt) == 3 and pt[-1].endswith("top threads, W (P/E): m3270754:0.608(0.600/0.008) EP0024:0.300(0.120/0.180) -00f8:0.080(0.000/0.080)"),
-              "[power-t]: threads by energy in W with the P/E split (%s)" % (pt[-1] if pt else ""))
+        check(len(pt) == 3 and pt[-1].endswith("top threads, W (P/E): m3270754/47:0.608(0.600/0.008) EP0024:0.300(0.120/0.180) -00f8:0.080(0.000/0.080)"),
+              "[power-t]: threads by energy in W with the P/E split, a native thread with its base priority (%s)" % (pt[-1] if pt else ""))
+xp_hook = xprobe[xprobe.find("if (ios_power_probe_on)   /* madeira-bcd power probe: this thread's energy"):]
+xp_hook = xp_hook[:xp_hook.find("sum_thr_ms += pt + et;")]
+check("if (pp && pp->pri == -2)" in xp_hook and "THREAD_EXTENDED_INFO" in xp_hook and "xi.pth_priority" in xp_hook,
+      "the xprobe asks a native thread for its base priority once per 5 s window (THREAD_EXTENDED_INFO)")
 
 gen = GEN.read_text(encoding="utf-8")
 cat = CAT.read_text(encoding="utf-8")
