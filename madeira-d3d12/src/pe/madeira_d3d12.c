@@ -3384,7 +3384,9 @@ static int mad_cmd_names(const struct mad_cmd *c, const struct mad_resource *r) 
  * the target is drawn): in Horizon Zero Dawn ~10 such clear-only passes and ~8
  * passes split by a clear a frame. Now the open pass ends only for a clear of
  * one of its own attachments, and a pending clear waits for the pass that binds
- * its target. Nothing can reach that target in between: after the clear it is
+ * its target through the same view (a pass that binds the texture through
+ * another view, or another clear of it through another view, applies it first:
+ * views may overlap). Nothing can reach that target in between: after the clear it is
  * in RENDER_TARGET or DEPTH_WRITE state, so any other use needs a
  * ResourceBarrier naming it first; such a barrier (or one whose resources were
  * not all recorded) applies the clear right there, so do a copy, resolve or
@@ -3407,6 +3409,15 @@ static void exec_flush_named(struct mad_exec *e, const struct mad_cmd *c) {
     unsigned k;
     for (k = 0; k < e->npend; )
         if (mad_cmd_names(c, e->pend[k].res)) { InterlockedIncrement(&g_tr_def_flushed); exec_flush_clear(e, (int)k); }
+        else k++;
+}
+/* A clear of r through view v comes: a pending clear of r through another view
+ * goes first (two views of one texture may overlap, and the later clear must
+ * win), so at most one clear per texture is ever pending. */
+static void exec_flush_other_views(struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v) {
+    unsigned k;
+    for (k = 0; k < e->npend; )
+        if (e->pend[k].res == r && !mad_rtvp_eq(&e->pend[k].v, v)) { InterlockedIncrement(&g_tr_def_flushed); exec_flush_clear(e, (int)k); }
         else k++;
 }
 
@@ -3467,7 +3478,10 @@ static void exec_rp_note(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_BARRIER: case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
         if (e->npend && mad_clear_defer_on()) exec_flush_named(e, c);
         break;
-    case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_RESOLVE: break;
+    case MC_CLEAR_RT: case MC_CLEAR_DS:
+        if (e->npend && mad_clear_defer_on()) exec_flush_other_views(e, c->u.clear.res, &c->u.clear.v);
+        break;
+    case MC_RESOLVE: break;   /* exec_resolve applies every pending clear first */
     default: return;
     }
     if (e->rp_ndisc) exec_disc_touch(e, c);
@@ -3791,20 +3805,25 @@ static const struct mad_list *mad_rp_next(const struct mad_queue *q, UINT count,
     return n;
 }
 /* A carried pass that no list took (cannot happen while mad_rp_next and the
- * replay loop agree; kept so an encoder is never left open at a commit). */
+ * replay loop agree; kept so an encoder is never left open at a commit). It
+ * ends as any pass does: fence update, store actions, pending clears. The
+ * replay state it needs is static (no allocation can fail here), under its
+ * own lock (each queue calls this under its submit lock). */
+static struct mad_exec g_rp_close_e;
+static SRWLOCK g_rp_close_lock = SRWLOCK_INIT;
 static void mad_rp_close(struct mad_queue *q) {
     struct mad_rp_carry *k = q->rp_carry;
-    struct mad_exec *e;
+    struct mad_exec *e = &g_rp_close_e;
     if (!k || !k->renc) return;
     d3d12_log("[madeira-d3d12] rp-carry: a carried render pass was not taken by a list; ending it\n");
-    e = calloc(1, sizeof *e);
-    if (!e) { MTLCommandEncoder_endEncoding(k->renc); k->renc = 0; return; }
+    AcquireSRWLockExclusive(&g_rp_close_lock);
+    memset(e, 0, sizeof *e);
     e->q = q; e->cb = q->open_cb; e->vis_prev = ~(UINT64)0;
     exec_rp_take(e, k);
     e->pass_draws = 0;   /* no list: no capture of it */
     exec_end(e);
     while (e->npend) exec_flush_clear(e, 0);
-    free(e);
+    ReleaseSRWLockExclusive(&g_rp_close_lock);
 }
 
 /* A clear whose target is not part of the next pass still has to happen: it
@@ -4283,11 +4302,14 @@ static int exec_begin_render(struct mad_exec *e) {
         attachless = 1;
     }
     /* Pending clears for targets outside this pass go first, on their own.
-     * madeira-bcd clear-defer: they wait for the pass that binds their target. */
-    for (k = 0; k < e->npend && !mad_clear_defer_on(); ) {
-        int bound = (e->pend[k].res == e->depth && mad_rtvp_eq(&e->pend[k].v, &e->dp));
-        for (i = 0; i < e->nrt && !bound; i++) if (e->rt[i] == e->pend[k].res && mad_rtvp_eq(&e->pend[k].v, &e->rtp[i])) bound = 1;
-        if (!bound) exec_flush_clear(e, (int)k); else k++;
+     * madeira-bcd clear-defer: they wait for the pass that binds their target;
+     * one of a texture this pass binds through another view still goes first
+     * (the views may overlap). */
+    for (k = 0; k < e->npend; ) {
+        int bound = (e->pend[k].res == e->depth && mad_rtvp_eq(&e->pend[k].v, &e->dp)), here = e->pend[k].res == e->depth;
+        for (i = 0; i < e->nrt && !bound; i++)
+            if (e->rt[i] == e->pend[k].res) { here = 1; if (mad_rtvp_eq(&e->pend[k].v, &e->rtp[i])) bound = 1; }
+        if (!bound && (here || !mad_clear_defer_on())) exec_flush_clear(e, (int)k); else k++;
     }
     memset(&rpi, 0, sizeof rpi);
     for (i = 0; i < e->nrt; i++) exec_note_write(e, e->rt[i]);   /* ml1116 */

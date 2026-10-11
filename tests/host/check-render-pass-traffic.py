@@ -17,8 +17,9 @@ command lists through a loop that carries the real loop's hooks, and checks:
     load action of the pass that binds it, with no clear-only pass; a clear of
     one of the pass's own textures still ends it; a barrier naming the
     texture (or one whose resources were not all recorded, but not one that
-    only adds resource-less UAV barriers), a copy naming it and the list end
-    apply the clear first; with clear-defer = 0 the old order comes back,
+    only adds resource-less UAV barriers), a copy naming it, a pass binding
+    or a clear of the texture through another view, and the list end apply
+    the clear first; with clear-defer = 0 the old order comes back,
     including the old gap (a dispatch after a barrier ran before the clear);
   - rp-discard (default off): a whole DiscardResource makes the next pass's
     Load of that texture DontCare only with the switch on, counted either way;
@@ -106,8 +107,9 @@ check("mad_ecl_run: one carry slot per call, the next list per list, closed befo
       and run.index("mad_rp_close(q);      /* madeira-bcd rp-carry: nothing is carried into a full batch") < run.index("mad_queue_flush(q);   /* bound the batch */")
       and run.index("mad_rp_close(q); q->rp_carry = NULL; q->rp_next = NULL;") < run.index("LeaveCriticalSection(&ml1021_q->submit_lock);"))
 begin = func("static int exec_begin_render(struct mad_exec *e) {")
-check("exec_begin_render: pending clears outside the pass flushed only with clear-defer = 0; traffic counted per pass",
-      "for (k = 0; k < e->npend && !mad_clear_defer_on(); ) {" in begin
+check("exec_begin_render: pending clears outside the pass flushed only with clear-defer = 0 (one of a texture the pass binds "
+      "through another view always); traffic counted per pass",
+      "if (!bound && (here || !mad_clear_defer_on())) exec_flush_clear(e, (int)k); else k++;" in begin
       and "if (e->renc) mad_tr_pass(&rpi, e->rt, e->rtp, e->nrt, e->depth, &e->dp);" in begin)
 addc = func("static void exec_add_clear(")
 check("exec_add_clear: ends the open pass only for its own textures (clear-defer) or always (clear-defer = 0)",
@@ -259,6 +261,11 @@ struct mad_queue { struct mad_device *device; struct mad_vis_batch *vis; unsigne
 ''' + exec_struct + r'''
 /* ---- stand-ins ---- */
 static LONG InterlockedIncrement(volatile LONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+typedef struct { void *p; } SRWLOCK;
+#define SRWLOCK_INIT { 0 }
+static int srw_held, srw_taken;
+static void AcquireSRWLockExclusive(SRWLOCK *l) { (void)l; srw_held++; srw_taken++; }
+static void ReleaseSRWLockExclusive(SRWLOCK *l) { (void)l; srw_held--; }
 static void *InterlockedCompareExchangePointer(void *volatile *p, void *x, void *cmp) {
     void *e = cmp; __atomic_compare_exchange_n(p, &e, x, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
 /* encode-batch: what this thread queued goes out (recorded: op 24 must come after it) */
@@ -526,6 +533,26 @@ int main(void) {
     p = first_pass_with(0x50, 0);
     for (q2 = 0; q2 < nev && evs[q2].kind != 'B'; q2++) ;
     EXPECT(p >= 0 && p < q2 && first_pass_with(0xb0, 0) > q2 && g_tr_clear_only == 2, "copy: X first; B at the list end");
+    /* another view of a texture with a clear pending (views may overlap): a pass binding the texture through it,
+     * or a clear through it, applies the pending clear first */
+    reset(-1, -1, -1, 1);
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1);
+    { struct mad_cmd *c = push(l1, MC_CLEAR_RT); c->u.clear.res = &X; c->u.clear.v.level = 1; c->u.clear.v.layers = 1; c->u.clear.rgba[0] = 0.5f; }
+    draw(l1);
+    { struct mad_resource *x1[1] = { &X }; rts(l1, 1, x1, NULL); } draw(l1);
+    ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(count('R') == 3 && g_tr_clear_only == 1 && first_pass_with(0x50, 0) == 1 && color_load(1, 0x50) == WMTLoadActionClear &&
+           evs[1].rpi.colors[0].level == 1 && color_load(2, 0x50) == WMTLoadActionLoad && evs[2].rpi.colors[0].level == 0 && all_ended_once(),
+           "a pass binding X through another view: X's pending clear (mip 1) goes first; A's pass was not split by it");
+    reset(-1, -1, -1, 1);
+    l1 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1);
+    { struct mad_cmd *c = push(l1, MC_CLEAR_RT); c->u.clear.res = &X; c->u.clear.v.level = 1; c->u.clear.v.layers = 1; c->u.clear.rgba[0] = 0.5f; }
+    clear_rt(l1, &X, 0.75f); draw(l1);
+    { struct mad_resource *x1[1] = { &X }; rts(l1, 1, x1, NULL); } draw(l1);
+    ls[0] = l1; ecl(&Q, 1, ls);
+    EXPECT(count('R') == 4 && g_tr_clear_only == 1 && g_tr_def_flushed == 1 && evs[1].rpi.colors[0].texture == 0x50 && evs[1].rpi.colors[0].level == 1 &&
+           color_load(3, 0x50) == WMTLoadActionClear && evs[3].rpi.colors[0].clear_color.r == 0.75 && all_ended_once(),
+           "two clears of X through two views: the first goes first, the second is the Clear of X's pass");
 
     /* 5. rp-discard: off = counted, Load kept; on = DontCare */
     for (i = 0; i <= 1; i++) {
@@ -619,8 +646,19 @@ int main(void) {
     l1 = L(); l2 = L(); rts(l1, 4, GB, &D); vpsc(l1); draw(l1); rts(l2, 4, GB, &D); vpsc(l2); draw(l2);
     { struct mad_rp_carry k0; memset(&k0, 0, sizeof k0); Q.rp_carry = &k0; Q.rp_next = l2; replay(&Q, l1);
       EXPECT(k0.renc && evs[0].ended == 0, "carried at the list end");
+      srw_taken = 0; mad_rp_close(&Q);
+      EXPECT(!k0.renc && evs[0].ended == 1 && evs[0].updates == 1, "mad_rp_close ends it with its fence update");
+      EXPECT(srw_taken == 1 && !srw_held, "mad_rp_close: its static replay state under its lock, released"); Q.rp_carry = NULL; }
+    /* the same with a store left open (rp-discard) and a pending clear going along: both settled there */
+    reset(-1, 1, 1, 1); mad_rp_dset_add(&A);
+    l1 = L(); l2 = L(); rts(l1, 1, a1, NULL); vpsc(l1); draw(l1); clear_rt(l1, &X, 0.5f); rts(l2, 1, a1, NULL); vpsc(l2); draw(l2);
+    { struct mad_rp_carry k0; memset(&k0, 0, sizeof k0); Q.rp_carry = &k0; Q.rp_next = l2; replay(&Q, l1);
+      EXPECT(k0.renc && k0.late && k0.npend == 1 && !n24 && count('R') == 1, "carried with its store left open and a pending clear");
       mad_rp_close(&Q);
-      EXPECT(!k0.renc && evs[0].ended == 1 && evs[0].updates == 1, "mad_rp_close ends it with its fence update"); Q.rp_carry = NULL; }
+      EXPECT(!k0.renc && evs[0].ended == 1 && evs[0].late_before_end && late_color(0, 0) == WMTStoreActionStore && count('R') == 2 &&
+             first_pass_with(X.texture, 1) == 1 && color_load(1, X.texture) == WMTLoadActionClear && evs[1].ended == 1 && all_ended_once(),
+             "mad_rp_close: the store decided (kept: no list to look at), then the pending clear applied");
+      Q.rp_carry = NULL; }
     /* 7. rp-discard's store side: decided at the pass end through op 24 */
     { struct mad_resource *b1[1] = { &B };
     reset(-1, -1, 1, 1); mad_rp_dset_add(&A);
