@@ -109,7 +109,7 @@ check("mad_ecl_run: one carry slot per call, the next list per list, closed befo
 begin = func("static int exec_begin_render(struct mad_exec *e) {")
 check("exec_begin_render: pending clears outside the pass flushed only with clear-defer = 0 (one of a texture the pass binds "
       "through another view always); traffic counted per pass",
-      "if (!bound && (here || !mad_clear_defer_on())) exec_flush_clear(e, (int)k); else k++;" in begin
+      "if (bound || (!here && mad_clear_defer_on())) { k++; continue; }" in begin
       and "if (e->renc) mad_tr_pass(&rpi, e->rt, e->rtp, e->nrt, e->depth, &e->dp);" in begin)
 addc = func("static void exec_add_clear(")
 check("exec_add_clear: ends the open pass only for its own textures (clear-defer) or always (clear-defer = 0)",
@@ -541,7 +541,7 @@ int main(void) {
     draw(l1);
     { struct mad_resource *x1[1] = { &X }; rts(l1, 1, x1, NULL); } draw(l1);
     ls[0] = l1; ecl(&Q, 1, ls);
-    EXPECT(count('R') == 3 && g_tr_clear_only == 1 && first_pass_with(0x50, 0) == 1 && color_load(1, 0x50) == WMTLoadActionClear &&
+    EXPECT(count('R') == 3 && g_tr_clear_only == 1 && g_tr_def_flushed == 1 && first_pass_with(0x50, 0) == 1 && color_load(1, 0x50) == WMTLoadActionClear &&
            evs[1].rpi.colors[0].level == 1 && color_load(2, 0x50) == WMTLoadActionLoad && evs[2].rpi.colors[0].level == 0 && all_ended_once(),
            "a pass binding X through another view: X's pending clear (mip 1) goes first; A's pass was not split by it");
     reset(-1, -1, -1, 1);

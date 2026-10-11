@@ -3787,7 +3787,7 @@ static void mad_tr_report(double np) {
     int k;
     for (k = 0; k < RPM_N; k++) { n[k] = InterlockedExchange(&g_rp_miss[k], 0); b[k] = InterlockedExchange64(&g_rp_miss_b[k], 0); }
     d3d12_log("[perf] gpu-traffic per frame: load %.1f MB, clear %.1f MB, not loaded %.1f MB, store %.1f MB, not stored %.1f MB; "
-              "render passes %.1f (clear-only %.1f); clears that left the open pass alone %.1f, applied at a barrier or copy %.1f; "
+              "render passes %.1f (clear-only %.1f); clears that left the open pass alone %.1f, applied early (barrier, copy, other view) %.1f; "
               "whole discards %.1f, loads of what they left undefined %.1f MB\n",
               ld / mb / np, cl / mb / np, nl / mb / np, st / mb / np, ns / mb / np, ps / np, co / np, df / np, fl / np, dw / np, dl / mb / np);
     d3d12_log("[perf] gpu-traffic list ends per frame with a pass the next list goes on with (store + reload): carried %.1f (%.0f MB), "
@@ -4309,7 +4309,9 @@ static int exec_begin_render(struct mad_exec *e) {
         int bound = (e->pend[k].res == e->depth && mad_rtvp_eq(&e->pend[k].v, &e->dp)), here = e->pend[k].res == e->depth;
         for (i = 0; i < e->nrt && !bound; i++)
             if (e->rt[i] == e->pend[k].res) { here = 1; if (mad_rtvp_eq(&e->pend[k].v, &e->rtp[i])) bound = 1; }
-        if (!bound && (here || !mad_clear_defer_on())) exec_flush_clear(e, (int)k); else k++;
+        if (bound || (!here && mad_clear_defer_on())) { k++; continue; }   /* this pass's Clear load action, or a later pass's */
+        if (here && mad_clear_defer_on()) InterlockedIncrement(&g_tr_def_flushed);
+        exec_flush_clear(e, (int)k);
     }
     memset(&rpi, 0, sizeof rpi);
     for (i = 0; i < e->nrt; i++) exec_note_write(e, e->rt[i]);   /* ml1116 */

@@ -240,7 +240,8 @@ OVERLAY = {
                         "render pass that draws to that target starts with: a clear no longer ends the pass in "
                         "progress unless it is one of that pass's own targets, and needs no pass of its own (which "
                         "wrote the whole target to memory and read it back later). A barrier or copy that names the "
-                        "cleared texture applies the clear first, so nothing sees it uncleared. 0: every clear ends "
+                        "cleared texture, or a pass or clear that uses it through another view, applies the clear "
+                        "first, so nothing sees it uncleared. 0: every clear ends "
                         "the open pass and goes before the next pass on its own, as before. Read once per game start."},
     "rp-carry": {"category": "Direct3D 12", "title": "Experiment: render passes go on into the next command list",
                 "kind": "bool", "default": "0",
