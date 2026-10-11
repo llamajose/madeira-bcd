@@ -1235,6 +1235,15 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* SDL2 games: with its raw-input joystick driver on (the default),
+             * SDL skips XInput enumeration and expects every pad to show up as a
+             * HID device. Madeira's pads exist only behind the XInput API (host
+             * snapshots, no HID device), so SDL saw no controller at all --
+             * SuperTuxKart's input.xml listed the keyboard only. Turning the
+             * raw-input driver off makes SDL enumerate through XInputGetCapabilities.
+             * Set before the env file below, which can still override it. */
+            setenv("SDL_JOYSTICK_RAWINPUT", "0", 0);
+
             /* ml1062: Documents/madeira-env.txt -- one KEY=VALUE per line, exported
              * before Wine starts. FEX reads its whole configuration from FEX_*
              * environment variables (EnvLoader over the process environment, which

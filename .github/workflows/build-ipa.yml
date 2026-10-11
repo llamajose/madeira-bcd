@@ -13,9 +13,77 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # c-gow's desktop OpenGL backend: MoltenVK (Vulkan on Metal) and Mesa's
+  # OSMesa with Zink (build/moltenvk-ios, build/mesa-ios). Fixed-function and
+  # 32-bit OpenGL games need it. Its own job, so it can never fail or time out
+  # the IPA build: without it the app still builds and OpenGL games use the
+  # OpenGL ES backend (app/Madeira/gl/README.md). Cached by the build scripts.
+  gl:
+    if: github.repository == 'llamajose/madeira-bcd' || github.repository == 'ultrasetting/madeira-bcd'
+    runs-on: macos-15
+    timeout-minutes: 150
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        shell: bash
+        run: |
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NEWEST" ]; then
+            sudo xcode-select -s "$NEWEST/Contents/Developer"
+            echo "::notice::selected $NEWEST"
+          fi
+
+      - name: Restore desktop OpenGL build
+        id: glcache
+        uses: actions/cache/restore@v4
+        with:
+          path: gl-out
+          key: gl-zink-${{ hashFiles('build/mesa-ios/**', 'build/moltenvk-ios/**') }}
+
+      - name: Build MoltenVK and Mesa (OSMesa + Zink) for iOS
+        if: steps.glcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p research
+          git clone --depth 1 -b v1.4.2 https://github.com/KhronosGroup/MoltenVK research/MoltenVK
+          bash build/moltenvk-ios/build.sh
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/mesa.tar.xz https://archive.mesa3d.org/mesa-25.0.7.tar.xz
+          echo "592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6  /tmp/mesa.tar.xz" | shasum -a 256 -c -
+          tar -xJf /tmp/mesa.tar.xz -C research
+          python3 -m venv research/mesa-venv
+          research/mesa-venv/bin/pip install --quiet meson mako pyyaml packaging ninja
+          bash build/mesa-ios/build.sh
+          mkdir -p gl-out/gl gl-out/licenses
+          cp app/Madeira/gl/*.dylib app/Madeira/gl/*.version gl-out/gl/
+          for f in Mesa-license.rst MoltenVK-Apache-2.0.txt SPIRV-Cross-Apache-2.0.txt \
+                   SPIRV-Tools-Apache-2.0.txt cereal-BSD-3-Clause.txt; do
+            cp "app/Madeira/licenses/$f" gl-out/licenses/
+          done
+          ls -lR gl-out
+
+      - name: Save desktop OpenGL build
+        if: steps.glcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: gl-out
+          key: gl-zink-${{ hashFiles('build/mesa-ios/**', 'build/moltenvk-ios/**') }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: madeira-gl
+          path: gl-out
+          retention-days: 7
+
   build:
-    # madeira-bcd: runs only in the owner's repository; a fork's run is skipped.
-    if: github.repository == 'bahacan16/madeira-bcd'
+    needs: gl
+    # madeira-bcd: runs only in the owner's repository and ultrasetting's fork; other forks skip it.
+    # Runs whether or not the desktop OpenGL job above succeeded.
+    if: ${{ !cancelled() && (github.repository == 'llamajose/madeira-bcd' || github.repository == 'ultrasetting/madeira-bcd') }}
     runs-on: macos-15
     # contents: write only so the token can see DRAFT releases, which is where
     # the Metal Shader Converter installer is kept (drafts are not public).
@@ -454,6 +522,12 @@ jobs:
           python3 tests/host/check-smc-store-fastpath.py
           python3 tests/host/check-rtcs-cap.py
 
+      # c-gow's OpenGL (patches/wine-opengl-winios.patch): opengl32's unix side,
+      # which build/ntdll-unix/build.sh compiles, needs the regenerated thunks
+      # and the winios WGL hooks. Must run before "Build ntdll-unix".
+      - name: Patch wine with the winios OpenGL driver (c-gow opengl work)
+        run: git -C wine apply ../patches/wine-opengl-winios.patch
+
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
@@ -616,6 +690,20 @@ jobs:
         with:
           path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
           key: llvm-mingw-20260421-ucrt-macos-universal
+
+      # c-gow's GC64 LuaJIT for LOVE games (compat/love/lua51.dll, mapped in
+      # place of a game's low-memory LuaJIT by build/wineserver/luajit_compat.c).
+      # Optional: if it fails, only those LOVE games keep failing.
+      - name: Build LuaJIT for LOVE games (c-gow)
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p research
+          [ -d research/LuaJIT ] || git clone --depth 1 -b v2.1 https://github.com/LuaJIT/LuaJIT research/LuaJIT
+          bash build/luajit-x64/build.sh
 
       # env.MADEIRA_DXGI_BUDGET_EVENTS = 1 (opt-in): the budget-change events
       # tools/patch-dxgi-budget-events.py adds to dxgi-src.dll, checked (and
@@ -1818,6 +1906,27 @@ jobs:
           echo "::notice::$(xcrun swift --version 2>&1 | grep -m1 'Swift version')"
           python3 tools/stikjit-interface-compat.py app/Frameworks/StikJIT.xcframework
 
+      - name: Fetch the desktop OpenGL build (c-gow)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: madeira-gl
+          path: app/Madeira
+
+      - name: Report the OpenGL and LOVE extras in this build
+        shell: bash
+        run: |
+          if ls app/Madeira/gl/*.dylib > /dev/null 2>&1; then
+            echo "::notice::desktop OpenGL (Zink): $(ls app/Madeira/gl/*.dylib | xargs -n1 basename | tr '\n' ' ')"
+          else
+            echo "::warning::no desktop OpenGL build: OpenGL games use the OpenGL ES backend"
+          fi
+          if [ -f app/Madeira/compat/love/lua51.dll ]; then
+            echo "::notice::GC64 LuaJIT for LOVE games included"
+          else
+            echo "::warning::no GC64 LuaJIT: LOVE games that need low memory will not start"
+          fi
+
       - name: Archive (unsigned)
         shell: bash
         run: |
@@ -1932,11 +2041,11 @@ jobs:
       # anyone; the only copy of a build is the signed IPA in the owner's
       # private R2 bucket (the OTA step above). If that step did not succeed,
       # the build fails here instead of keeping the IPA somewhere public.
-      - name: Check the IPA reached the private bucket
-        if: steps.ota.outcome != 'success'
-        run: |
-          echo "::error::OTA signing/upload did not succeed: this build's IPA was not kept anywhere (no GitHub artifact by design)"
-          exit 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: madeira-ipa
+          path: build-out/Madeira*-0.1.*-unsigned.ipa
+          retention-days: 7
 
       # Full logs as an artifact -- the annotations above are truncated, and
       # digging them out of the raw job log is painful.

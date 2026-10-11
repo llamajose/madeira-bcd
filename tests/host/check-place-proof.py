@@ -209,7 +209,10 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # --- textual wiring -----------------------------------------------------------
 def body(name):
-    b = src[src.index(name):]
+    start = src.index(name)
+    while ';' in src[start:src.index('{', start)]:   # skip a forward declaration
+        start = src.index(name, start + 1)
+    b = src[start:]
     return b[:b.index('\n}\n')]
 
 unmap = body('static void unmap_area( void *start, size_t size )')

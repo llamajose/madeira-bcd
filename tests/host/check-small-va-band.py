@@ -34,6 +34,7 @@ typedef struct { unsigned long long max_address; } task_vm_info_data_t;
 #define IOS_WOW_MAX_WINDOWS 8
 #define IOS_WOW_CEF_POOLS_START ((ULONG_PTR)0x7400000000)
 static unsigned long long fake_max;
+unsigned long long ios_layerkit_lo, ios_layerkit_hi;   /* ios_va_profile() measures these; 0 = not measured */
 static ULONG_PTR used_lo, used_hi;   /* one occupied region [used_lo, used_hi) */
 static task_t mach_task_self( void ) { return 1; }
 static kern_return_t task_info( task_t t, int flavor, task_info_t out, mach_msg_type_number_t *cnt ) {
