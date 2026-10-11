@@ -28,7 +28,6 @@ from pathlib import Path
 import importlib.util
 import os
 import re
-import shutil
 import struct
 import subprocess
 import tempfile
@@ -154,131 +153,21 @@ for macros in ({'FEX_IOS_HOST': 1}, {'ARCHITECTURE_arm64ec': 1}, {}):
     assert not any(f in text for f in NEW)
 
 # 4. Both stubs under emulation.
-try:
-    from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE
-    from unicorn import arm64_const as A64
-except ImportError:
-    Uc = None
-clang = shutil.which(os.environ.get('CLANG', 'clang'))
+emu = load('fexstub_emu', root / 'tests/host/fexstub_emu.py')
+TEXT, STUBS, DATA, FRAME, CPUAREA, TEB, TSD, STACK, JIT = (emu.TEXT, emu.STUBS, emu.DATA, emu.FRAME, emu.CPUAREA,
+                                                           emu.TEB, emu.TSD, emu.STACK, emu.JIT)
 emulated = 0
 
 
-def elf_load(data):
-    """.text, its relocations and symbols of a relocatable AArch64 ELF object."""
-    assert data[:4] == b'\x7fELF' and data[4] == 2 and data[5] == 1 and struct.unpack_from('<H', data, 18)[0] == 183
-    shoff, = struct.unpack_from('<Q', data, 0x28)
-    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', data, 0x3a)
-    secs = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
-    strs = lambda sec, off: data[secs[sec][4] + off:data.index(b'\0', secs[sec][4] + off)].decode()
-    names = [strs(shstrndx, s[0]) for s in secs]
-    text = names.index('.text')
-    symtab = next(i for i, s in enumerate(secs) if s[1] == 2)
-    syms = []
-    for i in range(secs[symtab][5] // 24):
-        name, info, _, shndx, value, _ = struct.unpack_from('<IBBHQQ', data, secs[symtab][4] + i * 24)
-        syms.append((strs(secs[symtab][6], name) if name else '', info & 0xf, shndx, value))
-    relocs = []
-    for s in secs:
-        if s[1] == 4 and s[7] == text:
-            relocs += [struct.unpack_from('<QQq', data, s[4] + i * 24) for i in range(s[5] // 24)]
-    body = bytearray(data[secs[text][4]:secs[text][4] + secs[text][5]])
-    return body, relocs, syms, text
-
-
-TEXT, STUBS, DATA, FRAME, CPUAREA, TEB, TSD, STACK, JIT = (0x10000000, 0x10100000, 0x20000000, 0x30000000, 0x31000000,
-                                                           0x32000000, 0x33000000, 0x40000000, 0x50000000)
-SIZES = {'IosXpFex': 4496 * 8, 'IosAliasEntries': 256 * 32}
-
-
-def link(obj):
-    body, relocs, syms, text = elf_load(obj)
-    data_at, stub_at, cursor, nstub = {}, {}, DATA, 0
-    resolved = {}
-    for off, info, addend in relocs:
-        name, kind, shndx, value = syms[info >> 32]
-        rtype = info & 0xffffffff
-        if shndx == text:
-            S = TEXT + value
-        elif rtype in (282, 283):
-            if name not in stub_at:
-                stub_at[name] = STUBS + 4 * nstub
-                nstub += 1
-            S = stub_at[name]
-        else:
-            if name not in data_at:
-                cursor = (cursor + 63) & ~63
-                data_at[name] = cursor
-                cursor += SIZES.get(name, 8)
-            S = data_at[name]
-        P, X = TEXT + off, S + addend
-        insn = struct.unpack_from('<I', body, off)[0]
-        if rtype == 275:  # ADR_PREL_PG_HI21
-            imm = ((X & ~0xfff) - (P & ~0xfff)) >> 12
-            insn = (insn & ~((3 << 29) | (0x7ffff << 5))) | ((imm & 3) << 29) | (((imm >> 2) & 0x7ffff) << 5)
-        elif rtype in (277, 278, 284, 285, 286, 299):  # ADD/LDST{8,16,32,64,128}_ABS_LO12_NC
-            shift = {277: 0, 278: 0, 284: 1, 285: 2, 286: 3, 299: 4}[rtype]
-            insn = (insn & ~(0xfff << 10)) | ((((X & 0xfff) >> shift) & 0xfff) << 10)
-        elif rtype in (282, 283):  # JUMP26/CALL26
-            insn = (insn & ~0x3ffffff) | (((X - P) >> 2) & 0x3ffffff)
-        elif rtype == 280:  # CONDBR19
-            insn = (insn & ~(0x7ffff << 5)) | ((((X - P) >> 2) & 0x7ffff) << 5)
-        elif rtype == 279:  # TSTBR14
-            insn = (insn & ~(0x3fff << 5)) | ((((X - P) >> 2) & 0x3fff) << 5)
-        else:
-            raise AssertionError(f'relocation type {rtype}')
-        struct.pack_into('<I', body, off, insn)
-    for name, kind, shndx, value in syms:
-        if shndx == text and name:
-            resolved[name] = TEXT + value
-    return bytes(body), resolved, data_at
-
-
 def run(code, symbols, data_at, entry, state, stops):
-    """Run one stub from `state` until a stop address; returns (stop, regs, nzcv, memory, steps)."""
-    uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
-    uc.ctl_set_cpu_model(A64.UC_CPU_ARM64_MAX)  # LSE
-    for base, size in ((TEXT, 0x100000), (STUBS, 0x1000), (DATA, 0x100000), (FRAME, 0x2000), (CPUAREA, 0x1000), (TEB, 0x2000),
-                       (TSD, 0x1000), (STACK, 0x10000), (JIT, 0x400000), (0x60000000, 0x10000)):
-        uc.mem_map(base, size)
-    uc.mem_write(TEXT, code)
-    uc.mem_write(STUBS, struct.pack('<I', 0xd4200020) * 1024)  # brk #1
-    for base, blob in state['mem'].items():
-        uc.mem_write(base, bytes(blob))
-    for r in range(29):
-        uc.reg_write(A64.UC_ARM64_REG_X0 + r, state['regs'][r])
-    uc.reg_write(A64.UC_ARM64_REG_X29, state['regs'][29])
-    uc.reg_write(A64.UC_ARM64_REG_X30, state['regs'][30])
-    uc.reg_write(A64.UC_ARM64_REG_SP, state['sp'])
-    uc.reg_write(A64.UC_ARM64_REG_NZCV, 0x20000000)
-    uc.reg_write(A64.UC_ARM64_REG_FPCR, 0)
-    uc.reg_write(A64.UC_ARM64_REG_TPIDRRO_EL0, TSD)
-    steps = [0]
-
-    def hook(uc, address, size, user):
-        if address in stops:
-            uc.emu_stop()
-        else:
-            steps[0] += 1
-
-    uc.hook_add(UC_HOOK_CODE, hook)
-    uc.emu_start(entry, 0, count=2000)
-    pc = uc.reg_read(A64.UC_ARM64_REG_PC)
-    assert pc in stops, f'stopped at {pc:#x}'
-    regs = [uc.reg_read(A64.UC_ARM64_REG_X0 + r) for r in range(29)] + \
-           [uc.reg_read(A64.UC_ARM64_REG_X29), uc.reg_read(A64.UC_ARM64_REG_X30), uc.reg_read(A64.UC_ARM64_REG_SP)]
-    mem = {base: bytearray(uc.mem_read(base, len(blob))) for base, blob in state['mem'].items()}
-    return pc, regs, uc.reg_read(A64.UC_ARM64_REG_NZCV), mem, steps[0]
+    return emu.run(code, b'', entry, state, stops)
 
 
-if Uc is None or clang is None:
-    print('note: ' + ('Python unicorn' if Uc is None else 'an AArch64 clang') + ' unavailable; the emulation of both stubs is '
-          'skipped (the text and layout checks above ran)')
+if emu.missing():
+    print('note: ' + emu.missing() + ' unavailable; the emulation of both stubs is skipped (the text and layout checks '
+          'above ran)')
 else:
-    with tempfile.TemporaryDirectory() as tmp:
-        src, obj = Path(tmp) / 'Module.S', Path(tmp) / 'Module.o'
-        src.write_text(asm)
-        subprocess.run([clang, '--target=aarch64-linux-gnu', '-DFEX_IOS_HOST=1', '-c', str(src), '-o', str(obj)], check=True)
-        code, symbols, data_at = link(obj.read_bytes())
+    code, _, symbols, data_at = emu.link(emu.assemble(asm))
     for name in ('IosXpFex', 'IosAliasEntries', 'IosAliasCount', 'IosAliasLast', 'X64ReturnInstr'):
         assert name in data_at, name
     D = DEFINES

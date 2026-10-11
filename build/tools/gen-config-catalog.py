@@ -603,6 +603,12 @@ OVERLAY = {
                         "nothing reads on iOS: 9 instructions less per guest CALL and per RET, and linked calls become "
                         "`bl`, so the CPU's return predictor follows guest calls. 0: the stack as before. Read when a "
                         "program starts."},
+    "env.MADEIRA_FEX_EC_RET_DIRECT": {"category": "x86 emulation (FEX)", "title": "Returns from native code straight into the JIT",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-fex-ios-ec-ret-direct.py"],
+                "note": "Default on. When a native (ARM64EC) function returns to the game's x64 code, the return enters "
+                        "the 64-bit JIT at once instead of testing the native-code bitmap first; the JIT's dispatcher "
+                        "already tests every address it has no translation for. 11 instructions less per return from a "
+                        "system DLL. 0: the test as before. Read when a program starts."},
     "env.MADEIRA_FEX_EC_RET": {"category": "x86 emulation (FEX)", "title": "Returns from native code through the return predictor",
                 "kind": "bool", "default": "1", "sources": ["tools/patch-fex-ios-ec-ret.py"],
                 "note": "Default on. A guest call into native (ARM64EC) code leaves the JIT with BLR and its return "
