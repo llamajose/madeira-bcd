@@ -1402,6 +1402,35 @@ jobs:
       - name: Check render-pass traffic
         run: python3 tests/host/check-render-pass-traffic.py
 
+      # madeira-bcd: the ARM64EC JIT no longer maintains the call-ret shadow stack nothing reads on iOS
+      # (MADEIRA_FEX_CALLRET_ELIDE=0 keeps it).
+      - name: Check fex-callret-elide
+        run: python3 tests/host/check-fex-callret-elide.py
+
+      # madeira-bcd: guest calls into ARM64EC code leave the JIT with BLR and their returns re-enter it with
+      # RET after an L1 probe (MADEIRA_FEX_EC_RET=0 keeps BR and the loop-top re-entry).
+      - name: Check fex-ec-ret
+        run: python3 tests/host/check-fex-ec-ret.py
+
+      # madeira-bcd: the dispatcher's EC code check loads PEB->EcCodeBitMap from the thread's frame
+      # (MADEIRA_FEX_EC_BITMAP_CACHE=0 keeps the TEB/PEB walk).
+      - name: Check fex-ec-bitmap-cache
+        run: python3 tests/host/check-fex-ec-bitmap-cache.py
+
+      # madeira-bcd: JIT exits into ARM64EC code go through ExitFunctionECJit when AFP is off
+      # (MADEIRA_FEX_EC_EXIT_LEAN=0 keeps ExitFunctionEC).
+      - name: Check fex-ec-exit-lean
+        run: python3 tests/host/check-fex-ec-exit-lean.py
+
+      # madeira-bcd: IosJitReverseTranslate answers addresses outside every JIT copy without walking the table.
+      - name: Check fex-alias-xlate-bounds
+        run: python3 tests/host/check-fex-alias-xlate-bounds.py
+
+      # madeira-bcd: RetToEntryThunk enters the JIT without its own EC code bitmap test
+      # (MADEIRA_FEX_EC_RET_DIRECT=0 keeps it).
+      - name: Check fex-ec-ret-direct
+        run: python3 tests/host/check-fex-ec-ret-direct.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
@@ -1501,6 +1530,16 @@ jobs:
               raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
           if b'smc-store-fastpath-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC SMC store fast-path module was not built; refusing the fallback IPA')
+          if b'callret-elide-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC call-ret elision module was not built; refusing the fallback IPA')
+          if b'ec-ret-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC EC-return module was not built; refusing the fallback IPA')
+          if b'ec-bitmap-cache-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC EC-bitmap cache module was not built; refusing the fallback IPA')
+          if b'ec-exit-lean-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC lean JIT exit module was not built; refusing the fallback IPA')
+          if b'ec-ret-direct-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC direct return module was not built; refusing the fallback IPA')
           print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
