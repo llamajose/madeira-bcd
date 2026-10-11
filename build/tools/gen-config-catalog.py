@@ -405,6 +405,15 @@ OVERLAY = {
                         "them. Off again, the packs are not read: what moved into them converts again. Bounds: DXIL as "
                         "env.MADEIRA_D3D12_DXIL_CACHE_MB (512 MB), DXBC 2 GB; a full pack starts over. Read once per "
                         "app start; the game's own file wins."},
+    # madeira-bcd: madeira-d3d12's shader cache without Wine's file API (tools/patch-winemetal-sc-native.py).
+    "shader-cache-native": {"category": "Direct3D 12", "title": "D3D12 shader cache files read natively",
+                "kind": "bool", "default": "1",
+                "note": "On by default. The Direct3D 12 runtime's shader cache (AppData\\Local\\Madeira\\ShaderCache) "
+                        "is read and written by Madeira itself instead of through Wine's file calls, which asked "
+                        "Wine's server three times per entry (~3.5 ms each in Horizon Zero Dawn's menu, ~1,000 "
+                        "entries a second, with the server on a performance core). The same files either way. "
+                        "0: Wine's file calls, as before. Read when the game creates its first pipeline.",
+                "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c", "tools/patch-winemetal-sc-native.py"]},
     # Read by DXMT's DXGI and by win32u's display adapter (sysparams_ios.c); a
     # library entry's "Report an NVIDIA GPU" sets it.
     "env.DXMT_ENABLE_NVEXT": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Report an NVIDIA GPU (all games)",
