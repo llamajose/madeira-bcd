@@ -1291,6 +1291,11 @@ jobs:
       - name: Check quiet-log
         run: python3 tests/host/check-quiet-log.py
 
+      # madeira-bcd: the ARM64EC JIT no longer maintains the call-ret shadow stack nothing reads on iOS
+      # (MADEIRA_FEX_CALLRET_ELIDE=0 keeps it).
+      - name: Check fex-callret-elide
+        run: python3 tests/host/check-fex-callret-elide.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
