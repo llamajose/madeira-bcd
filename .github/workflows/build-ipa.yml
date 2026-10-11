@@ -1392,6 +1392,11 @@ jobs:
       - name: Check ntdll-sync
         run: python3 tests/host/check-ntdll-sync.py
 
+      # madeira-bcd: the Mach handler repairs a TEB access whose base an ADD computed from a
+      # zeroed x18, also when the ADD wrote its own index register (HZD build 500).
+      - name: Check x18-derived base
+        run: python3 tests/host/check-x18-derived-base.py
+
       # madeira-bcd: madeira.cfg yield-mode (tools/patch-wine-yield-mode.py), opt-in.
       - name: Check yield-mode
         run: python3 tests/host/check-yield-mode.py
