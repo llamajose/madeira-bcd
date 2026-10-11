@@ -183,15 +183,19 @@ lean_v = func_body(virt, "static int ios_lean_diag_virtual( void )")
 mlog = func_body(virt, "static int ios_lean_mprotect_log( void )")
 sweep = func_body(virt, "static unsigned ios_warmer_sweep_cycles( void )")
 check(bool(lean_v) and bool(mlog) and bool(sweep), "virtual_ios.c helpers found")
+check("static volatile int ios_lean_mprotect_on;" in virt and "getenv" not in mlog,
+      "mprotect_exec's gate reads a flag, never the environment (it can run in a fault path)")
 vharness = r'''
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+static volatile int ios_lean_mprotect_on;
 ''' + lean_v + "\n" + mlog + "\n" + sweep + r'''
 int main( void )
 {
     long i, logged = 0, first_gap = 0;
+    ios_lean_mprotect_on = ios_lean_diag_virtual();   /* as the warmer thread does when it starts */
     for (i = 1; i <= 5000; i++)
     {
         if (ios_lean_mprotect_log()) logged++;
@@ -227,7 +231,9 @@ check("if (!zone_bad && (!ios_lean_diag_virtual() || cycle == 1 || (cycle % 30) 
 check("if (cycle == 2 || (cycle % ios_warmer_sweep_cycles()) == 0)" in warm
       and "(cycle % ios_warmer_sweep_cycles()) == 0))" in warm,
       "[phys-map] and the slot/window inventory follow ios_warmer_sweep_cycles")
-check(warm.count("ios_lean_diag_virtual()") == 4, "no other warmer step depends on the switch (page warming, [footprint], pump sample)")
+check(warm.count("ios_lean_diag_virtual()") == 5, "no other warmer step depends on the switch (page warming, [footprint], pump sample)")
+check(warm.find("ios_lean_mprotect_on = ios_lean_diag_virtual();") < warm.find("for (;;)"),
+      "the warmer sets mprotect_exec's flag before its first cycle")
 check("if (!ios_in_mach_exc && ios_lean_mprotect_log())   /* ml374: see ios_in_mach_exc; madeira-bcd lean-diag */" in virt
       and virt.count("ios_lean_mprotect_log()") == 1, "only mprotect_exec's per-call ERR line is thinned")
 

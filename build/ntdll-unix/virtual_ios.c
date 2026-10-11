@@ -1018,11 +1018,15 @@ static int ios_lean_diag_virtual( void )
     return v;
 }
 
+/* set by the warmer thread when it starts, so mprotect_exec (which can run in a
+ * fault path) never calls getenv itself; the first calls before that are logged */
+static volatile int ios_lean_mprotect_on;
+
 static int ios_lean_mprotect_log( void )
 {
     static long n;
     long k;
-    if (!ios_lean_diag_virtual()) return 1;
+    if (!ios_lean_mprotect_on) return 1;
     k = __atomic_add_fetch( &n, 1, __ATOMIC_RELAXED );
     if (k == 200)
         dprintf( 2, "[lean-diag] mprotect_exec: 200 calls logged, from now on 1 in 1000 (MADEIRA_LEAN_DIAG)\n" );
@@ -1047,6 +1051,7 @@ static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
     { extern void ios_eco_native_self( const char *who ); ios_eco_native_self( "pool-warmer" ); }   /* madeira-bcd eco-native */
+    ios_lean_mprotect_on = ios_lean_diag_virtual();   /* madeira-bcd lean-diag: mprotect_exec thins its ERR line from now on */
     for (;;)
     {
         /* ml1060: THE MONITOR WAS A TENTH OF THE MACHINE. Above 2400 MB this loop
