@@ -132,6 +132,34 @@ OVERLAY = {
                         "screen's top-left corner and over the whole screen first, as Windows does; the game then "
                         "sizes it to the chosen mode. Without it a game that only resizes its window (Red Dead "
                         "Redemption 2) keeps it where it was, beside the Wine desktop. Read once per session."},
+    "encode-batch": {"category": "Direct3D 12", "title": "One Metal call per encoder, not per draw",
+                "kind": "bool", "default": "1",
+                "note": "Default on. The commands a replay hands to one Metal encoder (every draw's state and draw, the "
+                        "encoder's fence wait and update) are queued and handed over in one call when the encoder ends, "
+                        "instead of one call into the Metal bridge per draw: the same commands in the same order, with "
+                        "~1,500 fewer crossings a frame in Horizon Zero Dawn. 0: one call per draw, as before (for "
+                        "telling a regression apart on the device). Read once per game start."},
+    "draw-dedup": {"category": "Direct3D 12", "title": "Leave out render state the encoder already has",
+                "kind": "bool", "default": "1",
+                "note": "Default on. A draw no longer sends Metal the pipeline, viewport, scissor, depth-stencil state, "
+                        "blend colour, rasterizer state or buffer bindings the render encoder already holds from the "
+                        "draw before it; a buffer bound again with only a new offset is sent as an offset. Every draw "
+                        "still runs with exactly the state it set (about half of a Horizon Zero Dawn draw's Metal "
+                        "calls were such repeats). 0: every draw sends all of it, as before. Read once per game start."},
+    "addr-scan": {"category": "Direct3D 12", "title": "Quicker GPU-address lookups",
+                "kind": "bool", "default": "1",
+                "note": "Default on. Finding the buffer behind a GPU address (every vertex buffer, index buffer and root "
+                        "descriptor a game records) walks back only over entries that can still reach the address, "
+                        "instead of over every buffer within the largest buffer's size of it (124 MB in Horizon Zero "
+                        "Dawn). The same buffer is found. 0: the old walk. Read once per game start."},
+    # madeira-bcd: tools/patch-winemetal-rp-lean.py (winemetal reads it).
+    "rp-lean": {"category": "Direct3D 12", "title": "Render passes fill only the targets they use",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-winemetal-rp-lean.py"],
+                "note": "Default on. A Metal render pass is described with only the colour targets it uses; the bridge "
+                        "filled all eight slots for every pass (~240 Objective-C calls and 8 allocations a pass, a few "
+                        "hundred passes a frame). Metal ignores a slot without a texture, so the pass is the same. "
+                        "Also used by Direct3D 9/10/11 games through DXMT. 0: all eight slots, as before. Read once "
+                        "per game start."},
     "indirect-fast": {"category": "Direct3D 12", "title": "Encode ExecuteIndirect records without per-record setup",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: after the first record of an ExecuteIndirect, the other records (which share "

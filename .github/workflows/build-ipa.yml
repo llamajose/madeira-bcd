@@ -1144,6 +1144,13 @@ jobs:
       - name: Patch winemetal GPU trace and render-pass experiment
         run: python3 tools/patch-winemetal-gpu-trace.py
 
+      # A render pass filled all eight colour attachments of its descriptor
+      # (~240 Objective-C messages and 8 allocations a pass); only the slots
+      # with a texture are filled now, the same pass for Metal. madeira.cfg /
+      # a game's config rp-lean = 0 restores the full loop. Native only.
+      - name: Patch winemetal lean render-pass descriptors
+        run: python3 tools/patch-winemetal-rp-lean.py
+
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
       # commit. Cached per wine/DXMT revision; a failure only leaves 32-bit
@@ -1290,6 +1297,21 @@ jobs:
       # madeira-bcd: quiet-log (madeira-d3d12) and MADEIRA_SRV_FGETPATH (wineserver).
       - name: Check quiet-log
         run: python3 tests/host/check-quiet-log.py
+
+      # madeira-bcd: encode-batch (one encodeCommands call per encoder), draw-dedup
+      # (no repeated render state) and rp-lean (winemetal fills only used targets).
+      - name: Check encode-batch
+        run: python3 tests/host/check-encode-batch.py
+
+      - name: Check draw-dedup
+        run: python3 tests/host/check-draw-dedup.py
+
+      - name: Check rp-lean
+        run: python3 tests/host/check-rp-lean.py
+
+      # madeira-bcd: addr-scan (GPU-address lookups stop where nothing earlier reaches).
+      - name: Check addr-scan
+        run: python3 tests/host/check-addr-scan.py
 
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
