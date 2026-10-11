@@ -670,6 +670,15 @@ OVERLAY = {
                 "note": "Kill switch, default 0: a file's size, index or end-of-file query (GetFileSizeEx and the "
                         "like) is answered from one fstat; the two extended-attribute reads that came after it fed "
                         "only file attributes, which these queries do not return. 1: as before. Read once per app run."},
+    # madeira-bcd: an I/O status block's layout by its address (tools/patch-wine-iosb-owner.py).
+    "env.MADEIRA_IO_STATUS_ADDRESS": {"category": "Wine core (ntdll)", "title": "32-bit I/O status blocks by address",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-wine-iosb-owner.py"],
+                "note": "Kill switch, default 1: in a 32-bit program's process, an I/O status block is written in "
+                        "the 32-bit layout only when it lies inside the program's guest window; a block anywhere "
+                        "else belongs to 64-bit code in that process (the CPU backend's kernelbase, whose console "
+                        "start-up wrote through stack garbage and faulted in CATIA V5's installer helpers, build "
+                        "501) and gets the 64-bit layout. 0: every block of such a process is a 32-bit one, as "
+                        "before. Read once per app run."},
     "env.MADEIRA_SRV_LOG_ALL": {"category": "Wine server", "title": "Every per-descriptor server log line",
                 "kind": "bool", "default": "0",
                 "sources": ["build/wineserver/fd_ios.c", "build/wineserver/request_ios.c"],

@@ -367,6 +367,14 @@ jobs:
       - name: Patch wine with size queries from one fstat
         run: python3 tools/patch-wine-file-info-fstat.py wine/dlls/ntdll/unix/file.c
 
+      # madeira-bcd: a WoW64 caller's I/O status block is a 32-bit one only inside its guest
+      # window; the 64-bit kernelbase in a 32-bit console program has blocks of its own
+      # (CATIA V5's installer helpers, build 501). env.MADEIRA_IO_STATUS_ADDRESS=0 undoes it.
+      - name: Check and patch the I/O status block layout by address
+        run: |
+          python3 tests/host/check-iosb-owner.py
+          python3 tools/patch-wine-iosb-owner.py wine/dlls/ntdll/unix
+
       - name: Check opt-in graphics DLL lifetime
         run: python3 tests/host/check-graphics-pin.py
 
