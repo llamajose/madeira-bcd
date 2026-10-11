@@ -351,8 +351,8 @@ check(xp_fields[:len(pe_fields)] == pe_fields and xp_fields[len(pe_fields):len(p
 check("struct ios_xp_pe_cap { int64_t fps_cap, t_cap, n_cap; };" in server, "ios_xp_pe_cap mirrors them")
 xprobe = func_body(server, "static void ios_xprobe_main( void )")
 check("ios_xp_pe_len >= sizeof(pe) + sizeof(struct ios_xp_pe_cap)" in xprobe
-      and "if (pc && ios_fps_gov_armed && pc->fps_cap != ios_fps_cap) pc->fps_cap = ios_fps_cap;" in xprobe,
-      "the xprobe writes the cap only into a block that long, and only when armed")
+      and "if (pc && pe.magic == 0x3130305058444d4dLL && ios_fps_gov_armed && pc->fps_cap != ios_fps_cap) pc->fps_cap = ios_fps_cap;" in xprobe,
+      "the xprobe writes the cap only into a live block that long (its magic read this sample), and only when armed")
 check(xprobe.index("ios_fps_gov_step(") > xprobe.index("ios_power_gov_step(") and
       xprobe.index("ios_fps_gov_step(") < xprobe.index('wine_log_write( "%s", line );'),
       "the governor runs every [xp] sample with that sample's ri_energy_nj")

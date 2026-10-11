@@ -643,8 +643,8 @@ OVERLAY = {
                 "note": "Unset (default): no cap beyond the FPS limit. 10-120: frames start at most N times a second for "
                         "the whole session: a Direct3D 12 game's thread waits after each Present, a DXMT game's encode "
                         "thread before each present (a timed kernel wait, not a spin). Any value, e.g. 20 or 24, unlike "
-                        "the FPS limit's 30/40/60; the lower of the two applies. Needs the [xp] sampler (MADEIRA_PROBES "
-                        "not 0). Read at session start."},
+                        "the FPS limit's 30/40/60; the lower of the two applies. While it is set, env.MADEIRA_FPS_GOV_MW "
+                        "is ignored. Needs the [xp] sampler (MADEIRA_PROBES not 0). Read at session start."},
     "env.MADEIRA_FPS_GOV_MW": {"category": "Windows, display & input", "title": "Hold CPU power with a frame cap (mW)",
                 "kind": "int", "default": "",
                 "sources": ["build/ntdll-unix/server_ios.c", "madeira-d3d12/src/pe/madeira_d3d12.c",
