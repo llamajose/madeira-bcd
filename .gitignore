@@ -190,3 +190,6 @@ app/Madeira/arm64ec-windows/dock-notices.txt
 
 # agent worktrees (Claude Code isolation), never part of the repo
 .claude/worktrees/
+# madeira-bcd fork-only smoke tests (bcd-smoke/build.sh output; built in CI, never committed)
+bcd-smoke/out/
+app/Madeira/arm64ec-windows/bcd-smoke-*.exe

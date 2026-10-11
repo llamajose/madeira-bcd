@@ -34,6 +34,13 @@ list the first time Madeira sees it with no config of its own; "Reset to
 Recommended" at the bottom of its settings brings the list back. This
 feature goes into the next pull request to upstream (willfaust/madeira).
 
+**Fork-only, never upstream (owner's decision, 2026-10-11):** the D3D9
+(32-bit) and D3D11 (64-bit) smoke tests never go into a pull request to
+upstream: `bcd-smoke/`, the "Build the fork-only smoke tests" step of
+`.github/workflows/build-ipa.yml`, the `bcd-smoke` lines of `.gitignore`, and
+the `x86D3D9Smoke` / `x64D3D11Smoke` lines of `app/Madeira/HomeView.swift`.
+Each place is marked "madeira-bcd FORK-ONLY".
+
 **Keep progress out of this repository:** no handoff or investigation
 documents in `docs/`, and commit messages stay one short line (no logs,
 evidence or analysis).

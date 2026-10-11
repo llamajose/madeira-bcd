@@ -1221,6 +1221,13 @@ jobs:
           path: app/Madeira/i386-windows
           key: ${{ steps.i386rev.outputs.key }}
 
+      # madeira-bcd FORK-ONLY (owner's decision, 2026-10-11): never part of a pull request to
+      # upstream. The D3D9 (i386, into the farm above, after its cache is saved) and D3D11
+      # (x86-64) smoke tests the home screen's "Test programs" start (bcd-smoke/).
+      - name: Build the fork-only smoke tests (bcd-smoke)
+        if: env.MINGW_OK == '1'
+        run: bash bcd-smoke/build.sh
+
       - name: Build dxmt-ios
         shell: bash
         run: |

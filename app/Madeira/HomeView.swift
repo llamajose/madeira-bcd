@@ -121,6 +121,13 @@ struct LaunchRequest {
     /// x86-64 program drawing through the native D3D12 runtime, its shaders
     /// converted at pipeline creation by the Metal Shader Converter.
     static let x64D3D12Cube = LaunchRequest(title: "x64 DX12 Cube", exe: "d3d12-cube-x64.exe", args: nil, desktop: nil)
+
+    /// madeira-bcd FORK-ONLY (owner's decision, 2026-10-11): never part of a pull
+    /// request to upstream. The smoke tests built by bcd-smoke/build.sh: each runs
+    /// 60 s, writes its frame rate every second and a RESULT line to the log, and
+    /// ends. The 32-bit one is started from the i386 farm (WoW64).
+    static let x86D3D9Smoke = LaunchRequest(title: "x86 DX9 Smoke Test", exe: "bcd-smoke-d3d9.exe", args: nil, desktop: nil)
+    static let x64D3D11Smoke = LaunchRequest(title: "x64 DX11 Smoke Test", exe: "bcd-smoke-d3d11-x64.exe", args: nil, desktop: nil)
 }
 
 // MARK: - Experimental settings
@@ -656,6 +663,11 @@ struct HomeView: View {
                      detail: "x86-64 → FEX → D3D11 → Metal. The smoke test.")
             demoCard(.x64D3D12Cube, icon: "cube.fill", tint: .indigo,
                      detail: "x86-64 → FEX → native D3D12 → Metal Shader Converter → Metal.")
+            // madeira-bcd FORK-ONLY: never in a pull request to upstream (see x86D3D9Smoke).
+            demoCard(.x86D3D9Smoke, icon: "square.stack.3d.up.fill", tint: .orange,
+                     detail: "32-bit x86 → WoW64 FEX → D3D9 → Metal. 60 s; FPS and RESULT in the log.")
+            demoCard(.x64D3D11Smoke, icon: "square.stack.3d.down.right.fill", tint: .teal,
+                     detail: "x86-64 → FEX → D3D11 → Metal, 73 draws a frame. 60 s; FPS and RESULT in the log.")
         }
     }
 
