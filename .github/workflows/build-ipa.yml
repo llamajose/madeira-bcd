@@ -1387,9 +1387,8 @@ jobs:
       - name: Check power-probe
         run: python3 tests/host/check-power-probe.py
 
-      # madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py), the default ARM64EC
-      # ntdll (env.MADEIRA_NTDLL_SYNC = 0 keeps ntdll.dll): cheaper SRW locks and
-      # critical sections.
+      # madeira-bcd: ntdll-sync.dll (tools/patch-wine-ntdll-sync.py), opt-in since build 499
+      # (env.MADEIRA_NTDLL_SYNC = 1 maps it): cheaper SRW locks and critical sections.
       - name: Check ntdll-sync
         run: python3 tests/host/check-ntdll-sync.py
 
