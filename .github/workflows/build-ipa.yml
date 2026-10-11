@@ -1311,6 +1311,10 @@ jobs:
       - name: Check fex-ec-exit-lean
         run: python3 tests/host/check-fex-ec-exit-lean.py
 
+      # madeira-bcd: IosJitReverseTranslate answers addresses outside every JIT copy without walking the table.
+      - name: Check fex-alias-xlate-bounds
+        run: python3 tests/host/check-fex-alias-xlate-bounds.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
