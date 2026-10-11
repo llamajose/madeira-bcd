@@ -152,6 +152,11 @@ fi
 #    PEB->EcCodeBitMap from the thread's frame instead of walking TPIDRRO_EL0,
 #    the TEB and the PEB (4 instructions less on every call into ARM64EC code
 #    through the import table). MADEIRA_FEX_EC_BITMAP_CACHE=0 keeps the walk.
+#  - patch-fex-ios-ec-exit-lean.py: JIT exits into ARM64EC code go through
+#    ExitFunctionECJit (Module.S) when AFP is off: no FPCR test, CPU area and
+#    doorbell from the frame, the call counted per thread (no atomic per call)
+#    and a per-thread alias hit; 31 instructions instead of 44.
+#    MADEIRA_FEX_EC_EXIT_LEAN=0 keeps ExitFunctionEC.
 echo "=== with the map-notification, IntervalsLock and IRCapRIP fixes and the AVX opt-in ==="
 python3 "$R/tools/patch-fex-ios-mapview-selfshared.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-intervals-reentry.py" "$R/FEX/Source/Windows/Common"
@@ -173,8 +178,9 @@ python3 "$R/tools/patch-fex-ios-smc-store-fastpath.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-callret-elide.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-ec-ret.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-ec-bitmap-cache.py" "$R/FEX"
+python3 "$R/tools/patch-fex-ios-ec-exit-lean.py" "$R/FEX"
 build
-git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/include/FEXCore/Debug/InternalThreadState.h FEXCore/Source/Interface/Core/Core.cpp Source/Windows/Common/CallRetStack.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/JIT/JIT.cpp
+git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/include/FEXCore/Debug/InternalThreadState.h FEXCore/Source/Interface/Core/Core.cpp Source/Windows/Common/CallRetStack.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/JIT/JIT.cpp
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"
