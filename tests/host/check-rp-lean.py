@@ -57,7 +57,18 @@ FIELDS = ["clearColor", "level", "slice", "depthPlane", "texture", "loadAction",
 
 with tempfile.TemporaryDirectory() as tmp:
     t = pathlib.Path(tmp)
-    shutil.copytree(src, t / "dxmt/src")
+    # CI runs this check after every dxmt/winemetal patch step: start from dxmt/src as committed
+    arc = subprocess.run(["git", "-C", str(src.parent), "archive", "--format=tar", "HEAD", "src"], capture_output=True)
+    if arc.returncode == 0 and arc.stdout:
+        import io, tarfile
+        (t / "dxmt").mkdir()
+        with tarfile.open(fileobj=io.BytesIO(arc.stdout)) as tf:
+            try:
+                tf.extractall(t / "dxmt", filter="data")
+            except TypeError:
+                tf.extractall(t / "dxmt")
+    else:
+        shutil.copytree(src, t / "dxmt/src")
     (t / "build").mkdir()
     shutil.copy(R / "build/madeira_cfg.h", t / "build/madeira_cfg.h")
     shutil.copytree(R / "research/remote-metal", t / "research/remote-metal")

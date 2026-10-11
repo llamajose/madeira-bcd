@@ -98,7 +98,13 @@ with tempfile.TemporaryDirectory(prefix='madeira-sc-native-') as d:
     tree = Path(d)
     target = tree / 'dxmt/src/winemetal/unix/winemetal_unix.c'
     target.parent.mkdir(parents=True)
-    shutil.copy(wm_src, target)
+    # CI runs this check after every winemetal patch step: start from the file as committed
+    committed = subprocess.run(['git', '-C', str(root / 'dxmt'), 'show', 'HEAD:src/winemetal/unix/winemetal_unix.c'],
+                               capture_output=True, text=True)
+    if committed.returncode == 0 and committed.stdout:
+        target.write_text(committed.stdout)
+    else:
+        shutil.copy(wm_src, target)
     pristine = target.read_text()
     for p in before_patches:
         r = run_patch(tree, p)

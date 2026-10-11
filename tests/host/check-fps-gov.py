@@ -362,10 +362,14 @@ ci = CI.read_text(encoding="utf-8")
 p_wm = ci.find("python3 tools/patch-winemetal-fps-cap.py")
 check(p_wm > ci.find("python3 tools/patch-winemetal-gpu-trace.py") > 0, "CI applies the winemetal patch after the GPU trace patch")
 if WM.is_file():
+    # CI runs this check after every winemetal patch step: start from the file as committed
+    _wm_git = subprocess.run(["git", "-C", str(ROOT / "dxmt"), "show", "HEAD:src/winemetal/unix/winemetal_unix.c"],
+                             capture_output=True, text=True)
+    WM_TEXT = _wm_git.stdout if _wm_git.returncode == 0 and _wm_git.stdout else WM.read_text()
     with tempfile.TemporaryDirectory(prefix="madeira-fps-wm-") as tmp:
         t = Path(tmp)
         (t / "dxmt/src/winemetal/unix").mkdir(parents=True)
-        (t / "dxmt/src/winemetal/unix/winemetal_unix.c").write_text(WM.read_text())
+        (t / "dxmt/src/winemetal/unix/winemetal_unix.c").write_text(WM_TEXT)
         r1 = subprocess.run([sys.executable, str(PATCH)], cwd=t, capture_output=True, text=True)
         r2 = subprocess.run([sys.executable, str(PATCH)], cwd=t, capture_output=True, text=True)
         out = (t / "dxmt/src/winemetal/unix/winemetal_unix.c").read_text()
@@ -375,7 +379,7 @@ if WM.is_file():
         check(fn.count("ios_fps_cap_dxmt_pace()") == 1 and fn.index("ios_fps_cap_dxmt_pace()") < fn.index("madeira_fg_enabled()")
               and fn.index("ios_fps_cap_dxmt_pace()") > fn.index("int mode = g_madeira_vsync_mode;"),
               "presentDrawable calls ios_fps_cap_dxmt_pace once, after reading the mode, before frame generation")
-        (t / "dxmt/src/winemetal/unix/winemetal_unix.c").write_text(WM.read_text().replace("int mode = g_madeira_vsync_mode;", "int mode = 1;"))
+        (t / "dxmt/src/winemetal/unix/winemetal_unix.c").write_text(WM_TEXT.replace("int mode = g_madeira_vsync_mode;", "int mode = 1;"))
         r3 = subprocess.run([sys.executable, str(PATCH)], cwd=t, capture_output=True, text=True)
         check(r3.returncode != 0 and "anchor" in r3.stderr, "a moved anchor fails the patch by name")
 else:
