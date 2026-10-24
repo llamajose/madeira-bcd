@@ -1085,8 +1085,11 @@ static void *wine_process_thread(void *arg) {
             [session setActive:YES error:&aerr];
             if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
-            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms io-buffer=%.1fms",
+            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms io-buffer=%.2fms",
                      session.sampleRate, session.outputLatency * 1000.0, session.IOBufferDuration * 1000.0);
+            char io_us[32];
+            snprintf(io_us, sizeof io_us, "%lld", (long long)(session.IOBufferDuration * 1e6));
+            setenv("MADEIRA_AUDIO_IO_US", io_us, 1);
         }
 
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
