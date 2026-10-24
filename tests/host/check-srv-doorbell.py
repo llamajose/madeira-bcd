@@ -43,6 +43,10 @@ typedef int semaphore_t;
 static sem_t real_sem;
 static semaphore_t ios_srv_wake_sem = 1;
 #define semaphore_signal(s) sem_post(&real_sem)
+/* ios_srv_switch (Will's madeira.cfg reader for the server's switches) sits in this slice:
+ * no madeira.cfg here, so the environment decides, as before. */
+#include <string.h>
+static int madeira_cfg_get( const char *key, char *out, size_t cap ) { (void)key; (void)out; (void)cap; return 0; }
 ''' + wake + r'''
 #define NTHREADS 8
 #define NREQ 200000

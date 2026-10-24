@@ -56,6 +56,9 @@ static void ios_va_release_note(void) { release_notes++; }
 static char out[1 << 16]; static size_t outn;
 static int fake_dprintf(int fd, const char *f, ...)
 { va_list ap; int w; (void)fd; va_start(ap, f); w = vsnprintf(out + outn, sizeof out - outn, f, ap); va_end(ap); if (w > 0) outn += w; return w; }
+/* 125hz's exe-window-relaunch rounds the claimed size to host pages */
+static const size_t host_page_mask = 0x3fff;
+#define ROUND_SIZE(addr,size,mask) (((size) + ((uintptr_t)(addr) & (mask)) + (mask)) & ~(mask))
 #define dprintf fake_dprintf
 ''' + chunk + r'''
 #undef dprintf
