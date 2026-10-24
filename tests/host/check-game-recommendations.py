@@ -374,10 +374,16 @@ struct LibraryEntry {
 final class PrefStore {
     static let shared = PrefStore()
     var flags: [String: Bool] = [:]
+    var screens: [String: String] = [:]
 }
 
 enum LibraryPrefs {
 ''' + stable_hash + r'''
+    static let screenSizes = ["", "1280x720", "fill", "fill-mfx15", "1600x900", "1920x1080"]
+    static func safeSync(_ path: String) -> Bool { PrefStore.shared.flags["safe|" + path] ?? false }
+    static func setSafeSync(_ on: Bool, for path: String) { PrefStore.shared.flags["safe|" + path] = on ? true : nil }
+    static func screen(_ path: String) -> String { PrefStore.shared.screens[path] ?? "" }
+    static func setScreen(_ size: String, for path: String) { PrefStore.shared.screens[path] = size.isEmpty ? nil : size }
     static func avx(_ path: String) -> Bool { PrefStore.shared.flags["avx|" + path] ?? false }
     static func setAVX(_ on: Bool, for path: String) { PrefStore.shared.flags["avx|" + path] = on ? true : nil }
     static func nvidia(_ path: String) -> Bool { PrefStore.shared.flags["nvidia|" + path] ?? false }
@@ -465,6 +471,10 @@ check(R.gta5EnhancedSteam.switchSummary == "AVX off, NVIDIA on, Wine's C++ runti
 check(R.note(R.ghostOfTsushima).contains("1280x720") && R.note(R.ghostOfTsushima).contains("fast semaphore waits off"),
       R.note(R.ghostOfTsushima))
 check(R.note(R.rdr2Steam).contains("@RDR2_CONFIG_LINES@ config lines") && R.note(R.rdr2Steam).contains("this screen's shape at 720 lines") && R.note(nil).contains("no recommended settings"), R.note(R.rdr2Steam))
+// madeira-bcd FORK-ONLY: the home screen's summary has no fast semaphore or FPS switches.
+check(R.gta5EnhancedSteam.summary(home: true) == "AVX off, NVIDIA on, Wine's C++ runtime off", R.gta5EnhancedSteam.summary(home: true))
+check(R.note(R.ghostOfTsushima, home: true).contains("1280x720") && !R.note(R.ghostOfTsushima, home: true).contains("semaphore"),
+      R.note(R.ghostOfTsushima, home: true))
 // Every other game: the standard list; a path that names nothing: none.
 check(R.recommendation(windowsPath: #"C:\Games\Foo\foo.exe"#, steamAppID: nil)?.id == "standard"
       && R.recommendation(windowsPath: steam + #"\Portal 2"#, steamAppID: 620)?.id == "standard", "every other game: the standard list")
@@ -611,9 +621,45 @@ check(!R.prepare(&own, new: true) && mark(ownExe) == "" && own.resolution == "14
 let got = #"C:\GoT\GhostOfTsushima.exe"#
 var gotOwn = LibraryEntry(title: "Ghost of Tsushima", windowsPath: got)
 check(R.prepare(&gotOwn, new: true) && LibraryPrefs.avx(got) && LibraryPrefs.nvidia(got) && gotOwn.resolution == "1280x720", "GoT by its program")
+check(LibraryPrefs.screen(gowExe) == "1920x1080" && !LibraryPrefs.safeSync(gowExe), "a reset writes the home screen's forms of the switches too")
+print("PASS: drive_c is looked up for a program's list; a new entry takes the fields of a list written for its path before")
+
+// madeira-bcd FORK-ONLY: the home screen, keyed by the program, with its own forms of the switches.
+let homeFolder = drive.appendingPathComponent("Home/GTA V Enhanced", isDirectory: true)
+try! FileManager.default.createDirectory(at: homeFolder, withIntermediateDirectories: true)
+check(FileManager.default.createFile(atPath: homeFolder.appendingPathComponent("GTA5_Enhanced.exe").path, contents: Data()), "fixture")
+let homePlay = #"C:\Home\GTA V Enhanced\PlayGTAV.exe"#
+LibraryModel.shared.entries = []
+R.prepare(windowsPath: homePlay, title: "GTA V Enhanced")
+check(file(homePlay) == R.gta5EnhancedOther.fileText && LibraryPrefs.nvidia(homePlay) && !LibraryPrefs.safeSync(homePlay)
+      && LibraryPrefs.screen(homePlay) == "1280x720", "the home screen's first sight")
+LibraryPrefs.setScreen("", for: homePlay)
+check(R.reset(windowsPath: homePlay, title: "GTA V Enhanced")?.id == "gta5e-other" && LibraryPrefs.screen(homePlay) == "1280x720",
+      "the home screen's Reset")
+var homeEntry = LibraryEntry(title: "GTA V Enhanced", windowsPath: homePlay)
+check(!R.prepare(&homeEntry), "the library's entry for the same program sees it was written")
+let homeGoT = #"C:\HomeGoT\GhostOfTsushima.exe"#
+R.prepare(windowsPath: homeGoT, title: "Ghost of Tsushima")
+check(LibraryPrefs.avx(homeGoT) && LibraryPrefs.nvidia(homeGoT) && LibraryPrefs.screen(homeGoT) == "1280x720", "GoT on the home screen")
+// Lines in the library entry's upstream config field for the same program are the game's own.
+let otherGoW = #"C:\Other\GoW.exe"#
+LibraryModel.shared.entries = [LibraryEntry(title: "God of War", windowsPath: otherGoW, config: "dxmt = d3d11.mipClampBC=1")]
+R.prepare(windowsPath: otherGoW, title: "God of War")
+check(file(otherGoW).isEmpty && mark(otherGoW) == "" && LibraryPrefs.screen(otherGoW).isEmpty, "the library's own lines count on the home screen")
+let lib2 = #"D:\Library2\steamapps\common\Red Dead Redemption 2"#
+GameProfile(windowsPath: lib2).text = "vram-mb = 2304\n"
+LibraryModel.shared.entries = [LibraryEntry(title: "Red Dead Redemption 2", windowsPath: lib2, steamAppID: 1174180)]
+R.prepare(windowsPath: lib2 + #"\RDR2.exe"#, title: "Red Dead Redemption 2")
+check(file(lib2 + #"\RDR2.exe"#).isEmpty && mark(lib2 + #"\RDR2.exe"#) == "",
+      "the library Steam game's own config counts for its program on the home screen")
+let gowHome = #"C:\Home\GoW.exe"#
+LibraryModel.shared.entries = [LibraryEntry(title: "God of War", windowsPath: gowHome, config: "dxmt = d3d11.mipClampBC=1")]
+check(R.reset(windowsPath: gowHome, title: "God of War")?.id == "god-of-war" && file(gowHome) == R.godOfWar.fileText
+      && LibraryModel.shared.entries[0].resolution == "1920x1080" && LibraryModel.shared.entries[0].config == nil,
+      "a home screen Reset reaches the library entry for the same program")
 check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v\(R.rdr2Steam.version) written (first sight)") }, "log line")
 UserDefaults.standard.removeObject(forKey: key)
-print("PASS: drive_c is looked up for a program's list; a new entry takes the fields of a list written for its path before")
+print("PASS: the home screen shares the files and records; Safe thread sync and Screen size take the list's values")
 '''
 
 with tempfile.TemporaryDirectory(prefix='madeira-recommended-') as directory:
