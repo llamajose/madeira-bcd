@@ -145,7 +145,11 @@ volatile long long ios_alert_lat_n, ios_alert_lat_ticks, ios_alert_lat_hist[6], 
 static void ios_ts_calibrate( void ) {}
 static void ios_thread_sampler_pass( int b ) { (void)b; passes++; }
 static void ios_guest_rip_profile( int gen ) { (void)gen; profiles++; }
-static int h_usleep( unsigned us ) { (void)us; return 0; }
+/* ml1288 (spitefulowl's low-ram-fixes): the 20 s wait is 200 waits of 100 ms with the
+ * stuck-store check between them; every 200th one ends a wait as sleep(20) did. */
+static int ticks;
+static void ios_stuck_store_check( void ) {}
+static int h_usleep( unsigned us ) { if (us == 100000 && ++ticks % 200 == 0) { if (++sleeps > 5) longjmp( done, 1 ); ios_alert_wakes += 100; } return 0; }
 static unsigned h_sleep( unsigned s ) { if (s != 20) abort(); if (++sleeps > 5) longjmp( done, 1 ); ios_alert_wakes += 100; return 0; }
 static void wine_log_write( const char *fmt, ... ) __attribute__((format(printf, 1, 2)));
 static void wine_log_write( const char *fmt, ... )
@@ -154,7 +158,7 @@ static void wine_log_write( const char *fmt, ... )
     if (!strncmp( b, "[sync-census] ml1115", 20 )) census1115++;
     if (!strncmp( b, "[sync-census] ml1122", 20 )) census1122++;
     if (!strcmp( b, "[thread-sample] ml876 burst done" )) bursts++;
-    if (!strcmp( b, "[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)" )) armed_full++;
+    if (!strncmp( b, "[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s", 77 )) armed_full++;
     if (strstr( b, "armed for [sync-census] only" )) armed_lean++;
 }
 #define sleep(x) h_sleep(x)
