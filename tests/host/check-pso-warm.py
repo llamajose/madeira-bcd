@@ -211,7 +211,10 @@ warm = d3d12[d3d12.index('static void mad_pso_warm('):]
 warm = warm[:warm.index('\n}\n') + 3]
 assert 'mad_cfg_int_pe("pso-warm", 0)' in warm and 'a.op = 10' in warm
 assert re.search(r'if \(!a\.ret\) \{\s*on = 0;', warm), 'the warm-up must stop when op 10 answers 0'
-assert 'mad_pso_warm(p->device_handle, &p->rp, p->has_vd ? &p->vd : NULL, p->has_vd ? 1 : 0);' in d3d12
+# Upstream's form (Oct 12) warms from the call's own descriptors, which the pipeline
+# keeps right after; the fork's earlier form stored them first.
+assert ('mad_pso_warm(p->device_handle, &p->rp, p->has_vd ? &p->vd : NULL, p->has_vd ? 1 : 0);' in d3d12
+        or 'mad_pso_warm(p->device_handle, &p->rp, has_vd ? &vd : NULL, has_vd ? 1 : 0);' in d3d12)
 lazy_cs = d3d12[d3d12.index('p->lazy_cs = 1; p->device_handle = d->mtl_device;'):]
 lazy_cs = lazy_cs[:lazy_cs.index('return hr;')]
 assert 'ci.compute_function = p->vs_fn;' in lazy_cs and 'mad_pso_warm(p->device_handle, &ci, NULL, 2);' in lazy_cs

@@ -3,7 +3,7 @@
 
 Used to read the Ghost of Tsushima kernel that hung the GPU: madeira_d3d12
 logs a faulting compute shader's bytecode as base64 at the next launch
-("[b64 <hash>] ..." lines, see docs/madeira-bcd.md, GPU fault attribution).
+("[b64 <hash>] ..." lines, see GPU fault attribution in madeira_d3d12.c).
 
   grep -a "^\[b64 <hash>\]" log.txt | sed 's/^\[b64 [0-9a-f]*\] //' | tr -d '\n' | base64 -d > s.dxil
   pip install llvmlite

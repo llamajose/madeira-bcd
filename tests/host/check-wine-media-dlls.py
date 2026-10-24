@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Exercise the media packaging gate with real bundled PEs and malformed fixtures.
+"""Exercise the media packaging gate (tools/check-wine-media-dlls.py) with real
+bundled PEs and malformed fixtures.
 
 The generated PE fixtures are only parsed; no Windows executable is run.
-Actual WMVCORE/winegstreamer source compilation remains the macOS CI's job.
+Building WMVCORE and winegstreamer is not this test's job: while the farm has no
+wmvcore.dll the gate must name it as missing, and once it has one the gate must
+pass the farm.
 """
 from contextlib import redirect_stdout
 import io
@@ -61,10 +64,14 @@ def rejected(function, message):
     else: raise AssertionError('bad media package unexpectedly accepted')
 
 
+farm = root / 'app/Madeira/arm64ec-windows'
 for name in ('mf.dll', 'mfplat.dll', 'kernel32.dll'):
-    module = PE(root / 'app/Madeira/arm64ec-windows' / name)
+    module = PE(farm / name)
     assert module.exports() and module.imports()
-rejected(lambda: check(root / 'app/Madeira/arm64ec-windows'), 'missing required wmvcore.dll')
+if any(p.name.lower() == 'wmvcore.dll' for p in farm.iterdir()):
+    with redirect_stdout(io.StringIO()): check(farm)   # built and bundled: the whole reader closure
+else:
+    rejected(lambda: check(farm), 'missing required wmvcore.dll')
 
 reader = ('WMCreateReader', 'WMCreateSyncReader', 'WMCreateProfileManager')
 backend = ('winegstreamer_create_wm_sync_reader',)

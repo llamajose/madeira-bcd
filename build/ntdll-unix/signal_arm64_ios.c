@@ -1513,6 +1513,151 @@ done:
              why, written, total, path );
 }
 
+/* ml1289: a store into aliased pages that CROSSES a 16 KB page boundary.
+ *
+ * The older cases of the write-fault store emulator (STR/STRB/STRH/STP/STUR,
+ * GPR and SIMD&FP, in ios_mach_exception_thread) write the whole access at
+ * alias(fault_addr): they take fault_addr as the start of the access and
+ * assume the alias goes on past the end of its page. A store that crosses a
+ * page breaks both: fault_addr need not be its first byte, and the next page
+ * may belong to another alias range or have none, so the bytes land at the
+ * wrong place or past the end of the first range's RW view. ml1276 and
+ * upstream's ml1283 already handle their encodings per page; this does the
+ * same for the rest, and only for crossing stores, so every other store keeps
+ * its existing case. The address comes from the registers, each page takes
+ * its own alias (a page without one that is plain writable memory is written
+ * directly), the store is refused when a page has neither, and the base
+ * register is written back after the whole store for the indexed forms.
+ * Store-release forms are left alone: a crossing STLR/STLUR is misaligned and
+ * takes the alignment-fault path instead.
+ *
+ * Returns 1 (written), -1 (refused: a page of the store has no alias) or 0
+ * (not a crossing store this helper decodes; the per-encoding cases run).
+ * ml1292: also called by the thread sampler (server_ios.c) to complete a store
+ * the kernel keeps faulting on, with the thread suspended. */
+int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
+                                     const arm_neon_state64_t *neon,
+                                     uintptr_t rx, uintptr_t rw, size_t sz )
+{
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t fault_addr );
+    extern void ios_jit_anon_alias_note_write( unsigned long long );
+    const unsigned rt = insn & 31, rn = (insn >> 5) & 31, size = insn >> 30, v = (insn >> 26) & 1;
+    const unsigned opc = (insn >> 22) & 3;
+    const uint64_t base = rn == 31 ? st->__sp : st->__x[rn];
+    uint8_t src[32];
+    uint64_t ea, a, x0, x1;
+    int64_t imm = 0;
+    int wb = 0, pair = 0;
+    unsigned bytes, elem, rt2 = (insn >> 10) & 31, parts = 0, done = 0, i, part_len[2];
+    uintptr_t part_rw[2];
+
+    if ((insn & 0x3a000000u) == 0x28000000u)                    /* STP/STNP and SIMD&FP pairs */
+    {
+        const unsigned mode = (insn >> 23) & 3;              /* 0 stnp, 1 post, 2 offset, 3 pre */
+        if ((insn >> 22) & 1) return 0;                      /* loads */
+        if (v) elem = size == 3 ? 0 : 4u << size;            /* S, D, Q */
+        else   elem = size == 0 ? 4 : size == 2 ? 8 : 0;     /* W, X (01 is STGP) */
+        if (!elem) return 0;
+        imm = (((int64_t)((insn >> 15) & 0x7f)) << 57 >> 57) * (int64_t)elem;
+        ea = mode == 1 ? base : base + (uint64_t)imm;
+        wb = mode == 1 || mode == 3;
+        bytes = 2 * elem;
+        pair = 1;
+    }
+    else if ((insn & 0x3b000000u) == 0x38000000u || (insn & 0x3b000000u) == 0x39000000u)
+    {
+        /* single-register LDR/STR families: a store has opc 00 (GPR) or opc<0> = 0 (SIMD&FP) */
+        if (v ? (opc & 1) : opc != 0) return 0;
+        elem = v && (opc & 2) ? (size == 0 ? 16u : 0u) : 1u << size;
+        if (!elem) return 0;
+        if ((insn & 0x3b000000u) == 0x39000000u)                 /* unsigned offset */
+            ea = base + ((uint64_t)((insn >> 10) & 0xfff) * elem);
+        else if ((insn & 0x00200c00u) == 0x00200800u)            /* register offset */
+        {
+            const unsigned option = (insn >> 13) & 7, rm = (insn >> 16) & 31;
+            uint64_t off = rm == 31 ? 0 : st->__x[rm];
+            if (!(option & 2)) return 0;
+            if (option == 2) off = (uint32_t)off;
+            else if (option == 6) off = (uint64_t)(int64_t)(int32_t)off;
+            if (insn & 0x1000) off *= elem;
+            ea = base + off;
+        }
+        else if (!(insn & 0x00200000u))                          /* unscaled, post, pre */
+        {
+            const unsigned idx = (insn >> 10) & 3;
+            if (idx == 2) return 0;                                /* unprivileged */
+            imm = ((int64_t)((insn >> 12) & 0x1ff)) << 55 >> 55;
+            ea = idx == 1 ? base : base + (uint64_t)imm;
+            wb = idx == 1 || idx == 3;
+        }
+        else return 0;
+        bytes = elem;
+    }
+    else return 0;
+
+    if (((ea ^ (ea + bytes - 1)) & ~(uint64_t)0x3fff) == 0) return 0;   /* within one page */
+    if (v && !neon) return 0;
+
+    if (v)
+    {
+        memcpy( src, &neon->__v[rt], elem );
+        if (pair) memcpy( src + elem, &neon->__v[rt2], elem );
+    }
+    else
+    {
+        x0 = rt == 31 ? 0 : st->__x[rt];
+        x1 = rt2 == 31 ? 0 : st->__x[rt2];
+        memcpy( src, &x0, elem );
+        if (pair) memcpy( src + elem, &x1, elem );
+    }
+
+    while (done < bytes && parts < 2)
+    {
+        unsigned len = bytes - done;
+        a = ea + done;
+        if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
+        part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
+                         ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+        if (!part_rw[parts])
+        {
+            /* A page with no alias that is plain writable memory (the aliased page is
+             * the one that faulted) takes its bytes directly. */
+            mach_vm_address_t ra = (mach_vm_address_t)a;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t ri;
+            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t ro = MACH_PORT_NULL;
+            if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS &&
+                ra <= a && a + len <= ra + rs && (ri.protection & VM_PROT_WRITE))
+                part_rw[parts] = (uintptr_t)a;
+            if (ro != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), ro );
+        }
+        if (!part_rw[parts]) break;
+        part_len[parts++] = len;
+        done += len;
+    }
+    {
+        static int split_n;
+        if (split_n < 8)
+            dprintf( STDERR_FILENO, "[split-store] ml1289 #%d insn=0x%08x bytes=%u ea=0x%llx parts=%u %s\n",
+                     ++split_n, insn, bytes, (unsigned long long)ea, parts,
+                     done == bytes ? "emulated" : "REFUSED: a page of the store has no alias and is not writable" );
+    }
+    if (done != bytes) return -1;
+    for (i = 0, done = 0; i < parts; done += part_len[i], i++)
+    {
+        memcpy( (void *)part_rw[i], src + done, part_len[i] );
+        ios_jit_anon_alias_note_write( (unsigned long long)(ea + done) );
+    }
+    if (wb)
+    {
+        if (rn == 31) st->__sp = base + (uint64_t)imm;
+        else          st->__x[rn] = base + (uint64_t)imm;
+    }
+    return 1;
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -2513,7 +2658,14 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                         /* unsigned-offset immediate loads, base x18 */
                         case 0xf9400000: /* LDR Xt */
-                            if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
+                            /* The x18 patcher's "via x18" trampoline (mrs x18 / and /
+                             * ldr x18,[x18,#slot] / insn) preempted before its ldr: that
+                             * ldr reads the TSD slot holding the TEB, so x18 gets the TEB
+                             * itself, not the TEB field at the slot's offset. */
+                            if (rt == 18 && rn == 18 && ios_teb_tls_slot_offset &&
+                                fault_addr == (uintptr_t)ios_teb_tls_slot_offset)
+                                state.__x[18] = thread_teb;
+                            else if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
                             emulated = 1; break;
                         case 0xb9400000: /* LDR Wt (zero-extend) */
                             if (rt != 31) state.__x[rt] = *(uint32_t *)ea;
@@ -3403,7 +3555,15 @@ static void *ios_mach_exception_thread( void *arg )
                      *
                      * STP Q is not architecturally one atomic 32-byte transaction, so two
                      * 16-byte copies are correct. Rn==31 is SP, never __x[31]. */
-                    if (have_neon && (insn & 0xFE400000) == 0xAC000000)
+                    /* ml1289: a store that crosses a 16 KB page is written per page here;
+                     * every other store goes on to its per-encoding case below. */
+                    const int split_r = ios_store_split_crossing( insn, &state, have_neon ? &neon_state : NULL,
+                                                                  rx, rw, sz );
+                    if (split_r)
+                    {
+                        if (split_r > 0) emulated = 1;
+                    }
+                    else if (have_neon && (insn & 0xFE400000) == 0xAC000000)
                     {
                         const int mode = (insn >> 23) & 0x3; /* 0 stnp, 1 post, 2 offset, 3 pre */
                         const int rt   = insn & 0x1f;
@@ -6519,6 +6679,8 @@ static void ios_install_task_exception_port(void)
 /* Register a Wine "process" thread with the shared Mach exception handler.
  * First call creates the shared port and handler thread.
  * Every call registers the thread and sets its exception ports. */
+static int ios_pc_in_app_text( uint64_t pc );
+
 static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                                                void *trampoline )
 {
@@ -6542,6 +6704,12 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
             if (!ios_mach_align_fault_enabled)
                 ERR("[unaligned-atomic] Mach-path alignment classification DISABLED by "
                     "MADEIRA_MACH_ALIGN_FAULT=0: alignment faults are delivered as c0000005 there\n");
+        }
+
+        {
+            /* the app's __TEXT range for the native-unaligned emulation, resolved here:
+             * dyld's lookups do not belong on the exception thread */
+            ios_pc_in_app_text( 0 );
         }
 
         pthread_t handler;
@@ -7069,13 +7237,20 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
  * TEB pointer is read in this address space, through mach_vm_read_overwrite,
  * so a target that exits meanwhile cannot fault this thread.
  *
- * madeira-bcd: ON by default (the fork's build-213 behaviour, which also
- * returns the snapshot's integer registers when the caller asked for them,
- * as tested on Ghost of Tsushima); MADEIRA_CTX_CPU_AREA=0 turns it off.
- * Upstream ships it opt-in: the snapshot is the thread's last exit from
- * emulated code, not where it is now, so a caller that writes the context
- * back (SetThreadContext, as a .NET runtime redirecting a thread does) would
- * move the thread back there. */
+ * Opt-in, MADEIRA_CTX_CPU_AREA=1 (madeira.cfg env., or a game's own config):
+ * the snapshot is the thread's last exit from emulated code, not where it is
+ * now, so a caller that writes the context back (SetThreadContext, as a .NET
+ * runtime redirecting a thread does) would move the thread back there.
+ *
+ * MADEIRA_CTX_CPU_AREA=2 also returns the snapshot's integer registers when the
+ * caller asked for CONTEXT_INTEGER (the ARM64EC_NT_CONTEXT registers that hold
+ * x64 state: X0-X12, X15, X19-X22 and X25-X27; the others are zeroed) and sets
+ * Cpsr to 0, so the caller gets one x64 state from a single moment instead of
+ * the snapshot's control registers next to the server's integer registers.
+ *
+ * madeira-bcd FORK-ONLY: this fork keeps 2 as the default (unset or empty),
+ * as its game lists were tested with it since build 213 (2026-09-28);
+ * MADEIRA_CTX_CPU_AREA=0 turns it off. */
 static int ctx_peek( void *dst, const void *src, size_t size )
 {
     mach_vm_size_t got = 0;
@@ -7095,11 +7270,13 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
 
     if (on < 0)
     {
-        /* 0: a cross-thread GetThreadContext without control registers keeps rip 0 (upstream's
-         * default). Default on: it gets the target's saved x64 state (a context written back
-         * would rewind the thread there). */
+        /* For a cross-thread GetThreadContext without control registers. 1: the target's
+         * Pc/Sp/Fp/Lr from its last exit from emulated code (upstream's opt-in). 2: also
+         * X0-X12, X15, X19-X22, X25-X27 and Cpsr = 0 from the same snapshot (madeira-bcd's
+         * behaviour). 0 turns it off. madeira-bcd FORK-ONLY: unset means 2 here (upstream: off);
+         * a context written back would rewind the thread. */
         const char *env = getenv( "MADEIRA_CTX_CPU_AREA" );
-        on = !(env && env[0] == '0');
+        on = !env || !*env ? 2 : env[0] == '1' ? 1 : env[0] == '2' ? 2 : 0;
     }
     if (!on) return 0;
     if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL )) return 0;
@@ -7109,7 +7286,7 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
     if (!ctx_peek( &ecp, &cpu->ContextAmd64, sizeof(ecp) ) || !ecp) return 0;
     if (!ctx_peek( &ec, ecp, sizeof(ec) )) return 0;
     if (!ec.Pc || !ec.Sp) return 0;
-    if (needed & (CONTEXT_INTEGER & ~CONTEXT_ARM64))
+    if (on == 2 && (needed & (CONTEXT_INTEGER & ~CONTEXT_ARM64)))
     {
         memset( context->X, 0, sizeof(context->X[0]) * 29 );
         context->X[0] = ec.X0;   context->X[1] = ec.X1;   context->X[2] = ec.X2;   context->X[3] = ec.X3;
@@ -7125,12 +7302,12 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
     context->Lr = ec.Lr;
     context->Sp = ec.Sp;
     context->Pc = ec.Pc;
-    context->Cpsr = 0;
+    if (on == 2) context->Cpsr = 0;
     context->ContextFlags |= CONTEXT_CONTROL;
     if (InterlockedIncrement( &said ) <= 8)
-        ERR_(seh)( "[ctx] madeira-bcd get handle=%p: no control registers from the server; "
-                   "returning the target's saved x64 state rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA=0 turns it off)\n",
-                   handle, (void *)ec.Pc, (void *)ec.Sp );
+        ERR( "[ctx] get handle=%p: no control registers from the server; "
+             "returning the target's saved x64 %s rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA=%d)\n",
+             handle, on == 2 ? "state" : "Pc/Sp/Fp/Lr", (void *)ec.Pc, (void *)ec.Sp, on );
     return 1;
 }
 
@@ -7927,22 +8104,18 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
             }
             /* madeira-bcd: an ordered/exclusive/LSE access in the app's own code
              * (ios_native_unaligned_emulate: the Launcher's `stlr` of build 454).
-             * dladdr names the function for the first few. */
+             * The app offset names the function offline: dladdr would take dyld's
+             * lock on the exception thread for a fault that is recovered. */
             if (ios_native_unaligned_emulate( &uc, a_insn, fault_addr, (uint64_t)pc ))
             {
                 static unsigned long ua_native;
                 PC_sig(&uc) += 4;
                 *state = mc.__ss;
                 if (++ua_native <= 16 || (ua_native % 4096) == 0)
-                {
-                    Dl_info di = { 0 };
-                    const char *fn = dladdr( (const void *)(uintptr_t)pc, &di ) && di.dli_sname ? di.dli_sname : "?";
-                    uint64_t at = di.dli_saddr && fn[0] != '?' ? (uint64_t)pc - (uint64_t)(uintptr_t)di.dli_saddr : 0;
-                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx, %s+0x%llx) insn=0x%08x "
+                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx) insn=0x%08x "
                                 "addr=0x%llx emulated in place, not handed to FEX (#%lu)\n",
-                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo), fn,
-                             (unsigned long long)at, a_insn, (unsigned long long)fault_addr, ua_native );
-                }
+                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo),
+                             a_insn, (unsigned long long)fault_addr, ua_native );
                 return 1;
             }
 
@@ -10050,7 +10223,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      * the range as executable: an executable section here points at
                      * the emulator, a data section with an executable vprot at a
                      * protect it was never told about, a data section without one at
-                     * a wrong jump target (docs/gta5-child-crash.md section 8). */
+                     * a wrong jump target (GTA V Enhanced's NoExec crash). */
                     {
                         extern int ios_image_section_describe( unsigned long long va, char *buf, size_t len,
                                                                unsigned long long *img_base );

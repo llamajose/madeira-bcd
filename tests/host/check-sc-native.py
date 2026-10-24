@@ -137,7 +137,9 @@ with tempfile.TemporaryDirectory(prefix='madeira-sc-native-') as d:
 # ---------------------------------------------------------------------------
 # 2 + 3. the patch's code and madeira_d3d12.c's shader cache, on this host
 # ---------------------------------------------------------------------------
-pe_slice = pe[pe.index('#define MAD_SC_MAGIC'):pe.index('/* madeira-bcd: SHARED METAL LIBRARIES.')]
+pe_end = pe.find('/* madeira-bcd: SHARED METAL LIBRARIES.')
+if pe_end < 0: pe_end = pe.index('/* SHARED METAL LIBRARIES.')   # upstream's wording since its Oct 12 merge
+pe_slice = pe[pe.index('#define MAD_SC_MAGIC'):pe_end]
 check('static int mad_scn_has(const UINT64 key[2]);' in pe[:pe.index('#define MAD_SC_MAGIC')] or
       'static int mad_scn_has(const UINT64 key[2]);' in pe_slice, 'the cut includes the native helpers')
 

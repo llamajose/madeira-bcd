@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Ghost of Tsushima smoke-square diagnostics (docs/got-corruption.md); no device.
+"""Ghost of Tsushima smoke-square diagnostics; no device.
 
-madeira-d3d12/src/pe/madeira_d3d12.c gained four switches, all OFF unless set
+madeira-d3d12/src/pe/madeira_d3d12.c gained three switches, all OFF unless set
 in madeira.cfg or the game's file: skip-ps (+ skip-ps-cycle), dxil-dump,
-dxil-tess-patch-topology, and converter (DXIL) draws in the capture-ps walker.
+and converter (DXIL) draws in the capture-ps walker.
 This test
 
   * checks statically that every switch is read with a default that changes
-    nothing, that the draw hook is behind its "unset" fast path, that the patch
-    topology value reaches the converter service and both shader caches, and
+    nothing, that the draw hook is behind its "unset" fast path, that both
+    shader caches key on the input topology, and
     that capture-cs still logs under its own tag after the walker was shared;
   * cuts the skip-ps / dxil-dump functions out of the source, compiles them on
     the host with small stubs for the Windows calls and runs them: unset means
@@ -16,7 +16,7 @@ This test
     skip-ps-cycle rotates "nothing", first, second, ... with the clock; the
     dxil-dump list matches exact names.
 
-Section 8 of the document (the one-frame shapes) added five more, also OFF
+The one-frame shapes added five more, also OFF
 by default: fence-strict, upload-guard (+ upload-guard-bytes), desc-guard and
 cbv-snapshot. The test checks that every hook sits behind g_sd_state, that
 the verifications run before a fence advances or Present returns, that
@@ -27,7 +27,7 @@ unchanged, GPU-only or READBACK one is not), descriptor writes into slots of
 an unfinished batch are reported, root-CBV copies land 256-aligned in the
 argument slot's own ring chunk and are reused within a replay.
 
-Section 10 (round 3, the main menu's flickering grass) added ind-count (+
+Round 3 (the main menu's flickering grass) added ind-count (+
 ind-count-from), capture-cs by name/hash, and sampler-reduction /
 sampler-census: the test checks their defaults and hooks, runs the per-frame
 sums and the dip detection inside the sync harness, and cuts the sampler
@@ -41,8 +41,6 @@ import pathlib, re, shutil, subprocess, sys, tempfile
 
 R = pathlib.Path(__file__).resolve().parents[2]
 SRC = (R / "madeira-d3d12/src/pe/madeira_d3d12.c").read_text()
-ABI = (R / "madeira-d3d12/src/madeira_ir_abi.h").read_text()
-UNIX = (R / "madeira-d3d12/src/unix/madeira_ir_unix.mm").read_text()
 CACHE = (R / "madeira-d3d12/src/unix/madeira_dxil_cache.h").read_text()
 ok = True
 
@@ -57,7 +55,6 @@ def check(what, cond):
 check("skip-ps read as a string (unset = no names)", 'mad_cfg_str_pe("skip-ps", buf, sizeof buf)' in SRC)
 check("skip-ps-cycle defaults to 0", 'mad_cfg_int_pe("skip-ps-cycle", 0)' in SRC)
 check("dxil-dump read as a string (unset = nothing dumped)", 'mad_cfg_str_pe("dxil-dump", g_dxil_dump, sizeof g_dxil_dump)' in SRC)
-check("dxil-tess-patch-topology defaults to 0", 'mad_cfg_int_pe("dxil-tess-patch-topology", 0)' in SRC)
 check("draw hook behind the skip-ps fast path",
       "if (g_skip_ps_state && mad_skip_ps_match(e->pso)) { MAD_SKIP(e); return; }" in SRC)
 check("draw hook after the render pass began (clears still run)",
@@ -65,15 +62,8 @@ check("draw hook after the render pass began (clears still run)",
       SRC.index("if (!exec_begin_render(e)) { MAD_SKIP(e); return; }\n    if (g_skip_ps_state"))
 check("dxil-dump hooks behind their fast path",
       SRC.count("if (g_dxil_dump_state && ") == 2)
-check("the three tessellation stages ask mad_dtess_topology",
-      len(re.findall(r"o[vhd]\.topology = mad_dtess_topology\(\(UINT\)desc->PrimitiveTopologyType\);", SRC)) == 3)
-check("only the PATCH topology type is changed, and only when switched on",
-      "return on && topo == (UINT)D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH ? MADEIRA_IR_TOPOLOGY_PATCH_STRICT : topo;" in SRC)
 check("the geometry-shader path keeps the plain topology",
       "ov.topology = (UINT)desc->PrimitiveTopologyType; ov.layout = L->n ? L : NULL;" in SRC)
-check("ABI value defined", re.search(r"#define MADEIRA_IR_TOPOLOGY_PATCH_STRICT 0x104u", ABI) is not None)
-check("service maps it to IRInputTopologyPatch (4)",
-      "a->input_topology == MADEIRA_IR_TOPOLOGY_PATCH_STRICT) topo = (IRInputTopology)4;" in UNIX)
 check("PE shader cache keys on input_topology", "mad_sc_feed_u64(&h, ((UINT64)a->gs_emulation << 32) | a->input_topology);" in SRC)
 check("unix DXIL cache keys on input_topology", "mad_dxc_hu32(&s, a->input_topology);" in CACHE)
 check("capture-cs keeps its log tag through the shared walker",
@@ -654,7 +644,7 @@ else:
             if r.returncode:
                 print(r.stdout[-4000:])
 
-# --- round 3 (docs/got-corruption.md section 10): ind-count, capture-cs by hash, sampler reduction ----
+# --- round 3: ind-count, capture-cs by hash, sampler reduction ----
 check("ind-count / ind-count-from default to 0",
       'ic = mad_cfg_int_pe("ind-count", 0);' in SRC and 'icf = mad_cfg_int_pe("ind-count-from", 0);' in SRC)
 check("ind-count: the replay hook is behind g_sd_state and the key",

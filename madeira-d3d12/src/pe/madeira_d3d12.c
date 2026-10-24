@@ -37,7 +37,7 @@
 #include "madeira_ir_abi.h"
 #include "madeira_graphics_entry.h"
 
-/* madeira-bcd: MAD_BUILD_ID names the CI run that built this DLL ("ipa 215"),
+/* madeira-bcd: MAD_BUILD_ID (build-pe.sh passes it from the environment) names the build,
  * so a log says which runtime ran. */
 #ifdef MAD_BUILD_ID
 #define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " MAD_BUILD_ID ", " __DATE__ " " __TIME__
@@ -281,7 +281,7 @@ static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shot
  * every material in compute, so this is how to see what a material samples. */
 static char g_capture_cs[64]; static int g_capture_cs_shots, g_capture_cs_max = 12, g_capture_cs_ind;
 /* madeira-bcd: DRAW SKIP BY SHADER NAME, a diagnostic for Ghost of Tsushima's
- * smoke squares (docs/got-corruption.md). madeira.cfg / the game's file
+ * smoke squares. madeira.cfg / the game's file
  * skip-ps = <entry>[,<entry>...]: draws whose pixel OR vertex shader entry is
  * one of the names (exact match) are dropped; their render pass and its clears
  * still run, and the drops are counted in "skips by site". skip-ps-cycle = N
@@ -293,12 +293,12 @@ static char g_capture_cs[64]; static int g_capture_cs_shots, g_capture_cs_max = 
 static char g_skip_ps_tok[16][64]; static int g_skip_ps_state = -1, g_skip_ps_n, g_skip_ps_cycle;
 static volatile LONG g_skip_ps_phase = -1, g_skip_ps_dropped; static ULONGLONG g_skip_ps_t0;
 static SRWLOCK g_skip_ps_lock = SRWLOCK_INIT;
-/* madeira-bcd: DXIL DUMP BY ENTRY NAME (docs/got-corruption.md). madeira.cfg /
+/* madeira-bcd: DXIL DUMP BY ENTRY NAME. madeira.cfg /
  * the game's file dxil-dump = <entry>[,<entry>...]: when a pipeline whose vertex,
  * pixel or compute entry is one of the names is created, the bytecode of EVERY
  * stage it has (VS, HS, DS, GS, PS or CS) is written to the log as base64
  * ([dxil-dump] header, [b64 <hash>] lines -- the same format as the GPU fault
- * shaders, so HANDOFF section 5's grep | base64 -d | tools/dxil-disasm.py works)
+ * shaders, so grep | base64 -d | tools/dxil-disasm.py works on the log)
  * and to C:\madeira-cs\dump_<stage>_<entry>_<hash>.dxil. Each bytecode once, at
  * most 48 blobs / 3 MB a run. Unset (the default): nothing is written. */
 static char g_dxil_dump[512]; static int g_dxil_dump_state = -1; static SRWLOCK g_dxil_dump_lock = SRWLOCK_INIT;
@@ -468,7 +468,7 @@ struct mad_device {
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
 static LONG g_resolve_locked, g_resolve_miss;   /* ml1132: address lookups that took live_lock */
 static LONG g_res_added, g_res_removed, g_tess_psos, g_tess_draws, g_tess_built, g_tess_drawn, g_tess_nonidx;
-static volatile LONG g_dtess_drawn, g_dtess_bad_cps, g_dtess_ind_drawn;   /* madeira-bcd: DXIL tessellation */
+static LONG g_dtess_drawn, g_dtess_bad_cps, g_dtess_ind_drawn;   /* DXIL tessellation through the converter's emulation (madeira-bcd: indirect draws) */
 static LONG g_gs_built, g_gs_drawn;   /* ml1147 */
 static LONG g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts;   /* ml1088 */
 static LONG g_srv_clamped; static float g_srv_clamp_max;   /* ml1089 */
@@ -1272,13 +1272,13 @@ struct mad_pso {
     struct { UINT strides[16]; obj_handle_t rps; } var[8]; unsigned nvar;
     CRITICAL_SECTION var_lock;
     obj_handle_t device_handle;
-    int lazy;   /* madeira-bcd: plain render pipeline built at its first draw (mad_pso_realize) */
-    int lazy_cs;   /* madeira-bcd: compute pipeline built at its first dispatch */
+    int lazy;                                       /* plain render pipeline built at its first draw (mad_pso_realize) */
+    int lazy_cs;                                    /* compute pipeline built at its first dispatch (mad_cpso_realize) */
     UINT64 cs_hash; UINT cs_len;   /* madeira-bcd: FNV-1a of the CS bytecode, for GPU fault reports */
     UINT64 vs_hash;                /* madeira-bcd skin-check: FNV-1a of the VS bytecode (0 unless skin-check is on) */
     char *il_tag; int il_int;      /* madeira-bcd skin-check-trace: the input layout in short; il_int: an integer element (blend indices) */
     LONG first_used; LONG64 born_present; DWORD born_tick;   /* madeira-bcd: pso-first-use */
-    SRWLOCK rlock;                 /* madeira-bcd: serialises this pipeline's lazy build (zero = SRWLOCK_INIT) */
+    SRWLOCK rlock;                                  /* serialises this pipeline's lazy build (zero = SRWLOCK_INIT) */
     /* madeira-bcd pso-lazy-libs: lz = the stage libraries were dropped once the
      * pipeline was created and come back from the shader cache under these keys
      * at its first draw (mad_lzlib_restore); lz_has_ps never changes after creation */
@@ -3241,6 +3241,25 @@ static int mad_pso_lazy_on(void) {   /* madeira-bcd: madeira.cfg pso-lazy (defau
                   d3d12_log("[madeira-d3d12] pipelines are built %s (madeira.cfg pso-lazy)\n", on ? "at their first draw/dispatch" : "at creation"); }
     return on;
 }
+static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
+    return on;
+}
+/* madeira-bcd readback-swap = 0 (opt-in): READBACK buffers stay on Metal-owned
+ * storage while upload-swap keeps UPLOAD buffers on the file tier. The GPU
+ * writes READBACK memory and the CPU reads it; with the file tier between them
+ * the CPU's view may not have the GPU's writes (vis-trace's readback check
+ * counts that). Horizon Zero Dawn has two 32 MB READBACK buffers. */
+static int mad_readback_swap_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = mad_cfg_int_pe("readback-swap", 1) ? 1 : 0;   /* fix attempt: 0 = READBACK buffers on Metal-owned storage, not the file tier (UPLOAD buffers stay there) */
+        if (!on) d3d12_log("[madeira-d3d12] madeira-bcd readback-swap = 0: READBACK buffers on Metal-owned storage, UPLOAD buffers as upload-swap says\n");
+    }
+    return on;
+}
 /* madeira-bcd: PIPELINE CACHE WARM-UP (madeira.cfg / a game's config pso-warm =
  * N, 1-4 parallel compiles; default 0). A lazy pipeline is compiled at its first
  * draw. Metal keeps what it compiled in its on-disk cache across sessions and
@@ -3248,7 +3267,7 @@ static int mad_pso_lazy_on(void) {   /* madeira-bcd: madeira.cfg pso-lazy (defau
  * new one 35-47 ms (GTA V Enhanced, builds 447-451, where new ones came in bursts
  * that froze the game for 100-400 ms). With the switch on, every lazy pipeline is
  * handed to winemetal when the game creates it (MadeiraCtl op 10,
- * tools/patch-winemetal-pso-warm.py): DXMT's own builder compiles the same
+ * winemetal in DXMT): DXMT's own builder compiles the same
  * descriptor on a utility-QoS queue and releases the pipeline at once, so only
  * the compile is kept, in Metal's cache, and memory stays as lazy creation left
  * it. The game's thread does not wait. A winemetal without op 10 answers 0 and
@@ -3271,25 +3290,6 @@ static void mad_pso_warm(obj_handle_t device, const void *info, const void *vd, 
     }
     if (InterlockedIncrement(&sent) == 1)
         d3d12_log("[madeira-d3d12] pso-warm: first pipeline handed to the warm-up queues\n");
-}
-static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
-    static int on = -1;
-    if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
-                  d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
-    return on;
-}
-/* madeira-bcd readback-swap = 0 (opt-in): READBACK buffers stay on Metal-owned
- * storage while upload-swap keeps UPLOAD buffers on the file tier. The GPU
- * writes READBACK memory and the CPU reads it; with the file tier between them
- * the CPU's view may not have the GPU's writes (vis-trace's readback check
- * counts that). Horizon Zero Dawn has two 32 MB READBACK buffers. */
-static int mad_readback_swap_on(void) {
-    static int on = -1;
-    if (on < 0) {
-        on = mad_cfg_int_pe("readback-swap", 1) ? 1 : 0;   /* fix attempt: 0 = READBACK buffers on Metal-owned storage, not the file tier (UPLOAD buffers stay there) */
-        if (!on) d3d12_log("[madeira-d3d12] madeira-bcd readback-swap = 0: READBACK buffers on Metal-owned storage, UPLOAD buffers as upload-swap says\n");
-    }
-    return on;
 }
 
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
@@ -3450,7 +3450,7 @@ static void exec_flush_other_views(struct mad_exec *e, const struct mad_resource
  * ExecuteCommandLists call, does not store it -- as a tile-based GPU's driver
  * does. The store is decided when the pass ends: a pass with a texture the
  * game has discarded before says Unknown store actions and exec_end sets them
- * through MadeiraCtl op 24 (tools/patch-winemetal-rp-store.py; without it, or
+ * through MadeiraCtl op 24 (winemetal in DXMT; without it, or
  * in remote mode, the store side stays off). Opt-in because a game may read
  * what it discarded and get away with it on desktop GPUs, which ignore
  * discards: here it would read garbage. Whether or not it is on, the textures
@@ -3976,7 +3976,7 @@ static void mad_label(obj_handle_t enc, const char *fmt, ...) {
  * nothing about which shader hung (Ghost of Tsushima, first gameplay frames:
  * repeated hangs, the driver then ignores the queue, the game gives up).
  * Batch command buffers are created with encoder execution status
- * (madeira_ctl op 8, tools/patch-dxmt-gpu-fault-info.py), and a failed one
+ * (madeira_ctl op 8, winemetal in DXMT), and a failed one
  * logs its faulted encoders by label (op 9). After the first fault every
  * encoder is labelled, a compute encoder runs ONE pipeline (so a faulted one
  * names its kernel exactly) and a render pass is labelled with the pipelines
@@ -4060,11 +4060,15 @@ struct mad_frec {
 static struct mad_frec g_frec[MAD_FREC_N];
 /* madeira-bcd: a compute shader that faulted the GPU is remembered in
  * C:\madeira-cs\fault-shaders.txt; at the next launch its bytecode is written
- * next to it and into the log (base64), so it can be disassembled offline. */
+ * next to it and into the log (base64), so it can be disassembled offline.
+ * Once: a shader whose fault_<hash>.dxil is already there was captured before,
+ * and is neither logged again at every later launch nor listed again. */
 static UINT64 g_fault_cs_want[16]; static UINT g_fault_cs_nwant; static LONG g_fault_cs_loaded;
 static void mad_fault_remember_cs(UINT64 hash, UINT len) {
     HANDLE h; DWORD wr; char line[64]; int n;
     if (!hash) return;
+    snprintf(line, sizeof line, "C:\\madeira-cs\\fault_%016llx.dxil", (unsigned long long)hash);
+    if (GetFileAttributesA(line) != INVALID_FILE_ATTRIBUTES) return;   /* captured at an earlier launch */
     CreateDirectoryA("C:\\madeira-cs", NULL);
     h = CreateFileA("C:\\madeira-cs\\fault-shaders.txt", FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -4113,6 +4117,7 @@ static void mad_fault_cs_check(const void *bc, UINT len, UINT64 hash) {
     if (i == g_fault_cs_nwant) return;
     g_fault_cs_want[i] = 0;   /* once */
     snprintf(name, sizeof name, "C:\\madeira-cs\\fault_%016llx.dxil", (unsigned long long)hash);
+    if (GetFileAttributesA(name) != INVALID_FILE_ATTRIBUTES) return;   /* captured at an earlier launch */
     h = CreateFileA(name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) { WriteFile(h, bc, len, &wr, NULL); CloseHandle(h); }
     d3d12_log("[madeira-d3d12] GPU fault shader %016llx: %u bytes follow as base64 (also %s)\n", (unsigned long long)hash, len, name);
@@ -4791,7 +4796,7 @@ static void mad_scbv_report(UINT64 presents) {
  * Ghost of Tsushima draws one-frame "shapes in the air" (a rock, a tree
  * smeared by motion blur, lighting from a frame that never was) about once a
  * second: per-object data that belongs to another draw or another frame
- * (docs/got-corruption.md section 8). Every key below is OFF unless set in
+ * (see the keys below). Every key below is OFF unless set in
  * madeira.cfg or the game's file; with all of them unset nothing here runs and
  * nothing is logged.
  *
@@ -5544,13 +5549,16 @@ static void mad_gs_draw(UINT pt, UINT vertex_size, UINT max_prims, UINT instance
  * IRRuntimePrimitiveTypeTriangle to the converter. */
 #define MAD_DTESS_OBJECT_TG_MEM 15360u   /* the helpers' setObjectThreadgroupMemoryLength:15360 atIndex:0 */
 
-/* madeira-bcd: HELPER KERNELS. Indirect tessellation draws need their object
- * threadgroup count from arguments the GPU wrote (Ghost of Tsushima's
- * GPU-driven particles, ~2,700 draws a run, were skipped). mad_kernels.metal
- * is compiled to a metallib in CI (tools/build-madeira-d3d12-dll.sh) and
- * embedded; its kernel turns each D3D12 argument record into
- * MTLDispatchThreadgroupsIndirectArguments in a shared ring. Without the
- * metallib (a local build) those draws stay skipped. */
+/* madeira-bcd: HELPER KERNELS. mad_kernels.metal is compiled to a metallib by
+ * build/madeira-d3d12/build-pe.sh and embedded; the indirect-argument probe
+ * (ind-probe) runs on its kernel and a shared 4 MB ring the CPU can read.
+ * Without the metallib (no xcrun, or the compile failed) whatever needs it is
+ * skipped. Indirect DXIL tessellation draws need their object threadgroup
+ * count from arguments the GPU wrote (Ghost of Tsushima's GPU-driven
+ * particles, ~2,700 draws a run, were skipped): mad_tess_indirect_args turns
+ * each D3D12 argument record into MTLDispatchThreadgroupsIndirectArguments in
+ * the same ring (exec_tess_indirect_prep); without the metallib those draws
+ * stay skipped. */
 #ifdef MAD_HAVE_KERNELS
 #include "mad_kernels_metallib.h"
 #endif
@@ -5583,15 +5591,15 @@ static int mad_kernels_ready(struct mad_device *d) {
             NSObject_release(fn);
         }
         memset(&bi, 0, sizeof bi); bi.length = MAD_KRING_BYTES; bi.options = WMTResourceStorageModeShared;
-        if (d->k_tind_pso) d->k_ring = MTLDevice_newBuffer(d->mtl_device, &bi);
+        if (d->k_lib) d->k_ring = MTLDevice_newBuffer(d->mtl_device, &bi);
         if (d->k_ring) { mad_resident(d, d->k_ring); d->k_ring_cpu = (unsigned char *)bi.memory.ptr; }
-        d->k_state = d->k_tind_pso && d->k_ring ? 1 : -1;
+        d->k_state = d->k_lib && d->k_ring ? 1 : -1;
         d3d12_log("[madeira-d3d12] helper kernels: %s (library %d, indirect tessellation kernel %d, probe kernel %d, ring %d%s)\n",
                   d->k_state > 0 ? "ready" : "NOT available", !!d->k_lib, !!d->k_tind_pso, !!d->k_probe_pso, !!d->k_ring,
                   d->k_ring_cpu ? ", CPU-visible" : "");
 #else
         d->k_state = -1;
-        d3d12_log("[madeira-d3d12] helper kernels: not built in (no metallib); indirect tessellation draws are skipped\n");
+        d3d12_log("[madeira-d3d12] helper kernels: not built in (no metallib); indirect tessellation draws are skipped and the indirect-argument probe is off\n");
 #endif
     }
     ReleaseSRWLockExclusive(&d->k_lock);
@@ -8358,7 +8366,7 @@ tess_go:
             struct { UINT64 addr; UINT32 length, stride; } vbt[31];
             if (c->kind == MC_DRAW_INDEXED) { dp[2] = c->u.drawi.start; if (e->ib) ibaddr = e->ib->gpu_address + e->ib_off; }
             else if (c->kind == MC_DRAW_INDEXED_INDIRECT && e->ib) ibaddr = e->ib->gpu_address + e->ib_off;   /* madeira-bcd */
-            if (gsemu == 2) mad_ts_draw(e->pso, inst, count, kind, ibaddr, &gdi, &grid, &otg, &mtg);   /* madeira-bcd */
+            if (gsemu == 2) mad_ts_draw(e->pso, inst, count, kind, ibaddr, &gdi, &grid, &otg, &mtg);
             else mad_gs_draw(pt, e->pso->gs_vertex_size, e->pso->gs_max_prims, inst, count, kind, ibaddr, &gdi, &grid, &otg, &mtg);
             memset(&c_mesh, 0, sizeof c_mesh); c_mesh.type = WMTRenderCommandDrawMeshThreadgroups;
             c_mesh.threadgroup_per_grid = grid; c_mesh.object_threadgroup_size = otg; c_mesh.mesh_threadgroup_size = mtg;
@@ -8973,12 +8981,6 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
-/* madeira-bcd: before an indirect DXIL tessellation draw, one small compute
- * pass turns its argument records (written by the GPU) into mesh dispatch
- * arguments: ceil(count / (patches per object threadgroup x control points))
- * object threadgroups by the instance count. The render pass is split there,
- * as it is for any dispatch between draws. Returns 0 (the draws are skipped as
- * before) when the helper kernel is not available. */
 /* madeira-bcd: INDIRECT-ARGUMENT PROBES. Ghost of Tsushima's GPU time grows
  * from ~17 to ~44 ms a frame within seconds while the command stream stays
  * the same (~60 draws a list): something the GPU itself counts keeps growing
@@ -9168,13 +9170,19 @@ static void mad_pso_first(struct mad_pso *p) {
                   (long long)g_presents_now, p->vs_name, p->ps_name, (long long)p->born_present,
                   (unsigned long)(GetTickCount() - p->born_tick), n == 30000 ? " -- limit of 30000 lines reached" : "");
 }
+/* madeira-bcd: before an indirect DXIL tessellation draw, one small compute
+ * pass turns its argument records (written by the GPU) into mesh dispatch
+ * arguments: ceil(count / (patches per object threadgroup x control points))
+ * object threadgroups by the instance count. The render pass is split there,
+ * as it is for any dispatch between draws. Returns 0 (the draws are skipped as
+ * before) when the helper kernel is not available. */
 static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, UINT64 *out_off) {
     struct mad_device *d = e->q->device;
     struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_setbuffer sb[2]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
     struct { UINT32 count, rec_words, verts_per_tg, pad; } prm;
     UINT64 off;
     static unsigned said;
-    if (!e->pso->rps || !c->u.ind.count || (c->u.ind.stride & 3) || (c->u.ind.off & 3) || !mad_kernels_ready(d)) return 0;
+    if (!e->pso->rps || !c->u.ind.count || (c->u.ind.stride & 3) || (c->u.ind.off & 3) || !mad_kernels_ready(d) || !d->k_tind_pso) return 0;
     off = mad_kring_alloc(d, (UINT64)c->u.ind.count * 16);
     if (off == ~(UINT64)0) return 0;
     if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
@@ -9885,7 +9893,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     struct mad_queue *q = (struct mad_queue *)This;
     struct mad_rp_carry rp_k; const struct mad_list *rp_want = NULL;   /* madeira-bcd rp-carry */
     if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd: sync diagnostics, read once */
-    mad_prebuild_lists(count, lists);   /* madeira-bcd */
+    mad_prebuild_lists(count, lists);   /* lazy pipelines this batch binds, built in parallel */
     if (rs) mad_rs_step(RS_PREBUILD, &rs_t);
     memset(&rp_k, 0, sizeof rp_k); q->rp_carry = &rp_k; q->rp_next = NULL; q->rp_lists = lists; q->rp_nlists = count;
     for (UINT i = 0; i < count; i++) {
@@ -14780,7 +14788,7 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
  *   3 = MIN/MAX: Metal's own reductionMode (iOS 26, Apple10 GPUs such as the
  *       A19): the mode rides in WMTSamplerInfo's padding byte after
  *       support_argument_buffers (0xA1 minimum, 0xA2 maximum) and the patched
- *       winemetal (tools/patch-winemetal-sampler-reduction.py, same key) sets
+ *       winemetal (DXMT's sampler-reduction change, same key) sets
  *       it; no comparison, and a NEAREST mip filter becomes LINEAR because
  *       Metal ignores reductionMode with a nearest mip filter (identical at the
  *       whole-number LODs a depth pyramid is read at).
@@ -15090,12 +15098,12 @@ struct mad_sc_hdr {
 static int g_sc_on = -1;
 static WCHAR g_sc_root[MAX_PATH], g_sc_build[64], g_sc_dir[MAX_PATH];
 static volatile LONG g_sc_hit, g_sc_miss, g_sc_store;
-/* bc1: converted with IRCompatibilityFlagBoundsCheck. madeira-bcd: the CI
+/* bc1: converted with IRCompatibilityFlagBoundsCheck. madeira-bcd: the
  * build passes MAD_SC_CONVERTER_ID, a hash of everything that shapes a
  * conversion (the service in madeira-d3d12/src/unix and the IR ABI,
  * its build script, DXMT's DXBC compiler and parser as patched, LLVM's
  * configuration, Apple's converter library and headers -- see
- * tools/build-madeira-d3d12-dll.sh), so a new Madeira build keeps the device's
+ * build/madeira-d3d12/build-pe.sh), so a new Madeira build keeps the device's
  * cache unless the converter itself changed; before, every build started from
  * nothing and Ghost of Tsushima converted ~29,000 stages again. A local build
  * without it still gets its own cache per build. The runtime switches that
@@ -15198,7 +15206,7 @@ static DWORD WINAPI mad_sc_prune(void *arg) {   /* other builds' caches */
 /* madeira-bcd shader-cache-native (madeira.cfg or the game's own file; on by
  * default, = 0 turns it off): the cache's files are read and written by
  * winemetal, natively, relative to an open descriptor of the build directory
- * (tools/patch-winemetal-sc-native.py, MadeiraCtl ops 20-22) -- the same names,
+ * (winemetal in DXMT, MadeiraCtl ops 20-22) -- the same names,
  * contents and layout as through Wine's file API, and the same temporary file
  * renamed over the entry. Wine's file API cost a create_file, get_handle_fd and
  * close_handle request and a realpath() in the wineserver per entry: Horizon
@@ -15270,17 +15278,31 @@ static int mad_sc_init(void) {
                 size_t l = strlen(g_sc_rt);
                 snprintf(g_sc_rt + l, sizeof g_sc_rt - l, ", dxbc-spaces 1");
             }
-            mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
-            mad_sc_feed(&h, g_sc_rt, sizeof g_sc_rt);
-            n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
-            if (!n || n >= MAX_PATH - 64) on = 0;
-            else {
-                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira", base); CreateDirectoryW(g_sc_root, NULL);
-                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira\\ShaderCache", base); CreateDirectoryW(g_sc_root, NULL);
-                _snwprintf(g_sc_build, 64, L"%016llx", (unsigned long long)h.a);
-                _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls", g_sc_root, g_sc_build);
-                CreateDirectoryW(g_sc_dir, NULL);
-                { HANDLE t = CreateThread(NULL, 0, mad_sc_prune, NULL, 0, NULL); if (t) CloseHandle(t); }
+            /* The build directory is the converter's identity alone -- this DLL's
+             * stamp and the app image the converter's unix half is linked into
+             * (MADEIRA_APP_IMAGE_UUID, from the bridge) -- and only other builds'
+             * directories are pruned. The switches above get a subdirectory each, so
+             * games with different lists (and two of them running) keep their caches. */
+            {
+                struct mad_sc_hash hr = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
+                char uuid[40] = "";
+                DWORD ul = GetEnvironmentVariableA("MADEIRA_APP_IMAGE_UUID", uuid, sizeof uuid);   /* set by the app: not a switch */
+                if (!ul || ul >= sizeof uuid) uuid[0] = 0;
+                mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
+                mad_sc_feed(&h, uuid, strlen(uuid) + 1);
+                mad_sc_feed(&hr, g_sc_rt, sizeof g_sc_rt);
+                n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+                if (!n || n >= MAX_PATH - 112) on = 0;
+                else {
+                    _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira", base); CreateDirectoryW(g_sc_root, NULL);
+                    _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira\\ShaderCache", base); CreateDirectoryW(g_sc_root, NULL);
+                    _snwprintf(g_sc_build, 64, L"%016llx", (unsigned long long)h.a);
+                    _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls", g_sc_root, g_sc_build);
+                    CreateDirectoryW(g_sc_dir, NULL);
+                    _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls\\%016llx", g_sc_root, g_sc_build, (unsigned long long)hr.a);
+                    CreateDirectoryW(g_sc_dir, NULL);
+                    { HANDLE t = CreateThread(NULL, 0, mad_sc_prune, NULL, 0, NULL); if (t) CloseHandle(t); }
+                }
             }
         }
         if (on) d3d12_log("[madeira-d3d12] shader cache ON: %ls, identity '%s' (%s; madeira.cfg shader-cache = 0 turns it off)\n", g_sc_dir, g_sc_stamp, g_sc_rt);
@@ -15772,14 +15794,14 @@ static void mad_ir_convert_cached_impl(struct madeira_ir_convert_args *a) {
     }
 }
 
-/* madeira-bcd: SHARED METAL LIBRARIES. A game's pipelines repeat the same
- * shader stage many times: Ghost of Tsushima created 30,370 libraries at New
- * Game from only ~11,400 distinct converter outputs, and Metal allocates
- * GPU-side storage per library -- 5.1 GB there, which with everything else
- * reached iOS's limit (a 1 MB allocation failed and the game stopped itself).
- * Identical metallib bytes with the same entry now share one MTLLibrary and
- * MTLFunction; each pipeline takes its own reference, so pso_Release stays
- * balanced. The table keeps one reference per distinct library. */
+/* SHARED METAL LIBRARIES. A game's pipelines repeat the same shader stage many
+ * times: Ghost of Tsushima created 30,370 libraries at New Game from only
+ * ~11,400 distinct converter outputs, and Metal allocates GPU-side storage per
+ * library -- 5.1 GB there, which with everything else reached iOS's limit (a
+ * 1 MB allocation failed and the game stopped itself). Identical metallib bytes
+ * with the same entry share one MTLLibrary and MTLFunction; each pipeline takes
+ * its own reference, so pso_Release stays balanced. The table keeps one
+ * reference per distinct library. */
 struct mad_libshare { UINT64 k0, k1; obj_handle_t lib, fn; };
 static struct mad_libshare *g_libshare; static SIZE_T g_libshare_cap, g_libshare_n;
 static SRWLOCK g_libshare_lock = SRWLOCK_INIT;
@@ -15811,146 +15833,6 @@ static int mad_libshare_on(void) {
                   d3d12_log("[madeira-d3d12] identical shader libraries are %s (madeira.cfg pso-share-libs)\n", on ? "shared" : "kept per pipeline"); }
     return on;
 }
-static int mad_libshare_find(UINT64 k0, UINT64 k1, obj_handle_t *lib, obj_handle_t *fn) {
-    struct mad_libshare *e; int ok = 0;
-    if (!mad_libshare_on()) return 0;
-    AcquireSRWLockShared(&g_libshare_lock);
-    e = mad_libshare_slot(k0, k1);
-    if (e && e->lib) { NSObject_retain(e->lib); NSObject_retain(e->fn); *lib = e->lib; *fn = e->fn; ok = 1; }
-    ReleaseSRWLockShared(&g_libshare_lock);
-    if (ok) {
-        LONG n = InterlockedIncrement(&g_libshare_hits);
-        if (n == 1 || (n % 2000) == 0)
-            d3d12_log("[madeira-d3d12] shared shader libraries: %ld reuses, %lu distinct\n", n, (unsigned long)g_libshare_n);
-    }
-    return ok;
-}
-static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_t fn) {
-    struct mad_libshare *e;
-    if (!mad_libshare_on()) return;
-    AcquireSRWLockExclusive(&g_libshare_lock);
-    if ((g_libshare_n + 1) * 10 >= g_libshare_cap * 7) {   /* grow at 70 % load; the capacity stays a power of two */
-        SIZE_T ncap = g_libshare_cap ? g_libshare_cap * 2 : 4096, i, oldcap = g_libshare_cap;
-        struct mad_libshare *old = g_libshare, *nw = calloc(ncap, sizeof *nw);
-        if (nw) {
-            g_libshare = nw; g_libshare_cap = ncap;
-            for (i = 0; i < oldcap; i++) if (old[i].lib) *mad_libshare_slot(old[i].k0, old[i].k1) = old[i];
-            free(old);
-        }
-    }
-    e = (g_libshare_n + 1) * 10 < g_libshare_cap * 9 ? mad_libshare_slot(k0, k1) : NULL;   /* never fill the table */
-    if (e && !e->lib) {
-        NSObject_retain(lib); NSObject_retain(fn);
-        e->k0 = k0; e->k1 = k1; e->lib = lib; e->fn = fn; g_libshare_n++;
-    }
-    ReleaseSRWLockExclusive(&g_libshare_lock);
-}
-
-/* madeira-bcd pso-lazy-libs (madeira.cfg or the game's own file, off by
- * default). Horizon Zero Dawn (build 480, 2026-10-09 20:28) created 52,570
- * pipelines in its menu and drew ~1,500 of them in its first gameplay seconds,
- * yet every one kept its converted Metal libraries for the whole session, and
- * the shared-library table one more reference to each: 23,045 libraries,
- * 432 MB of metallib, and the footprint grew ~32 KB with each new library until
- * iOS killed the game at 8,189 MB two seconds into play. With the switch, a lazy
- * pipeline (plain vertex/pixel or compute, built at its first draw or dispatch)
- * lets its libraries go once it is created; they stay in the shader cache
- * (%LOCALAPPDATA%\Madeira\ShaderCache, written when the stage was converted),
- * and the first draw reads them back by key, shares an identical library a
- * built pipeline already has, and builds the pipeline as before. A stage whose
- * cache file is not there, or whose entry name would not fit the pipeline's
- * name field, keeps its library as before. A pipeline whose file is gone by its
- * first draw is skipped and counted, like any lazy pipeline Metal refuses. */
-static int mad_lzlib_on(void) {
-    if (g_lzlib < 0) {
-        g_lzlib = mad_cfg_int_pe("pso-lazy-libs", 0) ? 1 : 0;   /* madeira.cfg pso-lazy-libs = 1 */
-        if (g_lzlib)
-            d3d12_log("[madeira-d3d12] pso-lazy-libs = 1: a lazy pipeline's shader libraries are let go once it is created "
-                      "and read back from the shader cache at its first draw\n");
-    }
-    return g_lzlib;
-}
-/* The pipeline's stages may be dropped: each has a cache file and a name the
- * pipeline holds whole. */
-static int mad_lzlib_can_drop(const struct mad_pso *p, const struct mad_lzkey *vs, const struct mad_lzkey *ps) {
-    int ok = p->vs_fn && vs->ok && strlen(p->vs_name) < sizeof p->vs_name - 1 &&
-             (!p->ps_fn || (ps && ps->ok && strlen(p->ps_name) < sizeof p->ps_name - 1));
-    if (!ok) InterlockedIncrement(&g_lzlib_kept);
-    return ok;
-}
-static void mad_lzlib_drop(struct mad_pso *p, const struct mad_lzkey *vs, const struct mad_lzkey *ps) {
-    LONG n;
-    p->lz_vs_key[0] = vs->key[0]; p->lz_vs_key[1] = vs->key[1];
-    p->lz_has_ps = p->ps_fn != 0;
-    if (p->lz_has_ps) { p->lz_ps_key[0] = ps->key[0]; p->lz_ps_key[1] = ps->key[1]; }
-    if (p->vs_fn) NSObject_release(p->vs_fn);
-    if (p->vs_lib) NSObject_release(p->vs_lib);
-    if (p->ps_fn) NSObject_release(p->ps_fn);
-    if (p->ps_lib) NSObject_release(p->ps_lib);
-    p->vs_fn = p->vs_lib = p->ps_fn = p->ps_lib = 0;
-    p->rp.vertex_function = p->rp.fragment_function = 0;
-    p->lz = 1;
-    n = InterlockedIncrement(&g_lzlib_dropped);
-    if (n == 1 || !(n % 5000))
-        d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines let their libraries go at creation (%ld kept them), "
-                  "%ld read them back at first use (%ld failed)\n", (long)n, (long)g_lzlib_kept, (long)g_lzlib_restored,
-                  (long)g_lzlib_failed);
-}
-/* One stage back from the cache: its own references to the library and the
- * function, the table's if an identical library is already shared. */
-static int mad_lzlib_stage(struct mad_pso *p, const UINT64 key[2], const char *name, obj_handle_t *lib_out, obj_handle_t *fn_out) {
-    unsigned char *blob = NULL; SIZE_T size = 0;
-    struct mad_sc_hdr h;
-    obj_handle_t dd, err = 0, lib = 0, fn = 0;
-    UINT64 k0, k1;
-    *lib_out = 0; *fn_out = 0;
-    if (!mad_sc_read_file(key, &blob, &size)) return 0;
-    memcpy(&h, blob, sizeof h);
-    if (!(h.magic == MAD_SC_MAGIC && h.hdr_size == sizeof h && h.key[0] == key[0] && h.key[1] == key[1] &&
-          h.ret_status == MADEIRA_IR_OK && h.ret_len && h.ret_len <= (UINT64)size - sizeof h)) {
-        free(blob);
-        return 0;
-    }
-    mad_libshare_key(blob + sizeof h, (SIZE_T)h.ret_len, name, &k0, &k1);
-    if (mad_libshare_find(k0, k1, &lib, &fn)) { free(blob); *lib_out = lib; *fn_out = fn; return 1; }
-    dd = DispatchData_alloc_init((uint64_t)(uintptr_t)(blob + sizeof h), (uint64_t)h.ret_len);   /* copies the bytes */
-    if (dd) { lib = MTLDevice_newLibrary(p->device_handle, dd, &err); NSObject_release(dd); }
-    free(blob);
-    if (err) mad_log_nserror("library (pso-lazy-libs)", err);
-    if (!lib) return 0;
-    InterlockedExchangeAdd64(&g_lib_bytes, (LONG64)h.ret_len); InterlockedIncrement(&g_lib_count);   /* ml1060 */
-    fn = MTLLibrary_newFunction(lib, name);
-    if (!fn) { NSObject_release(lib); return 0; }
-    mad_libshare_add(k0, k1, lib, fn);
-    *lib_out = lib; *fn_out = fn;
-    return 1;
-}
-/* Called with p->rlock held, before the pipeline is built. */
-static int mad_lzlib_restore(struct mad_pso *p) {
-    obj_handle_t vl = 0, vf = 0, pl = 0, pf = 0;
-    LONG n;
-    if (!mad_lzlib_stage(p, p->lz_vs_key, p->vs_name, &vl, &vf) ||
-        (p->lz_has_ps && !mad_lzlib_stage(p, p->lz_ps_key, p->ps_name, &pl, &pf))) {
-        if (vf) NSObject_release(vf);
-        if (vl) NSObject_release(vl);
-        n = InterlockedIncrement(&g_lzlib_failed);
-        if (n <= 8)
-            d3d12_log("[madeira-d3d12] pso-lazy-libs: '%s'/'%s' could not be read back from the shader cache; "
-                      "the pipeline's %s are skipped\n", p->vs_name, p->lz_has_ps ? p->ps_name : "-",
-                      p->is_compute ? "dispatches" : "draws");
-        return 0;
-    }
-    p->vs_lib = vl; p->vs_fn = vf; p->ps_lib = pl; p->ps_fn = pf;
-    if (!p->is_compute) { p->rp.vertex_function = vf; p->rp.fragment_function = pf; }
-    p->lz = 0;
-    MemoryBarrier();   /* the functions are in place before the pipeline is published (mad_pso_for_strides reads p->rp) */
-    n = InterlockedIncrement(&g_lzlib_restored);
-    if (n == 1 || !(n % 500))
-        d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines read their libraries back at first use (%ld failed; "
-                  "%ld let them go at creation)\n", (long)n, (long)g_lzlib_failed, (long)g_lzlib_dropped);
-    return 1;
-}
-
 /* madeira-bcd rsig-miss: the converter's code 4
  * (IRErrorCodeResourceNotReferencedByRootSignature) names no resource, and
  * Horizon Zero Dawn (build 469, 2026-10-09 13:57) lost 116 DXIL vertex and
@@ -16180,6 +16062,145 @@ static void mad_rsig_miss_log(const char *tag, const struct mad_rootsig *rs, con
                   "visible to it: %s | all: %s\n", tag, stage, (unsigned long long)h, m, nb, miss, all);
     d3d12_log("[madeira-d3d12] rsig-miss %s (%s shader %016llx) root signature: %s\n", tag, stage,
               (unsigned long long)h, desc);
+}
+static int mad_libshare_find(UINT64 k0, UINT64 k1, obj_handle_t *lib, obj_handle_t *fn) {
+    struct mad_libshare *e; int ok = 0;
+    if (!mad_libshare_on()) return 0;
+    AcquireSRWLockShared(&g_libshare_lock);
+    e = mad_libshare_slot(k0, k1);
+    if (e && e->lib) { NSObject_retain(e->lib); NSObject_retain(e->fn); *lib = e->lib; *fn = e->fn; ok = 1; }
+    ReleaseSRWLockShared(&g_libshare_lock);
+    if (ok) {
+        LONG n = InterlockedIncrement(&g_libshare_hits);
+        if (n == 1 || (n % 2000) == 0)
+            d3d12_log("[madeira-d3d12] shared shader libraries: %ld reuses, %lu distinct\n", n, (unsigned long)g_libshare_n);
+    }
+    return ok;
+}
+static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_t fn) {
+    struct mad_libshare *e;
+    if (!mad_libshare_on()) return;
+    AcquireSRWLockExclusive(&g_libshare_lock);
+    if ((g_libshare_n + 1) * 10 >= g_libshare_cap * 7) {   /* grow at 70 % load; the capacity stays a power of two */
+        SIZE_T ncap = g_libshare_cap ? g_libshare_cap * 2 : 4096, i, oldcap = g_libshare_cap;
+        struct mad_libshare *old = g_libshare, *nw = calloc(ncap, sizeof *nw);
+        if (nw) {
+            g_libshare = nw; g_libshare_cap = ncap;
+            for (i = 0; i < oldcap; i++) if (old[i].lib) *mad_libshare_slot(old[i].k0, old[i].k1) = old[i];
+            free(old);
+        }
+    }
+    e = (g_libshare_n + 1) * 10 < g_libshare_cap * 9 ? mad_libshare_slot(k0, k1) : NULL;   /* never fill the table */
+    if (e && !e->lib) {
+        NSObject_retain(lib); NSObject_retain(fn);
+        e->k0 = k0; e->k1 = k1; e->lib = lib; e->fn = fn; g_libshare_n++;
+    }
+    ReleaseSRWLockExclusive(&g_libshare_lock);
+}
+
+/* madeira-bcd pso-lazy-libs (madeira.cfg or the game's own file, off by
+ * default). Horizon Zero Dawn (build 480, 2026-10-09 20:28) created 52,570
+ * pipelines in its menu and drew ~1,500 of them in its first gameplay seconds,
+ * yet every one kept its converted Metal libraries for the whole session, and
+ * the shared-library table one more reference to each: 23,045 libraries,
+ * 432 MB of metallib, and the footprint grew ~32 KB with each new library until
+ * iOS killed the game at 8,189 MB two seconds into play. With the switch, a lazy
+ * pipeline (plain vertex/pixel or compute, built at its first draw or dispatch)
+ * lets its libraries go once it is created; they stay in the shader cache
+ * (%LOCALAPPDATA%\Madeira\ShaderCache, written when the stage was converted),
+ * and the first draw reads them back by key, shares an identical library a
+ * built pipeline already has, and builds the pipeline as before. A stage whose
+ * cache file is not there, or whose entry name would not fit the pipeline's
+ * name field, keeps its library as before. A pipeline whose file is gone by its
+ * first draw is skipped and counted, like any lazy pipeline Metal refuses. */
+static int mad_lzlib_on(void) {
+    if (g_lzlib < 0) {
+        g_lzlib = mad_cfg_int_pe("pso-lazy-libs", 0) ? 1 : 0;   /* madeira.cfg pso-lazy-libs = 1 */
+        if (g_lzlib)
+            d3d12_log("[madeira-d3d12] pso-lazy-libs = 1: a lazy pipeline's shader libraries are let go once it is created "
+                      "and read back from the shader cache at its first draw\n");
+    }
+    return g_lzlib;
+}
+/* The pipeline's stages may be dropped: each has a cache file and a name the
+ * pipeline holds whole. */
+static int mad_lzlib_can_drop(const struct mad_pso *p, const struct mad_lzkey *vs, const struct mad_lzkey *ps) {
+    int ok = p->vs_fn && vs->ok && strlen(p->vs_name) < sizeof p->vs_name - 1 &&
+             (!p->ps_fn || (ps && ps->ok && strlen(p->ps_name) < sizeof p->ps_name - 1));
+    if (!ok) InterlockedIncrement(&g_lzlib_kept);
+    return ok;
+}
+static void mad_lzlib_drop(struct mad_pso *p, const struct mad_lzkey *vs, const struct mad_lzkey *ps) {
+    LONG n;
+    p->lz_vs_key[0] = vs->key[0]; p->lz_vs_key[1] = vs->key[1];
+    p->lz_has_ps = p->ps_fn != 0;
+    if (p->lz_has_ps) { p->lz_ps_key[0] = ps->key[0]; p->lz_ps_key[1] = ps->key[1]; }
+    if (p->vs_fn) NSObject_release(p->vs_fn);
+    if (p->vs_lib) NSObject_release(p->vs_lib);
+    if (p->ps_fn) NSObject_release(p->ps_fn);
+    if (p->ps_lib) NSObject_release(p->ps_lib);
+    p->vs_fn = p->vs_lib = p->ps_fn = p->ps_lib = 0;
+    p->rp.vertex_function = p->rp.fragment_function = 0;
+    p->lz = 1;
+    n = InterlockedIncrement(&g_lzlib_dropped);
+    if (n == 1 || !(n % 5000))
+        d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines let their libraries go at creation (%ld kept them), "
+                  "%ld read them back at first use (%ld failed)\n", (long)n, (long)g_lzlib_kept, (long)g_lzlib_restored,
+                  (long)g_lzlib_failed);
+}
+/* One stage back from the cache: its own references to the library and the
+ * function, the table's if an identical library is already shared. */
+static int mad_lzlib_stage(struct mad_pso *p, const UINT64 key[2], const char *name, obj_handle_t *lib_out, obj_handle_t *fn_out) {
+    unsigned char *blob = NULL; SIZE_T size = 0;
+    struct mad_sc_hdr h;
+    obj_handle_t dd, err = 0, lib = 0, fn = 0;
+    UINT64 k0, k1;
+    *lib_out = 0; *fn_out = 0;
+    if (!mad_sc_read_file(key, &blob, &size)) return 0;
+    memcpy(&h, blob, sizeof h);
+    if (!(h.magic == MAD_SC_MAGIC && h.hdr_size == sizeof h && h.key[0] == key[0] && h.key[1] == key[1] &&
+          h.ret_status == MADEIRA_IR_OK && h.ret_len && h.ret_len <= (UINT64)size - sizeof h)) {
+        free(blob);
+        return 0;
+    }
+    mad_libshare_key(blob + sizeof h, (SIZE_T)h.ret_len, name, &k0, &k1);
+    if (mad_libshare_find(k0, k1, &lib, &fn)) { free(blob); *lib_out = lib; *fn_out = fn; return 1; }
+    dd = DispatchData_alloc_init((uint64_t)(uintptr_t)(blob + sizeof h), (uint64_t)h.ret_len);   /* copies the bytes */
+    if (dd) { lib = MTLDevice_newLibrary(p->device_handle, dd, &err); NSObject_release(dd); }
+    free(blob);
+    if (err) mad_log_nserror("library (pso-lazy-libs)", err);
+    if (!lib) return 0;
+    InterlockedExchangeAdd64(&g_lib_bytes, (LONG64)h.ret_len); InterlockedIncrement(&g_lib_count);   /* ml1060 */
+    fn = MTLLibrary_newFunction(lib, name);
+    if (!fn) { NSObject_release(lib); return 0; }
+    mad_libshare_add(k0, k1, lib, fn);
+    *lib_out = lib; *fn_out = fn;
+    return 1;
+}
+/* Called with p->rlock held, before the pipeline is built. */
+static int mad_lzlib_restore(struct mad_pso *p) {
+    obj_handle_t vl = 0, vf = 0, pl = 0, pf = 0;
+    LONG n;
+    if (!mad_lzlib_stage(p, p->lz_vs_key, p->vs_name, &vl, &vf) ||
+        (p->lz_has_ps && !mad_lzlib_stage(p, p->lz_ps_key, p->ps_name, &pl, &pf))) {
+        if (vf) NSObject_release(vf);
+        if (vl) NSObject_release(vl);
+        n = InterlockedIncrement(&g_lzlib_failed);
+        if (n <= 8)
+            d3d12_log("[madeira-d3d12] pso-lazy-libs: '%s'/'%s' could not be read back from the shader cache; "
+                      "the pipeline's %s are skipped\n", p->vs_name, p->lz_has_ps ? p->ps_name : "-",
+                      p->is_compute ? "dispatches" : "draws");
+        return 0;
+    }
+    p->vs_lib = vl; p->vs_fn = vf; p->ps_lib = pl; p->ps_fn = pf;
+    if (!p->is_compute) { p->rp.vertex_function = vf; p->rp.fragment_function = pf; }
+    p->lz = 0;
+    MemoryBarrier();   /* the functions are in place before the pipeline is published (mad_pso_for_strides reads p->rp) */
+    n = InterlockedIncrement(&g_lzlib_restored);
+    if (n == 1 || !(n % 500))
+        d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines read their libraries back at first use (%ld failed; "
+                  "%ld let them go at creation)\n", (long)n, (long)g_lzlib_failed, (long)g_lzlib_dropped);
+    return 1;
 }
 
 /* madeira-bcd msc-unbounded-retry (madeira.cfg or the game's own file, off by
@@ -17593,10 +17614,9 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
      * pipelines below. */
     if (!p->gs_emu && !p->has_tess) {
         if (mad_pso_lazy_on() && !(desc->GS.pShaderBytecode && desc->GS.BytecodeLength)) {
-            /* madeira-bcd: descriptors kept, built by mad_pso_realize */
-            p->lazy = 1; p->rp = rp; p->has_vd = has_vd; if (has_vd) p->vd = vd;
-            p->device_handle = d->mtl_device;
-            mad_pso_warm(p->device_handle, &p->rp, p->has_vd ? &p->vd : NULL, p->has_vd ? 1 : 0);   /* pso-warm */
+            /* built at its first draw (mad_pso_realize); the descriptors are kept below */
+            p->lazy = 1; p->rp = rp; p->device_handle = d->mtl_device;
+            mad_pso_warm(p->device_handle, &p->rp, has_vd ? &vd : NULL, has_vd ? 1 : 0);   /* pso-warm */
         } else {
             obj_handle_t err = 0;
             p->rps = has_vd ? MTLDevice_newRenderPipelineStateVD(d->mtl_device, &rp, &vd, &err)
@@ -17694,7 +17714,6 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     pso_Release((ID3D12PipelineState *)p);
     return hr;
 }
-
 
 /* madeira-bcd: the ml931 compute-shader dumps (C:\madeira-cs\cs_<pipeline
  * pointer>_<size>.dxil, the first 400 of every launch) are named by a pointer
@@ -17851,8 +17870,8 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         memset(&ci, 0, sizeof ci);   /* the descriptor mad_cpso_realize builds */
         ci.compute_function = p->vs_fn;
         mad_pso_warm(p->device_handle, &ci, NULL, 2);   /* pso-warm */
-        if (lz_on && mad_lzlib_can_drop(p, &lzc, NULL)) mad_lzlib_drop(p, &lzc, NULL);   /* madeira-bcd pso-lazy-libs */
         hr = pso_QI((ID3D12PipelineState *)p, riid, out);
+        if (lz_on && mad_lzlib_can_drop(p, &lzc, NULL)) mad_lzlib_drop(p, &lzc, NULL);   /* madeira-bcd pso-lazy-libs */
         pso_Release((ID3D12PipelineState *)p);
         return hr;
     }
@@ -19642,11 +19661,11 @@ struct mad_swapchain {
     UINT max_latency;
     HANDLE latency_event;
     UINT64 present_serial[8];   /* ml1070: GPU serial the frame presented N ago must have passed */
+    LONG64 cap_next;   /* madeira-bcd fps-gov: QPC time the next frame may start (0 = no cap running) */
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
     LONG diag_seq;   /* madeira-bcd: [swap-diag] number of the creation / ResizeBuffers being logged, 0 = none */
-    LONG64 cap_next;   /* madeira-bcd fps-gov: QPC time the next frame may start (0 = no cap running) */
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
 /* madeira-bcd: [swap-diag] counters of the swapchain's mode-switch lines (see
@@ -19869,6 +19888,45 @@ static HRESULT STDMETHODCALLTYPE swap_GetDevice(IDXGISwapChain4 *T, REFIID riid,
     return s->dev->vtbl->QueryInterface((ID3D12Device10 *)s->dev, riid, out);
 }
 
+/* madeira-bcd fps-gov: the D3D12 side of the frame cap (opt-in). The unix-side
+ * governor (server_ios.c ios_fps_gov_step: env.MADEIRA_FPS_CAP = fps, or
+ * env.MADEIRA_FPS_GOV_MW = a CPU power target) writes the cap into this DLL's
+ * counter block, g_xp.fps_cap; 0, the default, skips everything below. After
+ * a Present has queued its frame, the game's thread waits until one period
+ * after the previous deadline, so the next frame starts at most fps_cap times a
+ * second and the frame just presented is not delayed. The deadline moves one
+ * period at a time and is re-based when the game fell more than a period
+ * behind: a slow frame is not paid for twice and a stall banks no credit. The
+ * wait is NtDelayExecution (a timed kernel wait, 100 ns units), never a spin. */
+static void mad_fps_cap_pace(struct mad_swapchain *s, LONG64 now) {
+    typedef LONG (WINAPI *delay_fn)(BOOLEAN, const LARGE_INTEGER *);
+    static delay_fn delay;
+    static LONG looked;
+    LONG64 cap = g_xp.fps_cap, period, wait;
+    if (cap < 10 || cap > 240 || g_xp.qpf <= 0) { s->cap_next = 0; return; }
+    period = g_xp.qpf / cap;
+    if (!s->cap_next || now > s->cap_next + period) { s->cap_next = now + period; return; }
+    wait = s->cap_next - now;
+    s->cap_next += period;
+    if (wait <= 0) return;
+    if (!looked) {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        if (nt) delay = (delay_fn)(void *)GetProcAddress(nt, "NtDelayExecution");
+        looked = 1;
+    }
+    {
+        LONG64 t0 = mad_qpc();
+        if (delay) {
+            LARGE_INTEGER rel;
+            rel.QuadPart = -(LONGLONG)(wait * 10000000 / g_xp.qpf);   /* relative, 100 ns units */
+            if (rel.QuadPart < 0) delay(FALSE, &rel);
+        } else
+            Sleep((DWORD)(wait * 1000 / g_xp.qpf));
+        InterlockedExchangeAdd64(&g_xp.t_cap, mad_qpc() - t0);
+        InterlockedIncrement64(&g_xp.n_cap);
+    }
+}
+
 /* ml1056: drawable ownership. -[CAMetalLayer nextDrawable] returns an AUTORELEASED
  * (+0) object and this function ended with NSObject_release(drawable): a release
  * of a reference it never owned. On a thread with no autorelease pool that
@@ -19957,44 +20015,6 @@ static void mad_vt_present(struct mad_device *d, UINT64 presents) {
     if (presents % 300 == 0 && g_vt_mcpu)
         d3d12_log("[vis-trace] readback check so far: %ld mips equal to the GPU's own copy, %ld overwritten by a later readback, "
                   "%ld STALE (an earlier readback), %ld different\n", (long)g_vt_chk[0], (long)g_vt_chk[1], (long)g_vt_chk[2], (long)g_vt_chk[3]);
-}
-/* madeira-bcd fps-gov: the D3D12 side of the frame cap (opt-in). The unix-side
- * governor (server_ios.c ios_fps_gov_step: env.MADEIRA_FPS_CAP = fps, or
- * env.MADEIRA_FPS_GOV_MW = a CPU power target) writes the cap into this DLL's
- * counter block, g_xp.fps_cap; 0, the default, skips everything below. After
- * a Present has queued its frame, the game's thread waits until one period
- * after the previous deadline, so the next frame starts at most fps_cap times a
- * second and the frame just presented is not delayed. The deadline moves one
- * period at a time and is re-based when the game fell more than a period
- * behind: a slow frame is not paid for twice and a stall banks no credit. The
- * wait is NtDelayExecution (a timed kernel wait, 100 ns units), never a spin. */
-static void mad_fps_cap_pace(struct mad_swapchain *s, LONG64 now) {
-    typedef LONG (WINAPI *delay_fn)(BOOLEAN, const LARGE_INTEGER *);
-    static delay_fn delay;
-    static LONG looked;
-    LONG64 cap = g_xp.fps_cap, period, wait;
-    if (cap < 10 || cap > 240 || g_xp.qpf <= 0) { s->cap_next = 0; return; }
-    period = g_xp.qpf / cap;
-    if (!s->cap_next || now > s->cap_next + period) { s->cap_next = now + period; return; }
-    wait = s->cap_next - now;
-    s->cap_next += period;
-    if (wait <= 0) return;
-    if (!looked) {
-        HMODULE nt = GetModuleHandleA("ntdll.dll");
-        if (nt) delay = (delay_fn)(void *)GetProcAddress(nt, "NtDelayExecution");
-        looked = 1;
-    }
-    {
-        LONG64 t0 = mad_qpc();
-        if (delay) {
-            LARGE_INTEGER rel;
-            rel.QuadPart = -(LONGLONG)(wait * 10000000 / g_xp.qpf);   /* relative, 100 ns units */
-            if (rel.QuadPart < 0) delay(FALSE, &rel);
-        } else
-            Sleep((DWORD)(wait * 1000 / g_xp.qpf));
-        InterlockedExchangeAdd64(&g_xp.t_cap, mad_qpc() - t0);
-        InterlockedIncrement64(&g_xp.n_cap);
-    }
 }
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
@@ -20147,7 +20167,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         }
         if ((s->presents % 300) == 299) mad_sd_report(s->presents + 1);
     }
-    if (g_layer_cfg_layer == s->layer && g_layer_cfg_owner != s) {   /* madeira-bcd: shared layer taken over, see mad_swap_apply_layer */
+    if (g_layer_cfg_layer == s->layer && g_layer_cfg_owner != s) {   /* shared layer taken over, see mad_swap_apply_layer */
         static LONG said;
         if (InterlockedIncrement(&said) <= 8)
             d3d12_log("[madeira-d3d12] swapchain %ux%u (hwnd %p): another swapchain reconfigured the shared Metal layer -- its drawable size and format restored before present #%llu\n",

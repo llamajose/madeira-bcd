@@ -89,6 +89,10 @@ prelude = r'''
 #include <signal.h>
 #include <sys/mman.h>
 #include <linux/falloc.h>
+/* ml1293 (spitefulowl's low-ram-fixes): Darwin's msync flag, as check-swap-coverage.py */
+#ifndef MS_KILLPAGES
+#define MS_KILLPAGES 0
+#endif
 typedef unsigned long ULONG_PTR;
 typedef long NTSTATUS;
 #define NT_SUCCESS(s) ((s) >= 0)
@@ -132,6 +136,11 @@ static int get_unix_prot( unsigned char v )
 static unsigned char page_vprot = VPROT_READ | VPROT_COMMITTED;   /* what the image's pages carry */
 static unsigned char get_host_page_vprot( const void *addr ) { (void)addr; return page_vprot; }
 static int locked;   /* virtual_mutex depth (the stubs below) */
+/* ml1291 (spitefulowl's low-ram-fixes): the deferred punches' worker takes virtual_mutex
+ * itself; the enter/leave stubs below only count, as check-swap-coverage.py does. */
+#include <pthread.h>
+static pthread_mutex_t virtual_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define pthread_setname_np( name ) pthread_setname_np( pthread_self(), name )   /* glibc names a given thread */
 static int mprotect_range( void *base, size_t size, unsigned char set, unsigned char clear )
 {
     char *a = (char *)((uintptr_t)base & ~host_page_mask);
@@ -174,9 +183,8 @@ static ssize_t test_pwrite( int fd, const void *buf, size_t len, off_t off )
     return pwrite( fd, buf, len, off );
 }
 #define pwrite( fd, buf, len, off ) test_pwrite( fd, buf, len, off )
-static int virtual_mutex;
-static void server_enter_uninterrupted_section( int *m, sigset_t *s ) { (void)m; (void)s; locked++; }
-static void server_leave_uninterrupted_section( int *m, sigset_t *s ) { (void)m; (void)s; locked--; }
+static void server_enter_uninterrupted_section( pthread_mutex_t *m, sigset_t *s ) { (void)m; (void)s; locked++; }
+static void server_leave_uninterrupted_section( pthread_mutex_t *m, sigset_t *s ) { (void)m; (void)s; locked--; }
 /* the view table: one image view at most */
 static struct file_view the_view;
 static int have_view;
@@ -390,6 +398,7 @@ static void test_broad_churn_and_census( void )
 
 int main( void )
 {
+    setenv( "MADEIRA_SWAP_PUNCH_DEFER", "0", 1 );   /* ml1291: synchronous punches, as check-swap-coverage.py runs most cases */
     char path[] = "/tmp/madeira-swapimg-XXXXXX";
     int fd = mkstemp( path );
     if (fd < 0) return 2;

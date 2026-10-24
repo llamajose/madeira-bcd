@@ -27,6 +27,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/sysctl.h>
+#include <dlfcn.h>
+#include <mach-o/loader.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -289,14 +291,16 @@ extern void __wine_main(int argc, char *argv[]);
 // File-based logging (from server_ios.c)
 extern void wine_log_set_file(const char *path);
 
-static pthread_t g_wine_thread;
-static volatile int g_wine_running = 0;
 /* madeira-bcd: env.MADEIRA_SRV_FGETPATH of the launch in progress, read by the in-app
  * wineserver (build/wineserver/fd_ios.c), which is running before a game's env lines
  * are set. Set after they are applied, cleared when the session ends. */
 volatile int g_madeira_srv_fgetpath = 0;
-/* madeira-bcd: the same for the server's other per-launch switches (fd_ios.c, request_ios.c;
- * ntdll's server_ios.c reads g_madeira_srv_direct too). All off by default. */
+static pthread_t g_wine_thread;
+static volatile int g_wine_running = 0;
+/* madeira-bcd: the server's per-launch switches (fd_ios.c, request_ios.c; ntdll's
+ * server_ios.c reads g_madeira_srv_direct too), for the in-app wineserver, which is
+ * running before a game's env lines are set. Set after they are applied, cleared when
+ * the session ends. All off by default. */
 volatile int g_madeira_srv_eco_follow = 0;   /* env.MADEIRA_SRV_ECO_FOLLOW = 1 */
 volatile int g_madeira_srv_direct = 0;       /* env.MADEIRA_SRV_DIRECT = 1 or 2 */
 volatile int g_madeira_srv_idle_us = 0;      /* env.MADEIRA_SRV_IDLE_US = 100..50000, 0 = 1000 */
@@ -375,6 +379,30 @@ __attribute__((constructor)) static void madeira_docs_dir_ctor(void)
  * Only LocalLow is created. Roaming is left alone: Wine populates it itself and
  * decides by existence (see madeira_undo_appdata_skeleton). Local already
  * exists on every start (the TEMP directory is in it). */
+/* The PE shader cache's build identity (madeira_d3d12.c, mad_sc_init) includes the
+ * LC_UUID of the image this bridge is in: the converter's unix half is linked into it
+ * too, so the UUID changes whenever the converter could have, and a cache keyed on
+ * the DLL's own build would otherwise keep serving an older converter's output. */
+static void madeira_export_image_uuid(void)
+{
+    Dl_info di;
+    const struct mach_header_64 *mh;
+    const struct load_command *lc;
+    uint32_t i;
+
+    if (!dladdr((const void *)&madeira_export_image_uuid, &di) || !(mh = di.dli_fbase)) return;
+    lc = (const struct load_command *)(mh + 1);
+    for (i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
+    {
+        if (lc->cmd != LC_UUID) continue;
+        const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
+        char hex[33];
+        for (int k = 0; k < 16; k++) snprintf(hex + 2 * k, 3, "%02x", u[k]);
+        setenv("MADEIRA_APP_IMAGE_UUID", hex, 1);
+        return;
+    }
+}
+
 static void madeira_ensure_locallow(NSString *prefix)
 {
     /* 0 leaves the profile's AppData\LocalLow folder missing, as before. */
@@ -935,6 +963,7 @@ static void *wine_process_thread(void *arg) {
         // get_desktop_window's returned HWND fails get_user_object lookup
         // when create_window receives it as req->parent.
         setenv("MADEIRA_WIN32U", "1", 1);
+        madeira_export_image_uuid();
 
         /* iOS-Madeira ml711: default FNA to its D3D11 backend.
          *
@@ -1056,8 +1085,11 @@ static void *wine_process_thread(void *arg) {
             [session setActive:YES error:&aerr];
             if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
-            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms io-buffer=%.1fms",
+            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms io-buffer=%.2fms",
                      session.sampleRate, session.outputLatency * 1000.0, session.IOBufferDuration * 1000.0);
+            char io_us[32];
+            snprintf(io_us, sizeof io_us, "%lld", (long long)(session.IOBufferDuration * 1e6));
+            setenv("MADEIRA_AUDIO_IO_US", io_us, 1);
         }
 
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
@@ -1336,13 +1368,7 @@ static void *wine_process_thread(void *arg) {
                     LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
-                {   /* madeira-bcd: for the wineserver (g_madeira_srv_fgetpath) */
-                    const char *fp = getenv("MADEIRA_SRV_FGETPATH");
-                    g_madeira_srv_fgetpath = (fp && fp[0] == '1') ? 1 : 0;
-                    if (g_madeira_srv_fgetpath)
-                        fprintf(stderr, "[madeira-env] MADEIRA_SRV_FGETPATH=1: the server names the files it opens with F_GETPATH\n");
-                }
-                {   /* madeira-bcd: the server's other per-launch switches (fd_ios.c, request_ios.c) */
+                {   /* madeira-bcd: the server's per-launch switches (fd_ios.c, request_ios.c) */
                     const char *ef = getenv("MADEIRA_SRV_ECO_FOLLOW");   /* 1: the server thread runs at utility QoS while ECO is on */
                     const char *dr = getenv("MADEIRA_SRV_DIRECT");       /* 1 or 2: listed requests run on the calling thread */
                     const char *iu = getenv("MADEIRA_SRV_IDLE_US");      /* the server loop's longest sleep, us (default 1000) */
@@ -1364,6 +1390,12 @@ static void *wine_process_thread(void *arg) {
                 if (madeira_cfg_sync_engine() == MADEIRA_SYNC_FASTSYNC && !getenv("MADEIRA_FASTSYNC")) {
                     setenv("MADEIRA_FASTSYNC", "auto", 0);
                     fprintf(stderr, "[madeira-env] sync engine: fastsync (default), MADEIRA_FASTSYNC=auto\n");
+                }
+                {   /* madeira-bcd: for the wineserver (g_madeira_srv_fgetpath) */
+                    const char *fp = getenv("MADEIRA_SRV_FGETPATH");
+                    g_madeira_srv_fgetpath = (fp && fp[0] == '1') ? 1 : 0;
+                    if (g_madeira_srv_fgetpath)
+                        fprintf(stderr, "[madeira-env] MADEIRA_SRV_FGETPATH=1: the server names the files it opens with F_GETPATH\n");
                 }
             }
         }
@@ -2044,14 +2076,17 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
         unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
+        /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
+         * of this app run (GTA V Enhanced runs without them). */
+        unsetenv("MADEIRA_SRV_FGETPATH");
+        g_madeira_srv_fgetpath = 0;
         unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
         unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
         /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
          * of this app run (GTA V Enhanced runs without them). */
-        unsetenv("MADEIRA_UCRT_X64_MATH"); unsetenv("MADEIRA_SRV_FGETPATH");
+        unsetenv("MADEIRA_UCRT_X64_MATH");
         unsetenv("MADEIRA_NTDLL_SYNC");   /* madeira-bcd: a game's switch is its own */
-        g_madeira_srv_fgetpath = 0;
-        /* madeira-bcd: the server's per-launch switches end with the session as well */
+        /* madeira-bcd: the server's per-launch switches end with the session */
         unsetenv("MADEIRA_SRV_ECO_FOLLOW"); unsetenv("MADEIRA_SRV_DIRECT");
         unsetenv("MADEIRA_SRV_IDLE_US"); unsetenv("MADEIRA_SRV_LOG_ALL");
         g_madeira_srv_eco_follow = 0; g_madeira_srv_direct = 0;

@@ -96,16 +96,21 @@ server = SERVER.read_text(encoding="utf-8")
 virt = VIRT.read_text(encoding="utf-8")
 
 # ---- arming site -----------------------------------------------------------
-arm_at = server.find('const char *probes_env = getenv("MADEIRA_PROBES");')
+arm_at = server.find("if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))")
 arm = server[arm_at:server.find("ios_wprof_main(); });", arm_at) + 40]
 check(arm_at > 0 and 'const char *lean_env = getenv("MADEIRA_LEAN_DIAG");' in arm,
       "MADEIRA_LEAN_DIAG is read where the samplers are armed (once a process)")
 check('ios_lean_diag = lean_env && *lean_env && strcmp(lean_env, "0") != 0;' in arm,
       "unset, empty or 0 leaves it off")
-check("if (probes >= 2 && !ios_lean_diag) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });" in arm,
+# (a build may also gate each sampler on a probes level of its own: "if (probes >= N ...")
+check(re.search(r"if \((?:probes >= 2 && )?!ios_lean_diag\) dispatch_async\(dispatch_get_global_queue\(QOS_CLASS_UTILITY, 0\), "
+                r"\^\{ ios_wprof_main\(\); \}\);", arm),
       "[wprof] is not started with the switch")
-check("if (probes >= 2) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });" in arm
-      and "if (probes >= 1) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });" in arm,
+check(re.search(r"(?:if \(probes >= 2\) )?dispatch_async\(dispatch_get_global_queue\(QOS_CLASS_UTILITY, 0\), "
+                r"\^\{ ios_thread_sampler_main\(\); \}\);", arm)
+      and re.search(r"(?:if \(probes >= 1\) )?dispatch_async\(dispatch_get_global_queue\(QOS_CLASS_UTILITY, 0\), "
+                    r"\^\{ ios_xprobe_main\(\); \}\);", arm)
+      and "ios_lean_diag" not in arm[arm.find("ios_thread_sampler_main(); });") - 120:arm.find("ios_xprobe_main(); });")],
       "the thread sampler (for [sync-census]) and the [xp] sampler start as before")
 check(server.find("static int ios_lean_diag;") < server.find("static void ios_thread_sampler_main(void)"),
       "ios_lean_diag is declared before the sampler")
@@ -140,7 +145,11 @@ volatile long long ios_alert_lat_n, ios_alert_lat_ticks, ios_alert_lat_hist[6], 
 static void ios_ts_calibrate( void ) {}
 static void ios_thread_sampler_pass( int b ) { (void)b; passes++; }
 static void ios_guest_rip_profile( int gen ) { (void)gen; profiles++; }
-static int h_usleep( unsigned us ) { (void)us; return 0; }
+/* ml1288 (spitefulowl's low-ram-fixes): the 20 s wait is 200 waits of 100 ms with the
+ * stuck-store check between them; every 200th one ends a wait as sleep(20) did. */
+static int ticks;
+static void ios_stuck_store_check( void ) {}
+static int h_usleep( unsigned us ) { if (us == 100000 && ++ticks % 200 == 0) { if (++sleeps > 5) longjmp( done, 1 ); ios_alert_wakes += 100; } return 0; }
 static unsigned h_sleep( unsigned s ) { if (s != 20) abort(); if (++sleeps > 5) longjmp( done, 1 ); ios_alert_wakes += 100; return 0; }
 static void wine_log_write( const char *fmt, ... ) __attribute__((format(printf, 1, 2)));
 static void wine_log_write( const char *fmt, ... )
@@ -149,7 +158,7 @@ static void wine_log_write( const char *fmt, ... )
     if (!strncmp( b, "[sync-census] ml1115", 20 )) census1115++;
     if (!strncmp( b, "[sync-census] ml1122", 20 )) census1122++;
     if (!strcmp( b, "[thread-sample] ml876 burst done" )) bursts++;
-    if (!strcmp( b, "[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)" )) armed_full++;
+    if (!strncmp( b, "[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s", 77 )) armed_full++;
     if (strstr( b, "armed for [sync-census] only" )) armed_lean++;
 }
 #define sleep(x) h_sleep(x)
@@ -241,8 +250,10 @@ check("if (!ios_in_mach_exc && ios_lean_mprotect_log())   /* ml374: see ios_in_m
 gen = GEN.read_text(encoding="utf-8")
 cat = CAT.read_text(encoding="utf-8")
 check('"env.MADEIRA_LEAN_DIAG"' in gen and "env.MADEIRA_LEAN_DIAG" in cat, "the catalog documents env.MADEIRA_LEAN_DIAG")
-ci = CI.read_text(encoding="utf-8")
-check("- name: Check lean-diag" in ci and "python3 tests/host/check-lean-diag.py" in ci, "CI runs this check")
+# The CI step exists only in the fork's workflow; upstream has no .github.
+if CI.exists():
+    ci = CI.read_text(encoding="utf-8")
+    check("- name: Check lean-diag" in ci and "python3 tests/host/check-lean-diag.py" in ci, "CI runs this check")
 
 if failures:
     print("FAILED: %d" % len(failures))

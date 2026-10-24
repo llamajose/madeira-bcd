@@ -199,9 +199,11 @@ enum DockStartStatus {
     /// installs first; `installerProgress`: their progress in words;
     /// `installsFinished`: they ended, and the host starts next. `waited`: seconds
     /// since the host could start (the start began, or the installs finished); it
-    /// only matters before the host's first field.
+    /// only matters before the host's first field. madeira-bcd: `restartHint`, for a session
+    /// that runs only the installs (DockInstallers.installsOnly): no host follows them; the
+    /// hint (the session closes, then Madeira asks for a restart) does.
     static func text(_ fields: [String: String], installers: Bool, installerProgress: String?,
-                     installsFinished: Bool, waited: Double) -> String {
+                     installsFinished: Bool, waited: Double, restartHint: String? = nil) -> String {
         if fields["launch-option-missing"] != nil || fields["launch-option-invalid"] != nil {
             return "Steam rejected this game's launch option."
         }
@@ -238,6 +240,7 @@ enum DockStartStatus {
         let starting = waited >= slowAfter ? "Still starting Madeira Dock…" : "Starting Madeira Dock…"
         guard installers else { return starting }
         guard installsFinished else { return installerProgress ?? "Running this game's one-time installs…" }
+        if let restartHint { return (installerProgress ?? "One-time installs finished.") + "\n" + restartHint }
         return (installerProgress ?? "One-time installs finished.") + "\n" + starting
     }
 
@@ -288,6 +291,7 @@ final class DockStartScreen: ObservableObject {
     /// A library session begins; `game` is set for a Dock start.
     func begin(_ game: DockGame?, at start: Date) {
         endHold(reason: nil)
+        winios_window_census_enable(0)
         active = game != nil; appID = game?.id; failure = nil
         exitObserved = false; hostStarted = false; early = []; started = start
         guard let game, MadeiraConfig.flag("MADEIRA_DOCK_HIDE_DESKTOP") else { return }   // 0: a Dock start's starting screen ends on the desktop's first frame, as before
@@ -300,6 +304,7 @@ final class DockStartScreen: ObservableObject {
     /// The session ended.
     func finish() {
         endHold(reason: "session-ended")
+        winios_window_census_enable(0)
         active = false; appID = nil; failure = nil
     }
 
@@ -377,7 +382,9 @@ final class DockStartScreen: ObservableObject {
         }
         hold = nil
         holding = false; attention = false
-        winios_window_census_enable(0)
+        // 2: the game's window is found, but its main window may still be shown for the first time
+        // minimized; Winios.m goes on restoring such windows until finish() ends the session.
+        winios_window_census_enable(reason == "game-window" ? 2 : 0)
     }
 
     /// Winios.m's census as SteamLaunchScene reads it.

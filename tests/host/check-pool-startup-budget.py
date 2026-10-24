@@ -30,7 +30,8 @@ def function(source, signature, closing='\n}'):
 ec = native[native.index('size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;'):]
 ec = ec[:ec.index('size_t reserve_offset, tail_added, tail_skipped = 0;')]
 assert 'int low_ok = ios_jit_low_size_global && !ios_wow_base();' in ec
-assert ec.count('goto retry_code_carve_reuse;') == 1
+assert ec.count('goto retry_code_carve_reuse;') == 2
+assert ec.count('ios_tail_carve_ready( &ios_tail_carves[') == 2, 'cap lift and reuse share one readiness rule'
 assert 'if (kept_large_carve && !reuse_all_carves)' in ec
 assert 'reuse_all_carves = 1;\n                low_fits = 0;' in ec
 assert ec.count('(low_ok || !ios_tail_carve_in_low( ios_tail_carves[') == 2
@@ -41,7 +42,10 @@ helpers = ''.join(function(native, signature) for signature in (
     'static int ios_pool_low_take(',
     'static int ios_tail_carve_in_low(',
     'static int ios_pool_preserve_code_carve(',
+    'static int ios_tail_carve_ready(',
 ))
+carve_start = native.index('#define IOS_TAIL_CARVE_MAX ')
+carve_table = native[carve_start:native.index('\n\n', carve_start)]
 
 c_fixture = r'''
 #include <stdint.h>
@@ -49,13 +53,14 @@ c_fixture = r'''
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 #define MB ((size_t)1 << 20)
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "failed line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 #define STATUS_SUCCESS 0
 #define STATUS_NO_MEMORY -1
 #define FALLBACK_TAIL 2
 #define IOS_POOL_LOW_CARVE_MAX 0x8000000u
-#define IOS_TAIL_CARVE_MAX 256
+#define IOS_POOL_REUSE_GRACE_SEC 3
 static void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
 static uintptr_t ios_jit_low_rx_global, ios_jit_low_rw_global;
 static size_t ios_jit_low_size_global, ios_jit_pool_size_global;
@@ -66,8 +71,11 @@ static size_t ios_jit_hole2_off, ios_jit_hole2_end;
 static int ios_jit_low_full_logged, wow, lose_race;
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct { size_t off, size; int free; time_t freed_at; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+''' + carve_table + r'''
 static uintptr_t ios_wow_base(void) { return wow; }
+static void *ios_jit_current_peb(void) { return (void *)(uintptr_t)1; }
+static int ios_tail_carve_scan(const void *base, size_t size, int strict)
+{ (void)base; (void)size; (void)strict; return 0; }
 ''' + helpers + r'''
 static int racing_low_take(volatile size_t *used, size_t total, size_t want, size_t *off)
 {
@@ -100,6 +108,9 @@ static void reset(void *memory)
     ios_tail_carves[0].off = (size_t)(ios_jit_low_rx_global + 2 * MB - (uintptr_t)ios_jit_rx_base_global);
     ios_tail_carves[0].size = 16 * MB;
     ios_tail_carves[0].free = 1;
+    ios_tail_carves[0].freed_at = 0;
+    ios_tail_carves[0].peb = NULL;
+    ios_tail_carves[0].retired = 0;
 }
 int main(void)
 {

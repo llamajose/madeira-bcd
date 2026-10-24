@@ -154,6 +154,8 @@ gen = (root / 'build/tools/gen-config-catalog.py').read_text()
 assert '"env.MADEIRA_X64_IMAGE_NOCOPY"' in gen, 'catalog overlay'
 swift = (root / 'app/Madeira/ConfigCatalog.generated.swift').read_text()
 assert 'env.MADEIRA_X64_IMAGE_NOCOPY' in swift, 'generated catalog carries the key'
-yml = (root / '.github/workflows/build-ipa.yml').read_text()
-assert 'tests/host/check-x64-image-nocopy.py' in yml, 'CI gate'
+# The CI step exists only in the fork's workflow; upstream has no .github.
+if (root / '.github/workflows/build-ipa.yml').exists():
+    yml = (root / '.github/workflows/build-ipa.yml').read_text()
+    assert 'tests/host/check-x64-image-nocopy.py' in yml, 'CI gate'
 print('PASS: [x64-image] pure-x64 images run from their PE view without a pool copy, behind MADEIRA_X64_IMAGE_NOCOPY')

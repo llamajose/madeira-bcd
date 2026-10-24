@@ -124,7 +124,14 @@ jobs:
       # madeira-bcd: the games' built-in recommended settings and where the app
       # applies them (GameRecommendations.swift; owner's decision 2026-10-09).
       - name: Check built-in recommended game settings
-        run: python3 tests/host/check-game-recommendations.py --require-swift
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tests/host/check-game-recommendations.py --require-swift 2>&1 | tee check-recommended.log
+          rc=$?
+          # Annotations reach the API without the log download.
+          [ "$rc" -eq 0 ] || grep -E "error:|FAILED|Error|assert" check-recommended.log | head -10 | cut -c1-900 | sed 's/^/::error::/'
+          exit "$rc"
 
       # --- UNVERIFIED: exact configure invocation for the wine fork's
       # iOS/arm64 cross target isn't documented anywhere in the repo.
@@ -1950,6 +1957,10 @@ jobs:
             echo "===== failing build commands ====="
             sed -n '/The following build commands failed/,/failures)/p' \
               "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -15
+            # The same as annotations, readable through the API without the log download.
+            { grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | sed "s|$GITHUB_WORKSPACE/||" | sort -u | head -40
+              grep -E "Undefined symbol|^ld: |duplicate symbol" "$GITHUB_WORKSPACE/archive.log" | head -10; } \
+              | cut -c1-900 | sed 's/^/::error::/'
           fi
           exit "$rc"
 

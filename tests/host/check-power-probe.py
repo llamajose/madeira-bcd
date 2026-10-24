@@ -77,7 +77,7 @@ end = server.find("static void ios_xprobe_main( void )")
 probe = server[start:end]
 check(start > 0 and end > start and "static void ios_power_probe_tick(" in probe, "the probe block is found before the xprobe")
 
-arm_at = server.find('const char *probes_env = getenv("MADEIRA_PROBES");')
+arm_at = server.find("if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))")
 arm = server[arm_at:arm_at + 1500]
 check('const char *probe_env = getenv("MADEIRA_POWER_PROBE");' in arm
       and 'ios_power_probe_on = probe_env && *probe_env && strcmp(probe_env, "0") != 0;' in arm,
@@ -256,8 +256,10 @@ check("if (pp && pp->pri == -2)" in xp_hook and "THREAD_EXTENDED_INFO" in xp_hoo
 gen = GEN.read_text(encoding="utf-8")
 cat = CAT.read_text(encoding="utf-8")
 check('"env.MADEIRA_POWER_PROBE"' in gen and "env.MADEIRA_POWER_PROBE" in cat, "the catalog documents env.MADEIRA_POWER_PROBE")
-ci = CI.read_text(encoding="utf-8")
-check("- name: Check power-probe" in ci and "python3 tests/host/check-power-probe.py" in ci, "CI runs this check")
+# The CI step exists only in the fork's workflow; upstream has no .github.
+if CI.exists():
+    ci = CI.read_text(encoding="utf-8")
+    check("- name: Check power-probe" in ci and "python3 tests/host/check-power-probe.py" in ci, "CI runs this check")
 
 if failures:
     print("FAILED: %d" % len(failures))

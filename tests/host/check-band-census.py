@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The opt-in census of the 64 GB band (virtual_ios.c ios_band_census); no Wine runs.
 
-RDR2.exe reserves 8960 MB in one block as it starts; in its first licensed run
+RDR2.exe reserves 8960 MB in one block as it starts; in its first run
 (build 457, log 2026-10-08 21:20:59) the band [0x7000000000, 0x8000000000) had
 no gap that large. env MADEIRA_BAND_CENSUS=1 logs what each piece of Social
 Club's layout 2 uses. Compiles the census code against a fake mach_vm_region

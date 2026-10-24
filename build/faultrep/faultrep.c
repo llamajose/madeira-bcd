@@ -8,7 +8,7 @@
  * without doing anything, which is what Wine's own faultrep does for the three
  * functions it implements. The export list is Wine's plus WerReportHang.
  *
- * Built by tools/build-faultrep-dll.sh.
+ * Built by build/faultrep/build.sh.
  */
 #include <windows.h>
 

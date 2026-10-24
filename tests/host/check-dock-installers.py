@@ -74,7 +74,7 @@ require('Copyright 2026 125hz' in installers.split('\n', 3)[1], 'new file carrie
 # Record as done / Reset: saved from the app, applied by prepare() before it reads the registry.
 prep = installers[installers.index('    static func prepare('):]
 prep = prep[:prep.index('\n    }\n')]
-require(prep.index('absorbResults(') < prep.index('applyRequest(game, found: found, prefix: prefix)') < prep.index('let registry = '),
+require(prep.index('absorbResults(') < prep.index('applyRequest(game, found: found, prefix: prefix, drive: drive, others: others)') < prep.index('let registry = '),
         'a saved request is applied after the last results and before the plan reads the registry')
 require('var unfinished: [String: [String]]? = nil' in installers and 'var requests: [String: String]? = nil' in installers,
         'new ledger fields are optional (older files still load) and requests are stored by raw value')
@@ -100,6 +100,7 @@ enum SteamSignIn {
 enum MadeiraConfig {
     nonisolated(unsafe) static var values: [String: String] = [:]
     static func get(_ key: String) -> String? { values[key] }
+    static var gameURL: URL? { nil }
 }
 struct LogEntry { enum Level { case info, success, error, debug } }
 @MainActor final class LogStore {
@@ -306,6 +307,7 @@ func pe(_ url: URL, machine: UInt16) throws {
 
         // ---- prepare(): a first start on a bundle without 32-bit support or msiexec
         MadeiraConfig.values["inproc-sync"] = "1"   // madsync chosen: the per-session request applies
+        setenv("MADEIRA_DOCK_INSTALL_SEPARATE", "0", 1)   // the same session; the installs-only default is checked below
         try? FileManager.default.removeItem(at: prefix.appendingPathComponent(DockInstallLedger.fileName))
         try write(prefix.appendingPathComponent("system.reg"), "WINE REGISTRY Version 2\n\n[Software\\\\Wow6432Node\\\\Fixture Shared] 1700000000\n\"Shared Runtime\"=dword:00000001\n")
         try write(prefix.appendingPathComponent("user.reg"), "WINE REGISTRY Version 2\n")
@@ -335,6 +337,7 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(ended != nil && DockInstallers.finishedAt == ended &&
                 LogStore.shared.lines.filter({ $0.contains("[dock-installers] end succeeded=1 failed=0 of=1; the host starts next") }).count == 1,
                 "the end is logged once and its time kept (the starting screen times the host from it)")
+        unsetenv("MADEIRA_DOCK_INSTALL_SEPARATE")
         // The words count what succeeded and name what failed (the text reads only the result file).
         try write(drive.appendingPathComponent("madeira-dock-installers.result"),
                   "begin 3 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nstart 2 b \r\nexit 2 5 \r\nstart 3 c \r\nexit 3 -1073741819 \r\nend \r\n")
@@ -395,6 +398,9 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(!DockInstallers.serverSync && ((try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? "").contains("--start-services")
                 && !(DockInstallers.note ?? "").contains("standard synchronization"),
                 "no inproc-sync (fastsync, the default engine): the service step runs, no madsync note")
+        require((DockInstallers.note ?? "").contains("This start runs only them; afterwards restart Madeira and start the game again.")
+                && logged("this session runs only the one-time installs"),
+                "MADEIRA_DOCK_INSTALL_SEPARATE (on by default): a start that runs installers runs only them")
         unsetenv("MADEIRA_DOCK_INSTALL_SERVER_SYNC")
         setenv("MADEIRA_DOCK_INSTALL_SCM", "0", 1)
         DockInstallers.setRunsNext(7000, true, prefix: prefix)
@@ -467,14 +473,40 @@ func pe(_ url: URL, machine: UInt16) throws {
                 "Record as done: recorded in both views before the plan, nothing runs")
         ledger = DockInstallLedger.load(prefix: prefix)
         require(ledger.request(7002) == nil && ledger.unfinishedRuns(7002).isEmpty, "the request and the unfinished entry are cleared")
+        // madeira-bcd: other games of the prefix. Twin's own installer records under Solo's key,
+        // Triplet runs its own copy of Solo's setup.exe, Other shares neither (shareReset).
+        func extra(_ id: Int, _ name: String, _ script: String, _ file: String) throws -> (DockGame, [SteamInstallRun]) {
+            let game = DockGame(id: id, name: name, installDir: name, library: "Program Files (x86)/Steam/steamapps", installed: true, customExecutables: false)
+            try write(common.appendingPathComponent(name + "/installscript.vdf"), script)
+            try pe(common.appendingPathComponent(name + "/" + file), machine: 0x8664)
+            let runs = DockInstallers.own(DockInstallers.found(game, drive: drive, defaultKey: true).processes, game: game)
+            _ = try SteamInstallScripts.mark(runs, prefix: prefix)
+            return (game, runs)
+        }
+        let (twin, twinRuns) = try extra(7003, "Twin", "\"installscript\" { \"run process\" { \"Helper\" { \"HasRunKey\" \"HKEY_LOCAL_MACHINE\\\\Software\\\\Solo\" \"process 1\" \"%INSTALLDIR%\\\\helper.exe\" } } }", "helper.exe")
+        let (triplet, tripletRuns) = try extra(7004, "Triplet", "\"installscript\" { \"run process\" { \"Copy\" { \"HasRunKey\" \"HKEY_LOCAL_MACHINE\\\\Software\\\\Triplet\" \"process 1\" \"%INSTALLDIR%\\\\Setup.exe\" } } }", "Setup.exe")
+        let (other, otherRuns) = try extra(7005, "Other", "\"installscript\" { \"run process\" { \"Own\" { \"HasRunKey\" \"HKEY_LOCAL_MACHINE\\\\Software\\\\Other\" \"process 1\" \"%INSTALLDIR%\\\\own.exe\" } } }", "own.exe")
+        DockInstallers.setRunsNext(7003, false, prefix: prefix); DockInstallers.setRunsNext(7004, false, prefix: prefix); DockInstallers.setRunsNext(7005, false, prefix: prefix)
+        require(twinRuns.count == 1 && tripletRuns.count == 1 && otherRuns.count == 1, "the other games each have one own program")
         // Reset: the records go, the choice turns to Run, and the installer runs at that start.
+        // madeira-bcd: what the installers put in moves into a backup first (DockReset.swift;
+        // this prefix has none of it, so nothing moves).
         DockInstallers.setRequest(7002, .reset, prefix: prefix)
-        DockInstallers.prepare(solo, drive: drive, prefix: prefix, has32Bit: true, hasMsiexec: true, fusionSource: nil)
+        DockInstallers.prepare(solo, drive: drive, prefix: prefix, others: [solo, twin, triplet, other], has32Bit: true, hasMsiexec: true, fusionSource: nil)
         soloSystem = (try? String(contentsOf: prefix.appendingPathComponent("system.reg"), encoding: .utf8)) ?? ""
         let rerun = (try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? ""
-        require(logged("[dock-reset] app=7002 reset: records removed, choice=run; installed files left in place programs=setup values=2 shared-kept=1") &&
+        require(logged("[dock-reset] app=7002 reset: installed components moved to the backup, records removed, choice=run programs=setup values=2 shared-kept=1") &&
                 DockInstallScripts.recorded(setupRun, in: soloSystem) == nil && DockInstallScripts.marked(sharedRun, in: soloSystem),
                 "Reset removes only the game's own records; the shared redistributable stays recorded")
+        require(logged("[dock-reset] app=7002 clean sign-out=0 moved=0 entries=0 keys=0 values=0 template-keys=0 backup=Documents/madeira-reset-backup/") &&
+                FileManager.default.fileExists(atPath: base.appendingPathComponent("madeira-reset-backup").path),
+                "Reset backs up the registry next to the prefix and moves nothing the installers did not put in")
+        let shareLedger = DockInstallLedger.load(prefix: prefix)
+        require(logged("[dock-reset] app=7002 also app=7003 programs=helper values=2: records removed, choice=run") &&
+                logged("[dock-reset] app=7002 also app=7004 programs=copy values=2: records removed, choice=run") && !logged("also app=7005") &&
+                DockInstallScripts.recorded(twinRuns[0], in: soloSystem) == nil && DockInstallScripts.recorded(tripletRuns[0], in: soloSystem) == nil &&
+                DockInstallScripts.marked(otherRuns[0], in: soloSystem) && shareLedger.runsNext(7003) && shareLedger.runsNext(7004) && !shareLedger.runsNext(7005),
+                "the reset's installs go back to Run for games under the same key or with the same installer, not for others")
         require(DockInstallers.script != nil && rerun.contains("echo start 1 setup") && !DockInstallLedger.load(prefix: prefix).runsNext(7002) &&
                 DockInstallLedger.load(prefix: prefix).requests == nil, "after Reset the installer runs at that start, then the choice is Skip again")
 
@@ -513,7 +545,8 @@ with tempfile.TemporaryDirectory(prefix='madeira-dock-installers-') as tmp:
         build = None
     else:
         build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),
-                                str(tmp / 'stubs.swift'), str(tmp / 'checks.swift'), str(app / 'DockInstallers.swift')])
+                                str(tmp / 'stubs.swift'), str(tmp / 'checks.swift'), str(app / 'DockInstallers.swift'),
+                                str(app / 'DockReset.swift')])
         require(build.returncode == 0, 'production installer Swift compiles on the host')
     if build is not None and build.returncode == 0:
         run = subprocess.run([str(exe), str(tmp / 'fixture.cmd')], env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))

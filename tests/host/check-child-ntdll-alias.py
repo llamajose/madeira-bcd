@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-alias-retire-') as d:
 
 # The callback drop runs before the pool is reclaimed.
 reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )')
-drop = re.search(r'    ios_alias_cb_drop\( peb \);\n'
+drop = re.search(r'    ios_alias_cb_drop\( peb \);[^\n]*\n'
                  r'    if \(peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb\)\n    \{\n.*?\n    \}\n',
                  reclaim, re.S)
 assert drop and drop.start() < reclaim.index('pthread_mutex_lock( &ios_pool_lock )'), \

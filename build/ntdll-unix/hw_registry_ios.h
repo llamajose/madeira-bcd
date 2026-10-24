@@ -169,8 +169,8 @@ static inline uint64_t hwreg_fex_tsc_hz( uint64_t cntfrq )
     return hz;
 }
 
-/* `avx`: FEX runs with SupportsAVX (MADEIRA_FEX_AVX=1 with the ARM64EC module,
- * tools/patch-fex-ios-avx.py), which turns on CPUID's OSXSAVE/AVX (leaf 1) and
+/* `avx`: FEX runs with SupportsAVX (MADEIRA_FEX_AVX=1, read by FetchHostFeatures
+ * for the ARM64EC module only), which turns on CPUID's OSXSAVE/AVX (leaf 1) and
  * AVX2 (leaf 7) and with them FEX's XSAVE/AVX/AVX2 feature bits. SSE4.2 follows
  * SupportsCRC, which the iOS branch of FetchHostFeatures always sets for the
  * ARM64EC module. */

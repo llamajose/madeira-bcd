@@ -131,8 +131,10 @@ check("ios_eco_apply_self();" in start and "ios_eco_native_self" not in start, "
 gen = GEN.read_text(encoding="utf-8")
 cat = CAT.read_text(encoding="utf-8")
 check('"env.MADEIRA_ECO_NATIVE"' in gen and "env.MADEIRA_ECO_NATIVE" in cat, "the catalog documents env.MADEIRA_ECO_NATIVE")
-ci = CI.read_text(encoding="utf-8")
-check("- name: Check eco-native" in ci and "python3 tests/host/check-eco-native.py" in ci, "CI runs this check")
+# The CI step exists only in the fork's workflow; upstream has no .github.
+if CI.exists():
+    ci = CI.read_text(encoding="utf-8")
+    check("- name: Check eco-native" in ci and "python3 tests/host/check-eco-native.py" in ci, "CI runs this check")
 
 if failures:
     print("FAILED: %d" % len(failures))

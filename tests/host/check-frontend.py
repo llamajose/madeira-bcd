@@ -501,7 +501,7 @@ wrapper = block(server, 'void process_exit_wrapper( int status )')
 initial = wrapper[wrapper.index('    else\n    {'):]
 check('wine_launched_process_did_exit( status );' in initial and wrapper.count('wine_launched_process_did_exit( status );') == 1,
       'ntdll reports only the initial (app-launched) process exit, from the no-slot branch')
-check('__attribute__((weak))' in initial and 'ImagePathName' not in server and 'wine_process_did_' not in server,
+check('__attribute__((weak))' in initial and 'ImagePathName' not in wrapper and 'wine_process_did_' not in server,
       'the hook is weak and gets no image name')
 check('madeira_exit_is_helper' not in bridge and '.exe"' not in bridge[bridge.index('static uint64_t g_launch_exit'):bridge.index('static char *g_prefix_path')],
       'no program-name list in the exit report')
@@ -607,11 +607,13 @@ check('TouchControlsModel.diameter(control)' in content and 'library.opacity' in
       "touch controls follow the session's size and opacity")
 
 # Owner requests: the starting screen's glyph row, Settings credits last, no drive_c note.
-launch = block(hud, 'private func launchView(')
+launch = block(hud, 'private func launchColumnView(')
+wide = block(hud, 'private func launchWideView(')
 glyph = block(hud, 'private func launchGlyph(')
 row = block(launch, 'HStack(spacing: 14)')
 check('launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs)' in row
-      and 'Button(showLogs ?' not in launch,
+      and 'launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs)' in wide
+      and 'Button(showLogs ?' not in launch and 'Button(showLogs ?' not in wide,
       'starting screen: the live-log control is a glyph in one row')
 check('Image(systemName: symbol)' in glyph and '.accessibilityLabel(label)' in glyph and 'Text(' not in glyph
       and 'Circle()' in glyph, 'starting screen: glyph buttons show no text and keep their words as VoiceOver labels')

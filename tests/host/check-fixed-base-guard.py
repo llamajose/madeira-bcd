@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A version query cannot use up the fixed-base window; no Wine runs.
 
-In every licensed GTA V Enhanced session (builds 449-456) the Rockstar Games
+In every GTA V Enhanced session (builds 449-456) the Rockstar Games
 Launcher's resource-only view of Social-Club-Setup.exe (0x7a7d000 at its
 ImageBase 0x140000000) took the reserved executable window; SocialClubHelper.exe
 then landed at 0x141c00000 and later maps at 0x140000000 were REFUSED c0000018.
@@ -56,6 +56,9 @@ static void ios_va_release_note(void) { release_notes++; }
 static char out[1 << 16]; static size_t outn;
 static int fake_dprintf(int fd, const char *f, ...)
 { va_list ap; int w; (void)fd; va_start(ap, f); w = vsnprintf(out + outn, sizeof out - outn, f, ap); va_end(ap); if (w > 0) outn += w; return w; }
+/* 125hz's exe-window-relaunch rounds the claimed size to host pages */
+static const size_t host_page_mask = 0x3fff;
+#define ROUND_SIZE(addr,size,mask) (((size) + ((uintptr_t)(addr) & (mask)) + (mask)) & ~(mask))
 #define dprintf fake_dprintf
 ''' + chunk + r'''
 #undef dprintf
