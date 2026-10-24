@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A version query cannot use up the fixed-base window; no Wine runs.
 
-In every licensed GTA V Enhanced session (builds 449-456) the Rockstar Games
+In every GTA V Enhanced session (builds 449-456) the Rockstar Games
 Launcher's resource-only view of Social-Club-Setup.exe (0x7a7d000 at its
 ImageBase 0x140000000) took the reserved executable window; SocialClubHelper.exe
 then landed at 0x141c00000 and later maps at 0x140000000 were REFUSED c0000018.

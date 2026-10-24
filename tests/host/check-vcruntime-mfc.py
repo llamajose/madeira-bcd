@@ -29,19 +29,24 @@ def check(what, cond):
     ok &= bool(cond)
 
 
-wf = (root / ".github/workflows/build-ipa.yml").read_text()
-step = wf[wf.index("- name: Fetch the VC++ runtime DLLs from Microsoft"):]
-step = step[:step.index("\n      - name:", 10)]
-want = re.search(r'WANT="([^"]+)"', step)
-names = want.group(1).split() if want else []
-check("the workflow wants the 12 runtime DLLs and MFC's two",
-      len(names) == 14 and names[-2:] == ["mfc140.dll", "mfc140u.dll"] and "vcruntime140.dll" in names)
-check("counts follow the list", "NWANT=$(echo $WANT | wc -w | tr -d ' ')" in step
-      and '[ "$FOUND" -eq "$NWANT" ] && break' in step and "recovered $FOUND of $NWANT" in step
-      and "of 12" not in step)
-report = wf[wf.index("- name: Report vcruntime contents"):]
-report = report[:report.index("\n      - name:", 10)]
-check("the report expects 14", 'of 14' in report and '-lt 14' in report)
+# The fetch step exists only in the fork's workflow; upstream has no .github
+# (the DLLs are fetched by hand there, tools/fetch-vcruntime.md).
+wf_file = root / ".github/workflows/build-ipa.yml"
+step = None
+if wf_file.exists():
+    wf = wf_file.read_text()
+    step = wf[wf.index("- name: Fetch the VC++ runtime DLLs from Microsoft"):]
+    step = step[:step.index("\n      - name:", 10)]
+    want = re.search(r'WANT="([^"]+)"', step)
+    names = want.group(1).split() if want else []
+    check("the workflow wants the 12 runtime DLLs and MFC's two",
+          len(names) == 14 and names[-2:] == ["mfc140.dll", "mfc140u.dll"] and "vcruntime140.dll" in names)
+    check("counts follow the list", "NWANT=$(echo $WANT | wc -w | tr -d ' ')" in step
+          and '[ "$FOUND" -eq "$NWANT" ] && break' in step and "recovered $FOUND of $NWANT" in step
+          and "of 12" not in step)
+    report = wf[wf.index("- name: Report vcruntime contents"):]
+    report = report[:report.index("\n      - name:", 10)]
+    check("the report expects 14", 'of 14' in report and '-lt 14' in report)
 
 # The search: find -iname "$base.dll*" -o -iname "F_CENTRAL_${base}_*", case-insensitive.
 payload = ["mfc140.dll_amd64", "mfc140.dll_arm64", "mfc140u.dll_amd64", "mfc140enu.dll_amd64",
@@ -56,7 +61,8 @@ def found(base):
 
 check("mfc140 finds only mfc140's payloads", found("mfc140") == ["MFC140.DLL_AMD64", "mfc140.dll_amd64", "mfc140.dll_arm64"])
 check("mfc140u finds only mfc140u's payloads", found("mfc140u") == ["F_CENTRAL_mfc140u_x64", "mfc140u.dll_amd64"])
-check("the arm64 build is then refused by the PE machine check", "== 0x8664" in step and "is_x64" in step)
+if step is not None:
+    check("the arm64 build is then refused by the PE machine check", "== 0x8664" in step and "is_x64" in step)
 
 m = (root / "app/Madeira/WineProcessBridge.m").read_text()
 blk = m[m.index('const char *mfcEnv = getenv("MADEIRA_MFC");'):]

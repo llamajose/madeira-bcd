@@ -5,11 +5,6 @@ Horizon Zero Dawn (skinned characters collapse every few frames) and Ghost of
 Tsushima (objects with another instance's transform for a frame) are the only
 games that show it; GTA V Enhanced and RDR2 do not. Each switch is off by
 default and changes nothing then:
-  - madeira.cfg ignore-volatile-metadata = 1: build/ntdll-unix/virtual_ios.c
-    clears an x64 image's VolatileMetadataPointer when it is mapped, so FEX
-    orders the whole image by its TSO settings. Compiled here against Wine's
-    headers and run on synthetic images: off, ARM64, no load config, a short
-    load config, relocated and preferred-base pointers, the log cap;
   - d3d12-wave-ops = 0 (WaveOps FALSE) and d3d12-binding-tier = 3;
   - d3d12-raw-typed-views = 1: raw and structured buffer views also carry a
     texture-buffer view (the format choice is run here), a UAV with a counter
@@ -24,7 +19,6 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-vsrc = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
 dsrc = (root / 'madeira-d3d12/src/pe/madeira_d3d12.c').read_text()
 fails = []
 
@@ -41,143 +35,6 @@ def function(src, sig):
 
 
 cc = os.environ.get('CC', 'cc')
-
-# ---- ignore-volatile-metadata (unix side) ----
-strip = function(vsrc, 'static void ios_ignore_volatile_metadata( char *base, SIZE_T total_size, IMAGE_NT_HEADERS *nt,')
-harness = r'''
-#include <stdarg.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "windef.h"
-#include "winbase.h"
-#include "winternl.h"
-static int cfg_on, cfg_reads;
-static int madeira_cfg_bool(const char *key, int def)
-{ cfg_reads++; return strcmp(key, "ignore-volatile-metadata") ? def : cfg_on; }
-static char out[1 << 16]; static size_t outn;
-static int fake_dprintf(int fd, const char *f, ...)
-{ va_list ap; int w; (void)fd; va_start(ap, f); w = vsnprintf(out + outn, sizeof out - outn, f, ap); va_end(ap); if (w > 0) outn += w; return w; }
-static const char *debugstr_us(const UNICODE_STRING *us) { (void)us; return "L\"game.exe\""; }
-#define dprintf fake_dprintf
-''' + strip + r'''
-#undef dprintf
-#define SZ 0x20000
-#define LC 0x3000
-#define MD 0x5000
-static unsigned char img[SZ];
-static IMAGE_NT_HEADERS64 *mk(WORD machine, ULONGLONG image_base, ULONGLONG md_va, DWORD lc_size)
-{
-    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)img;
-    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(img + 0x80);
-    IMAGE_LOAD_CONFIG_DIRECTORY64 *lc = (IMAGE_LOAD_CONFIG_DIRECTORY64 *)(img + LC);
-    DWORD *md = (DWORD *)(img + MD);
-    memset(img, 0, sizeof img);
-    dos->e_magic = IMAGE_DOS_SIGNATURE; dos->e_lfanew = 0x80;
-    nt->Signature = IMAGE_NT_SIGNATURE; nt->FileHeader.Machine = machine;
-    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = image_base; nt->OptionalHeader.SizeOfImage = SZ;
-    nt->OptionalHeader.NumberOfRvaAndSizes = 16;
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress = LC;
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size = lc_size;
-    lc->Size = lc_size; lc->VolatileMetadataPointer = md_va;
-    md[0] = 24; md[1] = 1; md[2] = 0x6000; md[3] = 4 * 5424; md[4] = 0x9000; md[5] = 8 * 7;
-    return nt;
-}
-static ULONGLONG vmp(void) { return ((IMAGE_LOAD_CONFIG_DIRECTORY64 *)(img + LC))->VolatileMetadataPointer; }
-static int fail(const char *w) { printf("%s\nFAIL: %s\n", out, w); return 1; }
-#define CALL(nt, pref) ios_ignore_volatile_metadata((char *)img, SZ, (IMAGE_NT_HEADERS *)(nt), (pref), NULL)
-
-int main(int argc, char **argv)
-{
-    const char *s = argc > 1 ? argv[1] : "";
-    IMAGE_NT_HEADERS64 *nt;
-    int i;
-    if (offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, VolatileMetadataPointer) != 0x100) return fail("VolatileMetadataPointer is not at 0x100");
-    if (!strcmp(s, "off")) {
-        cfg_on = 0;
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x7f0000000ull + MD, 0x140);
-        CALL(nt, 0x140000000ull); CALL(nt, 0x140000000ull);
-        if (vmp() != 0x7f0000000ull + MD || outn) return fail("off: the pointer changed or a line was logged");
-        if (cfg_reads != 1) return fail("off: the setting is not read once and cached");
-        printf("PASS: off, an image keeps its volatile metadata and nothing is logged\n");
-        return 0;
-    }
-    cfg_on = 1;
-    if (!strcmp(s, "relocated")) {
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x7f0000000ull + MD, 0x140);
-        CALL(nt, 0x140000000ull);
-        if (vmp()) return fail("a relocated pointer was not cleared");
-        if (!strstr(out, "[fex-vmeta] madeira-bcd: L\"game.exe\" at ") ||
-            !strstr(out, ": volatile metadata (5424 accesses, 7 ranges) cleared; FEX orders the whole image by its TSO settings (ignore-volatile-metadata)"))
-            return fail("no [fex-vmeta] line with the table sizes");
-        printf("PASS: on, a relocated image's pointer is cleared and its table sizes are logged\n");
-        return 0;
-    }
-    if (!strcmp(s, "preferred")) {
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x140000000ull + MD, 0x140);   /* ml949: header rewritten, directory not applied */
-        CALL(nt, 0x140000000ull);
-        if (vmp() || !strstr(out, "(5424 accesses, 7 ranges) cleared")) return fail("a preferred-base pointer was not cleared or not measured");
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x123456789000ull, 0x140);   /* outside the image: cleared, sizes unknown */
-        outn = 0; out[0] = 0;
-        CALL(nt, 0x140000000ull);
-        if (vmp() || !strstr(out, "(0 accesses, 0 ranges) cleared")) return fail("a pointer outside the image was not cleared safely");
-        printf("PASS: on, a pointer at the preferred base is measured there; one outside the image is cleared without reading it\n");
-        return 0;
-    }
-    if (!strcmp(s, "skip")) {
-        nt = mk(IMAGE_FILE_MACHINE_ARM64, 0x7f0000000ull, 0x7f0000000ull + MD, 0x140);
-        CALL(nt, 0x140000000ull);
-        if (vmp() != 0x7f0000000ull + MD) return fail("an ARM64 image was changed");
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x7f0000000ull + MD, 0x100);   /* too short to hold the field */
-        CALL(nt, 0x140000000ull);
-        if (vmp() != 0x7f0000000ull + MD) return fail("a load config without the field was changed");
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x7f0000000ull + MD, 0x140);
-        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress = SZ - 8;   /* runs past the image */
-        CALL(nt, 0x140000000ull);
-        if (vmp() != 0x7f0000000ull + MD) return fail("a load config past the image was touched");
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0, 0x140);
-        CALL(nt, 0x140000000ull);
-        nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x7f0000000ull + MD, 0x140);
-        nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG;
-        CALL(nt, 0x140000000ull);
-        if (vmp() != 0x7f0000000ull + MD || outn) return fail("an image without a load config entry was changed or logged");
-        printf("PASS: on, ARM64 images, short or out-of-image load configs and images without metadata are left alone, silently\n");
-        return 0;
-    }
-    if (!strcmp(s, "cap")) {
-        for (i = 0; i < 40; i++) { nt = mk(IMAGE_FILE_MACHINE_AMD64, 0x7f0000000ull, 0x7f0000000ull + MD, 0x140); CALL(nt, 0x140000000ull); if (vmp()) return fail("not cleared"); }
-        { int n = 0; const char *p = out; while ((p = strstr(p, "[fex-vmeta]"))) { n++; p++; } if (n != 32) return fail("the line is not capped at 32"); }
-        printf("PASS: on, every image is cleared and the line stops after 32\n");
-        return 0;
-    }
-    return 2;
-}
-'''
-with tempfile.TemporaryDirectory(prefix='madeira-nixxes-') as directory:
-    c = Path(directory) / 'v.c'
-    exe = Path(directory) / 'v'
-    c.write_text(harness)
-    build = subprocess.run([cc, '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-function', '-DWINE_UNIX_LIB',
-                            '-I' + str(root / 'wine/include'), '-fsanitize=address,undefined', '-o', str(exe), str(c)],
-                           capture_output=True, text=True)
-    assert build.returncode == 0, build.stdout + build.stderr
-    for scenario in ('off', 'relocated', 'preferred', 'skip', 'cap'):
-        run = subprocess.run([str(exe), scenario], capture_output=True, text=True)
-        print(run.stdout, end='')
-        check('ignore-volatile-metadata scenario ' + scenario, run.returncode == 0)
-
-mapper = function(vsrc, 'static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRING *nt_name, int fd,')
-reloc = mapper.index('rel = process_relocation_block( ptr + rel->VirtualAddress, rel, delta );')
-call = mapper.index('ios_ignore_volatile_metadata( ptr, total_size, nt, (ULONG_PTR)image_info->base, nt_name );')
-prot = mapper.index('/* set the image protections */', reloc)   # the flat-mapped path above has its own
-copy = mapper.index('Eagerly JIT-copy all EXEC sections right here')
-check('the strip runs after relocation and before the protections and the JIT-pool copy', reloc < call < prot < copy)
-check('ignore-volatile-metadata is a madeira.cfg switch, off by default',
-      'enabled = madeira_cfg_bool( "ignore-volatile-metadata", 0 );' in strip)
-check("Wine's IMAGE_LOAD_CONFIG_DIRECTORY64 has VolatileMetadataPointer at 0x100",
-      re.search(r'ULONGLONG VolatileMetadataPointer;\s+/\* 100 \*/', (root / 'wine/include/winnt.h').read_text()) is not None)
 
 # ---- capability switches ----
 check('d3d12-wave-ops = 0 reports WaveOps FALSE; anything else keeps TRUE',

@@ -21,7 +21,11 @@
 //      game's own programs count, not a redistributable in its folder.
 //    - GTA V Enhanced by PlayGTAV.exe (or GTA5_Enhanced.exe) beside
 //      GTA5_Enhanced.exe: inside a Steam library it is the Steam copy,
-//      anywhere else another copy, and each has its own list.
+//      anywhere else a copy from outside Steam (Rockstar Games Launcher or
+//      another store), and each has its own list. Red Dead Redemption 2's
+//      RDR2.exe and PlayRDR2.exe the same way.
+//    - Any other game, and the Desktop, gets the standard list (owner's
+//      decisions, 2026-10-12; GameRecommendationsApply.swift).
 //
 //  This file is Foundation only: tests/host/check-game-recommendations.py
 //  compiles it with a test harness. The lists are the working ones recorded
@@ -113,9 +117,13 @@ enum GameRecommendations {
     /// DLLs: the game's code buffer then got 16 MB and was refilled again and
     /// again (2-3 FPS, 19:35), so the pool is back to 128 MB. The orphan-lock
     /// reaper releases only locks a live thread has stamped (it released live
-    /// locks: three "is not owned" errors on 476).
+    /// locks: three "is not owned" errors on 476). Version 10 (build 514,
+    /// 2026-10-12): the first install's VC++ setup may not start its elevated
+    /// engine (.be\vc_redist), which crashed with a lock held while the setup
+    /// waited for it forever (12:43). With the line the setup fails at once and
+    /// the installs pass (12:57); the session links its own VC++ DLLs anyway.
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 9,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 10,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -145,10 +153,8 @@ enum GameRecommendations {
         env.MADEIRA_SWAP_RESERVE_MAX_MB = 9216
         env.MADEIRA_THREAD_STACK_SPILL = 1
         env.MADEIRA_SMALL_STACK_EXES = RDR2.exe
-        env.MADEIRA_D3D11_SRC = 1
         env.MADEIRA_DOCK_GAME_SCM = 1
         env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe
-        env.MADEIRA_DXGI_SRC = 1
         env.MADEIRA_DXGI_BUDGET_EVENTS = 1
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
@@ -161,7 +167,7 @@ enum GameRecommendations {
         env.MADEIRA_POOL_LOW_IMAGES = 1
         env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_SC_PA_POOLS = 2
-        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
         env.MADEIRA_TOUCH_MOUSE = 1
         env.MADEIRA_WOW_MIN_FREE_GB = 2
         env.MADEIRA_X64_GRAPHICS_ENTRY = 1
@@ -169,14 +175,96 @@ enum GameRecommendations {
         env.WINEDLLOVERRIDES = video64=
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_METAL_HUD_MAIN = 1
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, fastSync: true, semaphoreFastPath: false,
+        resolution: GameRecommendation.screen720, display: "fit")
+
+    /// Red Dead Redemption 2 started from its own RDR2.exe or PlayRDR2.exe outside
+    /// a Steam library (Rockstar Games Launcher or another store; owner's request,
+    /// 2026-10-12). Derived from the Steam copy's list and not device-tested on
+    /// its own: the Steam list, whose lines are the game's own (its 8960 MB
+    /// reservation, the JIT pool, the swap file, the controller DLL, the
+    /// launcher's and Social Club's rings), without the two only Madeira Dock
+    /// reads when Steam starts the game (the service manager and the programs
+    /// that keep that session alive), plus the line GTA V Enhanced's list outside
+    /// Steam starts with: the [ec-hook] reporter off.
+    static let rdr2Other = GameRecommendation(
+        id: "rdr2-other", title: "Red Dead Redemption 2 (outside Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for Red Dead Redemption 2 outside Steam (Rockstar Games Launcher or another store).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        d3d12-caps-log = 2
+        d3d12-shader-pack = 1
+        replay-split = 1
+        ring-share = 1
+        pool-low = 1
+        pool-mid = 1
+        pool-page-fit = 1
+        pool-split = 1
+        vram-mb = 2304
+        swap-mb = 8192
+        swap-mode = 2
+        swap-min-mb = 1
+        swap-images = 1
+        pso-warm = 2
+        fence-chain = 6
+        avail-phys = 1
+        indirect-fast = 1
+        ind-probe = 0
+        fullscreen-window = 1
+        env.WINE_D3D_CONFIG = renderer=no3d
+        env.FEX_VECTORTSOENABLED = 0
+        env.MADEIRA_BAND_CENSUS = 1
+        env.MADEIRA_RDR2_VA_HOLD = 1
+        env.MADEIRA_SWAP_RESERVE_MAX_MB = 9216
+        env.MADEIRA_THREAD_STACK_SPILL = 1
+        env.MADEIRA_SMALL_STACK_EXES = RDR2.exe
+        env.MADEIRA_DXGI_BUDGET_EVENTS = 1
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
+        env.MADEIRA_EXECREQ_LEAVE = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_PIN_GRAPHICS_DLLS = 1
+        env.MADEIRA_PRELOAD_DLLS = xinput1_4.dll
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_X64_GRAPHICS_ENTRY = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.WINEDLLOVERRIDES = video64=
+        env.MADEIRA_DEVICE_STATS = 1
+        env.MADEIRA_METAL_HUD_MAIN = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, semaphoreFastPath: false,
         resolution: GameRecommendation.screen720, display: "fit")
 
     /// GTA V Enhanced from Steam, through Madeira Dock (build 456: 18 minutes
     /// idle and 19 minutes of fast driving without a crash, 33-40 FPS at 40).
+    /// Version 2 (2026-10-12): the orphan-lock reaper releases only locks a live
+    /// thread has stamped, as for RDR2 and Horizon Zero Dawn. Its default mode
+    /// released a busy lock in SocialClubHelper.exe while the owner lived; the
+    /// helper died at Story Mode and the launcher's window stayed grey (log
+    /// 10:53, after a reset and a new Rockstar sign-in). Version 3: the first
+    /// install's VC++ setup may not start its elevated engine, as for RDR2
+    /// (with the line GTA's installs passed, 13:08).
     static let gta5EnhancedSteam = GameRecommendation(
-        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 1,
+        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 3,
         config: """
         # Madeira's recommended settings for GTA V Enhanced (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -194,18 +282,17 @@ enum GameRecommendations {
         pso-warm = 2
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye
-        env.MADEIRA_D3D11_SRC = 1
         env.MADEIRA_DOCK_GAME_SCM = 1
         env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTA5_Enhanced.exe
-        env.MADEIRA_DXGI_SRC = 1
         env.MADEIRA_EXECREQ_LEAVE = 1
         env.MADEIRA_KMT_ADAPTER = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_PIN_GRAPHICS_DLLS = 1
         env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
         env.MADEIRA_POOL_LOW_IMAGES = 1
         env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_SC_PA_POOLS = 2
-        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
         env.MADEIRA_TOUCH_MOUSE = 1
         env.MADEIRA_WOW_MIN_FREE_GB = 2
         env.MADEIRA_X64_GRAPHICS_ENTRY = 1
@@ -214,16 +301,23 @@ enum GameRecommendations {
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_PAD_MODE = hid
         env.MADEIRA_METAL_HUD_MAIN = 1
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4,
         display: "fit")
 
     /// GTA V Enhanced started from its own PlayGTAV.exe outside a Steam
-    /// library (build 451); Madeira's own settings only.
+    /// library (Rockstar Games Launcher or another store; build 451). Version 2:
+    /// the same orphan-lock reaper mode as the Steam copy (its launcher and
+    /// Social Club too).
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (not Steam)", version: 1,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 2,
         config: """
-        # Madeira's recommended settings for GTA V Enhanced outside Steam.
+        # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         vram-mb = 4096
         d3d12-core-dll = 1
@@ -233,8 +327,8 @@ enum GameRecommendations {
         d3d12-caps-log = 2
         d3d12-msaa8 = 1
         pool-split = 1
-        env.MADEIRA_DXGI_SRC = 1
         env.MADEIRA_KMT_ADAPTER = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_PAD_MODE = hid
         env.SteamDeck = 1
         env.MADEIRA_SC_PA_POOLS = 2
@@ -242,6 +336,11 @@ enum GameRecommendations {
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: true, wineVCRT: false, fastSync: true, resolution: "1280x720", display: "fit")
 
@@ -252,8 +351,14 @@ enum GameRecommendations {
     /// where a view landed there (HZD: walls, trees and plants missing for one
     /// frame). GoT's one-frame "shapes in the air" are the same kind of fault.
     /// view-census counts such views, so its first run shows whether GoT makes any.
+    /// Version 3 (build 515, 2026-10-12, the owner's working list): the [ec-hook]
+    /// reporter is off (on 515 it ended the game at start, reading steam_api64.dll's
+    /// protected sections), the swap file holds 4 GB, and a new thread's stacks may
+    /// take the kernel's pick once Wine's band is full (a thread the game could not
+    /// create froze it in a cutscene, 15:39). With the game's own graphics at their
+    /// lowest it stays under the memory limit on an iPhone 17 Pro Max.
     static let ghostOfTsushima = GameRecommendation(
-        id: "ghost-of-tsushima", title: "Ghost of Tsushima", version: 2,
+        id: "ghost-of-tsushima", title: "Ghost of Tsushima", version: 3,
         config: """
         # Madeira's recommended settings for Ghost of Tsushima.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -264,7 +369,14 @@ enum GameRecommendations {
         typed-view-shadow = 1
         view-census = 1
         env.MADEIRA_PAD_MODE = hid
-        swap-mb = 3072
+        swap-mb = 4096
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_THREAD_STACK_SPILL = 1
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
         """,
         avx: true, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: false,
         resolution: "1280x720", display: "fit")
@@ -278,9 +390,13 @@ enum GameRecommendations {
         dxmt = d3d11.mipClampBC=2
         swap-mb = 6144
         swap-min-kb = 1024
-        env.MADEIRA_LD_BOUNDS = 0
         env.WINEDEBUG = err+all,err-virtual,fixme-all
         env.MADEIRA_PAD_MODE = hid
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, semaphoreFastPath: false,
         resolution: "1920x1080", display: "fit")
@@ -400,10 +516,34 @@ enum GameRecommendations {
         env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_SRV_FGETPATH = 1
         env.WINEDEBUG = fixme-input
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 
-    static let all = [rdr2Steam, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn]
+    /// Every other game, and the Desktop (owner's decisions, 2026-10-12): most games
+    /// the owner tried outside these lists closed at start until the [ec-hook]
+    /// reporter was off. It reads code a game's protection rewrites at run time
+    /// (GTA V Enhanced outside Steam on build 451, Ghost of Tsushima on build 515),
+    /// and it only logs, so turning it off costs a game nothing. Version 3: without
+    /// madeira-bcd's defaults (version 2 had them). This list reaches every game, and
+    /// MADEIRA_FREE_DELAY_MS keeps a released block's addresses taken, so an allocator
+    /// that reserves, releases and reserves again inside the same range never gets it
+    /// back: Madeira Dock spun on "Loading Steam" before Thumper. The game lists that
+    /// were tested with those defaults keep them. No switches.
+    static let standard = GameRecommendation(
+        id: "standard", title: "games without a list of their own", version: 3,
+        config: """
+        # Madeira's recommended settings for a game without a list of its own.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        """)
+
+    static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,
+                      standard]
 
     // MARK: Recognising a game
 
@@ -427,9 +567,10 @@ enum GameRecommendations {
             let installFolder = last == steamFolder ? steamFolder : nil
             if steamAppID == rdr2AppID || installFolder == "red dead redemption 2" { return rdr2Steam }
             if steamAppID == gta5EnhancedAppID || installFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
-            if steamAppID == ghostAppID { return ghostOfTsushima }
-            if steamAppID == godOfWarAppID { return godOfWar }
-            if steamAppID == horizonZeroDawnAppID { return horizonZeroDawn }
+            if steamAppID == ghostAppID || installFolder == "ghost of tsushima director's cut"
+                || installFolder == "ghost of tsushima" { return ghostOfTsushima }
+            if steamAppID == godOfWarAppID || installFolder == "godofwar" || installFolder == "god of war" { return godOfWar }
+            if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero dawn" { return horizonZeroDawn }
             return nil
         }
         // A program, wherever it was installed: only the game's own programs, so a
@@ -438,12 +579,12 @@ enum GameRecommendations {
         switch last {
         case "playgtav.exe", "gta5_enhanced.exe":
             // GTA V Enhanced (the legacy edition has PlayGTAV.exe too, beside GTA5.exe):
-            // inside a Steam library the Steam copy, anywhere else another copy.
+            // inside a Steam library the Steam copy, anywhere else the list for outside Steam.
             let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
             guard fileExists(folder + "\\GTA5_Enhanced.exe") else { return nil }
             return inSteam ? gta5EnhancedSteam : gta5EnhancedOther
         case "rdr2.exe", "playrdr2.exe":
-            return inSteam ? rdr2Steam : nil
+            return inSteam ? rdr2Steam : rdr2Other
         case "ghostoftsushima.exe":
             return ghostOfTsushima
         case "gow.exe":

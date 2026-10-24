@@ -175,6 +175,7 @@ research/remote-metal/host/rmetald.*
 app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
 app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
 madeira-d3d12/tests/offline/sm51/
+build/stub-dlls/
 
 # Former CI staging dir for the Metal Shader Converter headers (now vendored in
 # madeira-d3d12/third_party/metal-shader-converter); kept ignored.
@@ -212,3 +213,5 @@ app/Madeira/arm64ec-windows/dock-notices.txt
 # madeira-bcd fork-only smoke tests (bcd-smoke/build.sh output; built in CI, never committed)
 bcd-smoke/out/
 app/Madeira/arm64ec-windows/bcd-smoke-*.exe
+# faultrep.dll: build/faultrep/build.sh (its install goes into the tracked farm)
+build/faultrep/out/

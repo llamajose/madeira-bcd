@@ -50,10 +50,13 @@ check("switch read once with mad_cfg_int_pe, off by default",
 
 loop = src[src.index("case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: {"):]
 loop = loop[:loop.index("\n            break;\n        }")]
-check("replay loop: fast path only after record 0 drew, never for indirect tessellation, then leaves the loop",
+check("replay loop: fast path only after record 0 drew (never for indirect tessellation, where the runtime has it), "
+      "then leaves the loop",
       "unsigned drawn = e.draws;" in loop
       and "if (!k && mad_indirect_fast_on()) {" in loop
-      and "int why = tess ? IFR_TESS_IND : e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);" in loop
+      and ("int why = tess ? IFR_TESS_IND : e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);" in loop
+           or ("int tess" not in loop
+               and "int why = e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);" in loop))
       and "mad_ifr_note(why, c->u.ind.count);" in loop
       and "if (why != IFR_USED) mad_ifr_detail(&e, c, why, (int)(e.draws - drawn));" in loop
       and "if (why == IFR_USED) { exec_indirect_rest(&e, c); break; }" in loop
@@ -61,7 +64,7 @@ check("replay loop: fast path only after record 0 drew, never for indirect tesse
 draw = src[src.index("static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {"):]
 draw = draw[:draw.index("\n}\n")]
 check("exec_draw binds the record at buffer 4 as the fast path repeats it",
-      "else MAD_SETBUF(WMTRenderCommandSetVertexBuffer, c->u.ind.args->buffer, c->u.ind.off, 4);" in draw)
+      "MAD_SETBUF(WMTRenderCommandSetVertexBuffer, c->u.ind.args->buffer, c->u.ind.off, 4);" in draw)
 check("exec_draw's indexed indirect draw matches the fast path's fields",
       all(s in draw for s in ("c_dii.primitive_type = mad_prim(e->topo);", "c_dii.index_type = e->ib_type;",
                               "c_dii.index_buffer = e->ib->buffer;", "c_dii.index_buffer_offset = e->ib_off;",

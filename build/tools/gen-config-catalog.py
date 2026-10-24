@@ -7,7 +7,7 @@ Two kinds of option live in Documents/madeira.cfg:
     the app (MadeiraConfig.get/bool/flag);
   - environment switches ("env.NAME = value"), which the app exports before
     Wine starts; any MADEIRA_*/DXMT_*/MYTHIC_* name the code reads with getenv,
-    GetEnvironmentVariable, env::getEnvVar, madeiraSwitch or a flag helper.
+    GetEnvironmentVariable, env::getEnvVar, madeiraSwitch, ios_srv_switch or a flag helper.
 
 The scan covers the tracked sources of this repository and of the wine, DXMT
 and FEX submodules. Each option gets its type and default from the reading
@@ -34,7 +34,7 @@ SKIP = ("/host-tests/", "/ffmpeg/", "ConfigCatalog.generated.swift")
 CFG = re.compile(r'\b(madeira_cfg_(?:get|int|bool)|mad_cfg_(?:int|str)_pe|'
                  r'MadeiraConfig\.(?:get|bool|flag))\(\s*"([A-Za-z0-9._-]+)"\s*(?:,\s*([^,)]+))?')
 ENV = re.compile(r'\b(getenv|GetEnvironmentVariable[AW]?|env::getEnvVar|madeiraSwitch|'
-                 r'madeira_switch_for_caller|mad_env_is_zero|flag|envFlag)\(\s*L?"((?:MADEIRA|DXMT|MYTHIC)_[A-Z0-9_]+)"'
+                 r'madeira_switch_for_caller|mad_env_is_zero|flag|envFlag|ios_srv_switch)\(\s*L?"((?:MADEIRA|DXMT|MYTHIC)_[A-Z0-9_]+)"'
                  r'\s*(?:,\s*(?:fallback:|default:)?\s*([^,)]+))?')
 BOOL_READERS = {"madeira_cfg_bool", "MadeiraConfig.bool", "MadeiraConfig.flag", "flag", "envFlag",
                 "madeiraSwitch", "madeira_switch_for_caller", "mad_env_is_zero"}
@@ -63,6 +63,13 @@ OVERLAY = {
                 "note": "Default off. If other image allocations fail, retired region-C code buffers up to 64 MB "
                         "may enter the image freelist after a 3-second grace, executable-page and thread-PC checks. "
                         "Requires pool-low; 64-bit processes only. Live buffers and the pool-low-margin stay unchanged."},
+    "env.MADEIRA_POOL_CODE_EXIT_RECLAIM": {"category": "Memory & JIT pool", "title": "Return an exited program's code buffers",
+                "kind": "bool", "default": "1",
+                "note": "On by default. When a program of the session exits (a launcher restarting itself, "
+                        "RockstarService.exe, a setup step), the emulator's code buffers it held go back to the JIT "
+                        "pool: reusable 3 seconds later, once no thread runs in them. Before, they stayed in use "
+                        "until Madeira closed, and a game started after many such exits got 16 MB code buffers and "
+                        "ran slowly. 0 keeps them in use, as before."},
     "env.MADEIRA_X64_IMAGE_NOCOPY": {"category": "Memory & JIT pool", "title": "Pure-x64 images without a JIT-pool copy",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: an x64-only image (not ARM64EC hybrid, not a Wine builtin) in a 64-bit "
@@ -397,10 +404,22 @@ OVERLAY = {
                         "Dead Redemption 2's 8960 MB reserve fits; 64 censuses at most. Logging only, changes no "
                         "placement; read at session start."},
     "env.MADEIRA_EC_HOOK_TRACE": {"category": "Debugging / logs", "title": "Log code patches the emulated copy misses",
-                "kind": "bool", "default": "1",
-                "note": "Default on, logging only. Compare executable PE sections and their pool copies before "
+                "kind": "bool", "default": "0",
+                "note": "Default off, logging only. 1 compares executable PE sections and their pool copies before "
                         "sync, including x64 entry thunks. Separate budgets preserve later graphics-jump records "
-                        "after native startup rewrites. A difference alone does not prove an inline hook. 0 disables it."},
+                        "after native startup rewrites. A difference alone does not prove an inline hook."},
+    # Upstream's switch (build/ntdll-unix/signal_arm64_ios.c) with its mode 2.
+    # madeira-bcd FORK-ONLY: unset means 2 here, as this fork's game lists were tested with it.
+    "env.MADEIRA_CTX_CPU_AREA": {"category": "Exceptions & threads", "title": "Cross-thread GetThreadContext from the x64 snapshot",
+                "kind": "choice", "default": "",
+                "choices": [("", "Control and integer registers (default)"), ("0", "Off"), ("1", "Control registers"), ("2", "Control and integer registers")],
+                "note": "Another thread's GetThreadContext when the server has no control registers for it. 0: off; "
+                        "the answer is the server's registers. 1 (upstream's opt-in): the control "
+                        "registers (Pc/Sp/Fp/Lr) from the thread's last exit from emulated code. 2: also the integer "
+                        "registers the caller asked for, and Cpsr 0, from the same snapshot; unset means this, "
+                        "madeira-bcd's default behaviour (Ghost of Tsushima's loading screen froze without it). "
+                        "The snapshot is where the thread last left emulated code, not where it is now: a context "
+                        "written back moves the thread back there."},
     "env.MADEIRA_X64_GRAPHICS_ENTRY": {"category": "Direct3D 12 (Madeira)", "title": "Patchable x64 graphics method entries",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1 exposes typed x64 ARM64EC entries for swapchain Present/Present1, "
@@ -719,6 +738,14 @@ OVERLAY = {
                         "crossing to the native code and back (Horizon Zero Dawn: 2-4 million such calls a second). "
                         "Same results; a negative or NaN sqrt still goes to Wine's native sqrt. Off (default): the "
                         "shipped ucrtbase.dll. Set it in the game's own file; read at session start."},
+    # madeira-bcd: WM_TIMER not starved by WM_PAINT (build/wineserver/queue_ios.c).
+    "env.MADEIRA_TIMER_FAIRNESS": {"category": "Wine server", "title": "Timers run while a window keeps repainting",
+                "kind": "bool", "default": "1", "sources": ["build/wineserver/queue_ios.c"],
+                "note": "Default on. A thread gets its paint messages before its timers, so a window that "
+                        "invalidates itself while it paints starved every timer of that thread for good: the "
+                        "Rockstar Games Launcher installer, whose status text and finish page run on a timer, "
+                        "stayed at \"Preparing to Install...\" after its work was done. A timer that has waited "
+                        "100 ms now goes before such a paint. 0: the strict order, as before. Read once per app run."},
     # madeira-bcd: lean periodic diagnostics (build/ntdll-unix/server_ios.c, virtual_ios.c).
     "env.MADEIRA_LEAN_DIAG": {"category": "Debugging / logs", "title": "Lean diagnostics (no thread-suspending samplers)",
                 "kind": "bool", "default": "0",

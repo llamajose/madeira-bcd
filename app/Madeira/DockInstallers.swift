@@ -470,8 +470,11 @@ enum DockInstallRequest: String, Sendable {
     /// work but never closed, so its batch never saw an exit status.
     case record
     /// Forget the game's own recorded programs and choose Run at next start, so they run
-    /// again (for a clean reinstall). Files the installers wrote stay where they are.
+    /// again (for a clean reinstall). madeira-bcd: what the installers put into the prefix
+    /// moves into a backup first (DockReset.swift; MADEIRA_DOCK_RESET_CLEAN=0: files stay).
     case reset
+    /// madeira-bcd: `reset`, and the Rockstar launcher's and Social Club's sign-in data goes too.
+    case resetSignOut = "reset-signout"
 }
 
 /// Kept next to the prefix's registry files, one small JSON file: the programs the last
@@ -539,6 +542,10 @@ struct DockInstallLedger: Codable, Equatable, Sendable {
 /// - `MADEIRA_DOCK_INSTALL_SERVER_SYNC`: a start that runs installers turns madsync off for
 ///   its session (off: madsync stays and the service-manager step is left out).
 /// - `MADEIRA_DOTNET_FUSION`: place Wine's fusion.dll in the .NET 2.0 folder when missing.
+/// - `MADEIRA_DOCK_INSTALL_SEPARATE` (madeira-bcd): a start that runs installers runs only
+///   them; the game starts after Madeira is restarted (off: the host follows in the same session).
+/// - `MADEIRA_DOCK_RESET_CLEAN` (madeira-bcd): Reset also moves what the installers put into
+///   the prefix into a backup (DockReset.swift; off: only the records are forgotten).
 @MainActor
 enum DockInstallers {
     static let scriptName = "madeira-dock-installers.cmd"
@@ -546,6 +553,51 @@ enum DockInstallers {
 
     /// The batch this start runs before the host (a C:\ path), nil when none runs.
     private(set) static var script: String?
+    /// madeira-bcd: this start's session runs only the installers, not the host. In one session
+    /// the installers' copies in the JIT pool left Red Dead Redemption 2 too little room at its
+    /// start, and it stopped while loading (log 2026-10-12 08:13: "[jit-pool] EXHAUSTED"); a
+    /// session of their own also leaves madsync on for the game. One session runs per app run,
+    /// so the game starts after a restart of Madeira.
+    private(set) static var installsOnly = false
+    nonisolated static let restartWords = "To start the game, restart Madeira: swipe it away in the app switcher, open it again and start the game."
+    /// What the starting screen says once the installs ended, until the session has closed (the
+    /// wineserver writes the registry to disk as it stops; Madeira asks for the restart then).
+    nonisolated static let closingWords = "This session now closes. Madeira asks you to restart it when it has; wait for that."
+    /// madeira-bcd: the game's lines a session of one-time installs runs without. Social Club's
+    /// layout 2 (env.MADEIRA_SC_PA_POOLS) and RDR2's hold (env.MADEIRA_RDR2_VA_HOLD) take the
+    /// 4 GB slots 32-bit programs run in, so the Visual C++ setups' second 32-bit process could
+    /// not start ([wow-window] REJECTED, BOOT FAILED 'guest-window-reserve', exit 0x8007054f; logs
+    /// 2026-10-03 16:00 and 2026-10-12 10:00). Both serve the game's Social Club only; the game's
+    /// other lines stay (the Rockstar Service install needs env.MADEIRA_EXECREQ_LEAVE).
+    nonisolated static let installSessionDroppedKeys: Set<String> = ["env.MADEIRA_SC_PA_POOLS", "env.MADEIRA_RDR2_VA_HOLD"]
+
+    /// madeira-bcd: for a session of one-time installs (the app sets MADEIRA_DOCK_INSTALLS_SESSION),
+    /// the game's config file (MADEIRA_CFG_GAME) is replaced by a copy without
+    /// `installSessionDroppedKeys`. Returns the keys left out. MADEIRA_DOCK_INSTALL_LAYOUT=0 keeps
+    /// every line.
+    nonisolated static func applyInstallSessionConfig(directory: URL? = MadeiraConfig.gameURL?.deletingLastPathComponent()) -> [String] {
+        guard ProcessInfo.processInfo.environment["MADEIRA_DOCK_INSTALLS_SESSION"] == "1",
+              flag("MADEIRA_DOCK_INSTALL_LAYOUT"),   // 0: a session of one-time installs keeps the game's layout lines
+              let path = ProcessInfo.processInfo.environment["MADEIRA_CFG_GAME"], !path.isEmpty,
+              let text = try? String(contentsOfFile: path, encoding: .utf8), let directory else { return [] }
+        var dropped: [String] = []
+        let kept = text.components(separatedBy: "\n").filter { line in
+            let key = line.split(separator: "=", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            guard installSessionDroppedKeys.contains(key) else { return true }
+            dropped.append(key)
+            return false
+        }
+        guard !dropped.isEmpty else { return [] }
+        let copy = directory.appendingPathComponent("madeira-game-installs.cfg")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try kept.joined(separator: "\n").write(to: copy, atomically: true, encoding: .utf8)
+        } catch {
+            return []
+        }
+        setenv("MADEIRA_CFG_GAME", copy.path, 1)
+        return dropped
+    }
     /// This start runs installers and turns madsync off for its session.
     private(set) static var serverSync = false
     /// This start's plan in words (the Dock sheet's status), nil when there is nothing to say.
@@ -698,8 +750,13 @@ enum DockInstallers {
     /// own programs' records (as a finished run would), `.reset` removes them and sets the
     /// choice to Run at next start. The request is cleared either way, and with it the game's
     /// unfinished entries. Returns the request applied.
+    /// madeira-bcd: a reset first moves what the installers put into the prefix into a backup
+    /// (DockReset.clean; `.resetSignOut` takes the Rockstar sign-in data too). Those are shared:
+    /// the games in `others` that record under the same keys or run the same installers get
+    /// Run at next start as well (shareReset), so each installs them again.
     @discardableResult
-    static func applyRequest(_ game: DockGame, found: [SteamInstallProcess], prefix: URL) -> DockInstallRequest? {
+    static func applyRequest(_ game: DockGame, found: [SteamInstallProcess], prefix: URL,
+                             drive: URL? = nil, others: [DockGame] = []) -> DockInstallRequest? {
         var ledger = DockInstallLedger.load(prefix: prefix)
         let app = game.id
         guard ledger.requests?[String(app)] != nil else { return nil }
@@ -708,23 +765,49 @@ enum DockInstallers {
         let runs = own(found, game: game)
         let names = runs.map { DockInstallScripts.label($0) }.joined(separator: ",")
         let shared = Set(found.map(\.run)).subtracting(runs).count
+        let drive = drive ?? prefix.appendingPathComponent("drive_c", isDirectory: true)
         var changed = 0
         var failure: String?
+        var cleaned: DockReset.Summary?
+        var alsoRun: [String] = []
         switch request {
         case .record?:
             do { changed = try SteamInstallScripts.mark(runs, prefix: prefix) } catch { failure = error.localizedDescription }
-        case .reset?:
+        case .reset?, .resetSignOut?:
+            if flag("MADEIRA_DOCK_RESET_CLEAN") {   // 0: Reset only forgets the records; installed files stay
+                cleaned = DockReset.clean(drive: drive, prefix: prefix, documents: prefix.deletingLastPathComponent(),
+                                          appID: app, signOut: request == .resetSignOut, baseline: DockReset.baselineProvider())
+            }
             do { changed = try SteamInstallScripts.unmark(runs, prefix: prefix) } catch { failure = error.localizedDescription }
-            if failure == nil { ledger.runNext[String(app)] = nil }
+            if failure == nil {
+                ledger.runNext[String(app)] = nil
+                if cleaned != nil {
+                    alsoRun = shareReset(app, runs: runs, found: found, others: others, drive: drive, prefix: prefix, ledger: &ledger)
+                }
+            }
         case nil:
             failure = "unknown request"
         }
         if failure == nil { ledger.setUnfinished(app, []) }
         do { try ledger.save(prefix: prefix) }
         catch { LogStore.shared.log("[dock-installers] app=\(app) ledger not saved: \(error.localizedDescription)", level: .error) }
-        let tag = request == .reset ? "[dock-reset]" : "[dock-installers]"
-        let what = request == .reset ? "reset: records removed, choice=run; installed files left in place"
-                                     : "record-as-done: records written"
+        let tag = request == .record ? "[dock-installers]" : "[dock-reset]"
+        let what = request == .record ? "record-as-done: records written"
+            : cleaned != nil ? "reset: installed components moved to the backup, records removed, choice=run"
+                             : "reset: records removed, choice=run; installed files left in place"
+        if let cleaned {
+            let failed = cleaned.failures.isEmpty ? "" : " failures=\(cleaned.failures.count)"
+            LogStore.shared.log("[dock-reset] app=\(app) clean sign-out=\(request == .resetSignOut ? 1 : 0) moved=\(cleaned.moved.count) " +
+                                "entries=\(cleaned.entries.count) keys=\(cleaned.keys) values=\(cleaned.values) " +
+                                "template-keys=\(cleaned.restored) backup=Documents/\(cleaned.backup)" + failed,
+                                level: cleaned.failures.isEmpty ? .info : .error)
+            for path in cleaned.moved { LogStore.shared.log("[dock-reset]   moved C:\\" + path.replacingOccurrences(of: "/", with: "\\")) }
+            for entry in cleaned.entries { LogStore.shared.log("[dock-reset]   uninstall entry removed: " + entry) }
+            for problem in cleaned.failures { LogStore.shared.log("[dock-reset]   failed: " + problem, level: .error) }
+            for other in alsoRun {
+                LogStore.shared.log("[dock-reset] app=\(app) also \(other): records removed, choice=run; they share these installs")
+            }
+        }
         if let failure {
             LogStore.shared.log("\(tag) app=\(app) request=\(request?.rawValue ?? "?") failed: \(failure)", level: .error)
         } else {
@@ -733,19 +816,61 @@ enum DockInstallers {
         return failure == nil ? request : nil
     }
 
+    /// madeira-bcd: what a reset removed (DockReset.clean) belongs to the prefix, not to one
+    /// game. Another installed game whose own programs record under one of the same keys, or
+    /// run a program of the same file name (its own copy of the same installer), loses those
+    /// records and gets Run at next start, so its next start installs them again. Returns
+    /// "app=<id> programs=<labels> values=<removed>" for each such game, for the log.
+    static func shareReset(_ app: Int, runs: [SteamInstallRun], found: [SteamInstallProcess], others: [DockGame],
+                           drive: URL, prefix: URL, ledger: inout DockInstallLedger) -> [String] {
+        func file(_ path: String) -> String { path.split(separator: "\\").last.map { $0.lowercased() } ?? "" }
+        func key(_ run: SteamInstallRun) -> String { run.hive.rawValue + "|" + run.key.lowercased() }
+        let keys = Set(runs.map { key($0) })
+        let files = Set(found.filter { runs.contains($0.run) }.map { file($0.executable) })
+        var result: [String] = []
+        for other in others where other.id != app && other.installed {
+            let theirs = Self.found(other, drive: drive).processes
+            let ownRuns = own(theirs, game: other)
+            var shared: [SteamInstallRun] = []
+            for process in theirs where ownRuns.contains(process.run) && !shared.contains(process.run) {
+                if keys.contains(key(process.run)) || files.contains(file(process.executable)) { shared.append(process.run) }
+            }
+            guard !shared.isEmpty else { continue }
+            let removed: Int
+            do { removed = try SteamInstallScripts.unmark(shared, prefix: prefix) }
+            catch {
+                LogStore.shared.log("[dock-reset] app=\(other.id) shared records not removed: \(error.localizedDescription)", level: .error)
+                continue
+            }
+            ledger.runNext[String(other.id)] = nil
+            result.append("app=\(other.id) programs=\(shared.map { DockInstallScripts.label($0) }.joined(separator: ",")) values=\(removed)")
+        }
+        return result
+    }
+
     // MARK: A start
 
     /// Called right before a Dock start, while no session runs (the registry is on disk).
     /// Records the previous batch's results, plans the game's programs and writes the batch.
-    static func prepare(_ game: DockGame, drive: URL, prefix: URL,
+    /// `others`: the prefix's other Dock games (a reset's shared installs, applyRequest).
+    static func prepare(_ game: DockGame, drive: URL, prefix: URL, others: [DockGame] = [],
                         has32Bit: Bool = DockInstallers.bundleHas32Bit, hasMsiexec: Bool = DockInstallers.bundleHasMsiexec,
                         fusionSource: URL? = Bundle.main.resourceURL?.appendingPathComponent("i386-windows/fusion.dll")) {
-        script = nil; serverSync = false; note = nil; finishedAt = nil; logged = []; runningSince = nil
+        script = nil; serverSync = false; note = nil; finishedAt = nil; logged = []; runningSince = nil; installsOnly = false
+        allSucceeded = false
         let app = game.id
         let batchFile = drive.appendingPathComponent(scriptName)
         try? FileManager.default.removeItem(at: batchFile)
         absorbResults(reason: "next-start", drive: drive, prefix: prefix)
         try? FileManager.default.removeItem(at: drive.appendingPathComponent(resultName))
+        // madeira-bcd: a Vulkan loader an installer wrote into system32 goes back out, so the
+        // session links Madeira's stand-in (DockReset.restoreStandIn).
+        if flag("MADEIRA_DOCK_VULKAN_STANDIN"),   // 0: a Vulkan loader an installer wrote stays in system32
+           let moved = DockReset.restoreStandIn(drive: drive, documents: prefix.deletingLastPathComponent(),
+                                                standIn: Bundle.main.resourceURL?.appendingPathComponent("arm64ec-windows/vulkan-1.dll")) {
+            LogStore.shared.log("[dock-installers] C:\\" + moved.replacingOccurrences(of: "/", with: "\\") +
+                                " (an installer's Vulkan loader) moved to Documents/madeira-reset-backup; this session links Madeira's stand-in")
+        }
         guard enabled else {
             LogStore.shared.log("[dock-installers] app=\(app) off (MADEIRA_DOCK_INSTALLERS=0)"); return
         }
@@ -753,7 +878,7 @@ enum DockInstallers {
         let (found, scripts) = Self.found(game, drive: drive, defaultKey: defaultKey)
         // A Record as done / Reset request saved since the last start, before the plan reads
         // the registry.
-        applyRequest(game, found: found, prefix: prefix)
+        applyRequest(game, found: found, prefix: prefix, drive: drive, others: others)
         guard !found.isEmpty else {
             LogStore.shared.log("[dock-installers] app=\(app) scripts=\(scripts) programs=0"); return
         }
@@ -796,6 +921,7 @@ enum DockInstallers {
                 try Data(text.utf8).write(to: batchFile, options: .atomic)
                 script = "C:\\" + scriptName
                 serverSync = sessionOff
+                installsOnly = flag("MADEIRA_DOCK_INSTALL_SEPARATE")   // 0: the host follows the installers in the same session
             } catch {
                 LogStore.shared.log("[dock-installers] app=\(app) batch not written: \(error.localizedDescription)", level: .error)
             }
@@ -817,7 +943,9 @@ enum DockInstallers {
             note = "One-time installs skipped. To run them, choose Run at next start under One-time installs."
         } else {
             note = DockInstallScripts.note(items)
-            if serverSync && madsyncConfigured {
+            if installsOnly {
+                note = (note.map { $0 + " " } ?? "") + "This start runs only them; afterwards restart Madeira and start the game again."
+            } else if serverSync && madsyncConfigured {
                 note = (note.map { $0 + " " } ?? "") + "This start uses Wine's standard synchronization instead of madsync; the next start uses madsync again."
             }
         }
@@ -838,7 +966,11 @@ enum DockInstallers {
         LogStore.shared.log("[dock-installers] app=\(app) scripts=\(scripts) programs=\(found.count) pending=\(pending.count) " +
                             "done=\(items.filter { $0.status == .done }.count) missing=\(items.filter { $0.status == .missing }.count) " +
                             "unsupported=\(items.filter { $0.status == .unsupported }.count) default-key=\(defaultKey ? 1 : 0) " +
-                            "services-step=\(script == nil ? "-" : services == .off ? "off" : "start") session-madsync-off=\(serverSync ? 1 : 0)")
+                            "services-step=\(script == nil ? "-" : services == .off ? "off" : "start") session-madsync-off=\(serverSync ? 1 : 0) " +
+                            "installs-only=\(installsOnly ? 1 : 0)")
+        if installsOnly {
+            LogStore.shared.log("[dock-installers] app=\(app) this session runs only the one-time installs; the game starts after Madeira is restarted (MADEIRA_DOCK_INSTALL_SEPARATE=0: in the same session)")
+        }
     }
 
     /// An installer with a managed step (DirectX setup's is one) loads fusion.dll from the
@@ -944,8 +1076,21 @@ enum DockInstallers {
         let total = max(results.total, results.exits.count), succeeded = results.exits.count - failed.count
         if logged.insert("end").inserted {
             finishedAt = Date()
-            LogStore.shared.log("[dock-installers] end succeeded=\(succeeded) failed=\(failed.count) of=\(total); the host starts next")
+            LogStore.shared.log("[dock-installers] end succeeded=\(succeeded) failed=\(failed.count) of=\(total); " +
+                                (installsOnly ? "the session ends, the game starts after a restart" : "the host starts next"))
         }
+        allSucceeded = total > 0 && succeeded == total
         return "One-time installs finished: \(succeeded) of \(total) succeeded." + failures
+    }
+
+    /// madeira-bcd: the batch ended and every program in it succeeded (poll).
+    private(set) static var allSucceeded = false
+
+    /// madeira-bcd: the "Restart Madeira" alert after a session of one-time installs, in the
+    /// owner's words (2026-10-12): all succeeded, or the count and the failed programs. `ended`
+    /// is poll's text, nil when the batch never ended.
+    static func restartNotice(_ ended: String?) -> String {
+        if allSucceeded { return "One-time installs completed successfully. Close Madeira and open it again to play the game." }
+        return (ended ?? "One-time installs ended.") + "\nClose Madeira and open it again to play the game."
     }
 }

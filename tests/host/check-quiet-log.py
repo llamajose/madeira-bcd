@@ -23,8 +23,7 @@ Checks:
     MADEIRA_SRV_FGETPATH=1 after the game's env lines (the server is running
     before them) and falls back to realpath; the function, compiled on this
     host with a stand-in fcntl, behaves that way; the session end clears the
-    switch and unsets it and MADEIRA_UCRT_X64_MATH so a later game of the same
-    app run does not inherit them;
+    switch and unsets it so a later game of the same app run does not inherit it;
   - the catalog documents both switches; Horizon Zero Dawn's list (version 16)
     sets both and no other game's list does.
 """
@@ -130,10 +129,10 @@ i_env = br.find('fprintf(stderr, "[madeira-env] game %s=%s\\n", k.UTF8String, v.
 i_set = br.find('g_madeira_srv_fgetpath = (fp && fp[0] == \'1\') ? 1 : 0;')
 check(0 <= i_env < i_set and 'const char *fp = getenv("MADEIRA_SRV_FGETPATH");' in br[i_env:i_set + 10],
       "the bridge sets it from MADEIRA_SRV_FGETPATH after the game's env lines are applied")
-i_end = br.find('unsetenv("MADEIRA_UCRT_X64_MATH"); unsetenv("MADEIRA_SRV_FGETPATH");')
+i_end = br.find('unsetenv("MADEIRA_SRV_FGETPATH");')
 i_stop = br.find('wineserver_stop();', i_end)
 check(i_end > i_set and 0 <= br.find("g_madeira_srv_fgetpath = 0;", i_end) < i_stop,
-      "the session end unsets MADEIRA_UCRT_X64_MATH and MADEIRA_SRV_FGETPATH and clears the global before the server stops")
+      "the session end unsets MADEIRA_SRV_FGETPATH and clears the global before the server stops")
 
 # Compile the function on this host with a stand-in fcntl that returns a fixed path.
 cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
@@ -197,7 +196,9 @@ others = rec.replace(m.group(0), "") if m else rec
 check("quiet-log" not in re.sub(r"///.*", "", others) and "MADEIRA_SRV_FGETPATH" not in re.sub(r"///.*", "", others),
       "no other game's list sets either switch")
 
-check("python3 tests/host/check-quiet-log.py" in CI.read_text(encoding="utf-8"), "CI runs this check")
+# The CI step exists only in the fork's workflow; upstream has no .github.
+if CI.exists():
+    check("python3 tests/host/check-quiet-log.py" in CI.read_text(encoding="utf-8"), "CI runs this check")
 
 print()
 if failures:

@@ -3284,16 +3284,15 @@ struct LibraryDetail: View {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                     Section { Button("Remove from library", role: .destructive) { remove = true } }
                 }
-                // madeira-bcd: always last, for every game (GameRecommendationsApply.swift).
-                if entry.desktop != true {
-                    Section {
-                        Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
-                            .confirmationDialog(GameRecommendations.question(recommended), isPresented: $confirmReset, titleVisibility: .visible) {
-                                Button("Reset", role: .destructive) { resetToRecommended() }
-                            }
-                    } footer: {
-                        Text(GameRecommendations.note(recommended))
-                    }
+                // madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).
+                Section {
+                    Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
+                        .confirmationDialog(GameRecommendations.question(recommended, desktop: entry.desktop == true),
+                                            isPresented: $confirmReset, titleVisibility: .visible) {
+                            Button("Reset", role: .destructive) { resetToRecommended() }
+                        }
+                } footer: {
+                    Text(GameRecommendations.note(recommended, desktop: entry.desktop == true))
                 }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
             }
@@ -3322,7 +3321,11 @@ struct LibraryDetail: View {
             .task {
                 if entry.graphicsAPI == nil, entry.desktop != true, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
             }
-            .onAppear { migrateEntryOptions(); prepareRecommendation(); reloadBCD() }
+            .onAppear {
+                migrateEntryOptions()
+                prepareRecommendation()
+                reloadBCD()
+            }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
                 guard !leaving, !findCover, !importCover, !remove, !confirmReset else { return }
@@ -4199,7 +4202,8 @@ struct LibraryHUD: View {
             let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
             return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
                                         installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
-                                        waited: Date().timeIntervalSince(hostDue))
+                                        waited: Date().timeIntervalSince(hostDue),
+                                        restartHint: DockInstallers.installsOnly ? DockInstallers.closingWords : nil)
         }
     }
 

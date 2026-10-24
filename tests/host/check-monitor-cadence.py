@@ -14,6 +14,7 @@ Needs python3 and a C compiler with pthreads (CC, default cc).
 """
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 
@@ -85,7 +86,7 @@ with tempfile.TemporaryDirectory() as tmp:
               f'{inventories} inventories in 300 cycles (~10 min)')
 
 # --- textual wiring -----------------------------------------------------------
-assert warmer.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'pages are still warmed every cycle'
+assert len(re.findall(r'for \(o = (?:0|total - tail); o < (?:head|total); o \+= 0x4000\) \{ (?:if \(IOS_POOL_IN_HOLE\(o\)\) continue; )?sink \+= r[wx]\[o\]; touched\+\+; \}', warmer)) == 4, 'pages are still warmed every cycle'
 assert 'if (cycle == 2 || (cycle % ios_warmer_sweep_cycles()) == 0)' in warmer
 assert 'if (cycle == 1 || (ios_warmer_sweep_cycles() == 5 ? (cycle % 15) == 0' in warmer
 assert 'if ((cycle % 5) == 0 && rx)' in warmer, 'the .text sweep keeps its cadence'

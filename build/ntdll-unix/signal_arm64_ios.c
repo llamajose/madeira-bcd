@@ -2513,7 +2513,14 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                         /* unsigned-offset immediate loads, base x18 */
                         case 0xf9400000: /* LDR Xt */
-                            if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
+                            /* The x18 patcher's "via x18" trampoline (mrs x18 / and /
+                             * ldr x18,[x18,#slot] / insn) preempted before its ldr: that
+                             * ldr reads the TSD slot holding the TEB, so x18 gets the TEB
+                             * itself, not the TEB field at the slot's offset. */
+                            if (rt == 18 && rn == 18 && ios_teb_tls_slot_offset &&
+                                fault_addr == (uintptr_t)ios_teb_tls_slot_offset)
+                                state.__x[18] = thread_teb;
+                            else if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
                             emulated = 1; break;
                         case 0xb9400000: /* LDR Wt (zero-extend) */
                             if (rt != 31) state.__x[rt] = *(uint32_t *)ea;
@@ -6519,6 +6526,8 @@ static void ios_install_task_exception_port(void)
 /* Register a Wine "process" thread with the shared Mach exception handler.
  * First call creates the shared port and handler thread.
  * Every call registers the thread and sets its exception ports. */
+static int ios_pc_in_app_text( uint64_t pc );
+
 static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                                                void *trampoline )
 {
@@ -6542,6 +6551,12 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
             if (!ios_mach_align_fault_enabled)
                 ERR("[unaligned-atomic] Mach-path alignment classification DISABLED by "
                     "MADEIRA_MACH_ALIGN_FAULT=0: alignment faults are delivered as c0000005 there\n");
+        }
+
+        {
+            /* the app's __TEXT range for the native-unaligned emulation, resolved here:
+             * dyld's lookups do not belong on the exception thread */
+            ios_pc_in_app_text( 0 );
         }
 
         pthread_t handler;
@@ -7069,13 +7084,20 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
  * TEB pointer is read in this address space, through mach_vm_read_overwrite,
  * so a target that exits meanwhile cannot fault this thread.
  *
- * madeira-bcd: ON by default (the fork's build-213 behaviour, which also
- * returns the snapshot's integer registers when the caller asked for them,
- * as tested on Ghost of Tsushima); MADEIRA_CTX_CPU_AREA=0 turns it off.
- * Upstream ships it opt-in: the snapshot is the thread's last exit from
- * emulated code, not where it is now, so a caller that writes the context
- * back (SetThreadContext, as a .NET runtime redirecting a thread does) would
- * move the thread back there. */
+ * Opt-in, MADEIRA_CTX_CPU_AREA=1 (madeira.cfg env., or a game's own config):
+ * the snapshot is the thread's last exit from emulated code, not where it is
+ * now, so a caller that writes the context back (SetThreadContext, as a .NET
+ * runtime redirecting a thread does) would move the thread back there.
+ *
+ * MADEIRA_CTX_CPU_AREA=2 also returns the snapshot's integer registers when the
+ * caller asked for CONTEXT_INTEGER (the ARM64EC_NT_CONTEXT registers that hold
+ * x64 state: X0-X12, X15, X19-X22 and X25-X27; the others are zeroed) and sets
+ * Cpsr to 0, so the caller gets one x64 state from a single moment instead of
+ * the snapshot's control registers next to the server's integer registers.
+ *
+ * madeira-bcd FORK-ONLY: this fork keeps 2 as the default (unset or empty),
+ * as its game lists were tested with it since build 213 (2026-09-28);
+ * MADEIRA_CTX_CPU_AREA=0 turns it off. */
 static int ctx_peek( void *dst, const void *src, size_t size )
 {
     mach_vm_size_t got = 0;
@@ -7095,11 +7117,13 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
 
     if (on < 0)
     {
-        /* 0: a cross-thread GetThreadContext without control registers keeps rip 0 (upstream's
-         * default). Default on: it gets the target's saved x64 state (a context written back
-         * would rewind the thread there). */
+        /* For a cross-thread GetThreadContext without control registers. 1: the target's
+         * Pc/Sp/Fp/Lr from its last exit from emulated code (upstream's opt-in). 2: also
+         * X0-X12, X15, X19-X22, X25-X27 and Cpsr = 0 from the same snapshot (madeira-bcd's
+         * behaviour). 0 turns it off. madeira-bcd FORK-ONLY: unset means 2 here (upstream: off);
+         * a context written back would rewind the thread. */
         const char *env = getenv( "MADEIRA_CTX_CPU_AREA" );
-        on = !(env && env[0] == '0');
+        on = !env || !*env ? 2 : env[0] == '1' ? 1 : env[0] == '2' ? 2 : 0;
     }
     if (!on) return 0;
     if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL )) return 0;
@@ -7109,7 +7133,7 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
     if (!ctx_peek( &ecp, &cpu->ContextAmd64, sizeof(ecp) ) || !ecp) return 0;
     if (!ctx_peek( &ec, ecp, sizeof(ec) )) return 0;
     if (!ec.Pc || !ec.Sp) return 0;
-    if (needed & (CONTEXT_INTEGER & ~CONTEXT_ARM64))
+    if (on == 2 && (needed & (CONTEXT_INTEGER & ~CONTEXT_ARM64)))
     {
         memset( context->X, 0, sizeof(context->X[0]) * 29 );
         context->X[0] = ec.X0;   context->X[1] = ec.X1;   context->X[2] = ec.X2;   context->X[3] = ec.X3;
@@ -7125,12 +7149,12 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
     context->Lr = ec.Lr;
     context->Sp = ec.Sp;
     context->Pc = ec.Pc;
-    context->Cpsr = 0;
+    if (on == 2) context->Cpsr = 0;
     context->ContextFlags |= CONTEXT_CONTROL;
     if (InterlockedIncrement( &said ) <= 8)
-        ERR_(seh)( "[ctx] madeira-bcd get handle=%p: no control registers from the server; "
-                   "returning the target's saved x64 state rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA=0 turns it off)\n",
-                   handle, (void *)ec.Pc, (void *)ec.Sp );
+        ERR( "[ctx] get handle=%p: no control registers from the server; "
+             "returning the target's saved x64 %s rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA=%d)\n",
+             handle, on == 2 ? "state" : "Pc/Sp/Fp/Lr", (void *)ec.Pc, (void *)ec.Sp, on );
     return 1;
 }
 
@@ -7927,22 +7951,18 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
             }
             /* madeira-bcd: an ordered/exclusive/LSE access in the app's own code
              * (ios_native_unaligned_emulate: the Launcher's `stlr` of build 454).
-             * dladdr names the function for the first few. */
+             * The app offset names the function offline: dladdr would take dyld's
+             * lock on the exception thread for a fault that is recovered. */
             if (ios_native_unaligned_emulate( &uc, a_insn, fault_addr, (uint64_t)pc ))
             {
                 static unsigned long ua_native;
                 PC_sig(&uc) += 4;
                 *state = mc.__ss;
                 if (++ua_native <= 16 || (ua_native % 4096) == 0)
-                {
-                    Dl_info di = { 0 };
-                    const char *fn = dladdr( (const void *)(uintptr_t)pc, &di ) && di.dli_sname ? di.dli_sname : "?";
-                    uint64_t at = di.dli_saddr && fn[0] != '?' ? (uint64_t)pc - (uint64_t)(uintptr_t)di.dli_saddr : 0;
-                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx, %s+0x%llx) insn=0x%08x "
+                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx) insn=0x%08x "
                                 "addr=0x%llx emulated in place, not handed to FEX (#%lu)\n",
-                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo), fn,
-                             (unsigned long long)at, a_insn, (unsigned long long)fault_addr, ua_native );
-                }
+                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo),
+                             a_insn, (unsigned long long)fault_addr, ua_native );
                 return 1;
             }
 
@@ -10050,7 +10070,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      * the range as executable: an executable section here points at
                      * the emulator, a data section with an executable vprot at a
                      * protect it was never told about, a data section without one at
-                     * a wrong jump target (docs/gta5-child-crash.md section 8). */
+                     * a wrong jump target (GTA V Enhanced's NoExec crash). */
                     {
                         extern int ios_image_section_describe( unsigned long long va, char *buf, size_t len,
                                                                unsigned long long *img_base );

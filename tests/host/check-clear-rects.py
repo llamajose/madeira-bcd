@@ -27,7 +27,8 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 pe = (root / 'madeira-d3d12/src/pe/madeira_d3d12.c').read_text()
 metal = (root / 'madeira-d3d12/src/pe/mad_kernels.metal').read_text()
-build = (root / 'tools/build-madeira-d3d12-dll.sh').read_text()
+build_sh = root / 'tools/build-madeira-d3d12-dll.sh'   # the fork's CI build script
+build = build_sh.read_text() if build_sh.exists() else None
 catalog = (root / 'app/Madeira/ConfigCatalog.generated.swift').read_text()
 ok = True
 
@@ -108,8 +109,9 @@ check('the clear shaders sit behind MAD_NO_CLEAR_RECTS, after the other kernels'
       all(('mad_clear_' + n) in guard for n in ('vs(', 'fs_float(', 'fs_uint(', 'fs_sint(', 'fs_depth(')))
 check('the shaders write what the runtime binds: fragment buffer 0, depth(any), a layer per instance',
       guard.count('[[buffer(0)]]') == 4 and '[[depth(any)]]' in guard and '[[render_target_array_index]]' in guard)
-check('the build compiles the helpers again without them when they do not compile',
-      'mad_kernels_metal -DMAD_NO_TEXBUF_PROBE -DMAD_NO_CLEAR_RECTS;' in build and 'mad_kernels_metal ||' in build)
+if build is not None:
+    check('the build compiles the helpers again without them when they do not compile',
+          'mad_kernels_metal -DMAD_NO_TEXBUF_PROBE -DMAD_NO_CLEAR_RECTS;' in build and 'mad_kernels_metal ||' in build)
 check('in the settings catalog, off by default',
       'key: "clear-rects"' in catalog and 'defaultValue: "0"' in catalog[catalog.index('key: "clear-rects"'):][:300])
 

@@ -51,7 +51,8 @@ REQ = (ROOT / "build/wineserver/request_ios.c").read_text(encoding="utf-8")
 NTDLL = (ROOT / "build/ntdll-unix/server_ios.c").read_text(encoding="utf-8")
 BRIDGE = (ROOT / "app/Madeira/WineProcessBridge.m").read_text(encoding="utf-8")
 CAT = (ROOT / "app/Madeira/ConfigCatalog.generated.swift").read_text(encoding="utf-8")
-CI = (ROOT / ".github/workflows/build-ipa.yml").read_text(encoding="utf-8")
+CI_FILE = ROOT / ".github/workflows/build-ipa.yml"   # the fork's CI only; upstream has no .github
+CI = CI_FILE.read_text(encoding="utf-8") if CI_FILE.exists() else None
 
 failures = []
 
@@ -419,7 +420,8 @@ check("volatile int g_madeira_srv_log_all = 0;" in BRIDGE and
 for key in ("env.MADEIRA_SRV_FD_SOCKET", "env.MADEIRA_SRV_LOG_ALL"):
     check(re.search(r'key: "%s", title: "[^"]+", kind: \.bool, defaultValue: "0"' % re.escape(key), CAT) is not None,
           "the catalog documents %s (kill switch, default 0)" % key)
-check("python3 tests/host/check-srv-fd-reply.py" in CI, "CI runs this check")
+if CI is not None:
+    check("python3 tests/host/check-srv-fd-reply.py" in CI, "CI runs this check")
 
 print()
 if failures:

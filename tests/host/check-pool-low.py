@@ -89,7 +89,8 @@ assert 'a < ios_jit_low_rx_global + low' in scan and 'pool_base = ios_jit_low_rw
 assert 'if (ios_jit_low_overlaps( (uintptr_t)a, size )) return 1;' in function(native, 'static int ios_jit_pool_intersects(')
 assert 'ios_jit_low_overlaps( a, size ))) return;' in function(native, 'static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t size,\n                                    int prot, void *retaddr )\n{')
 assert 'if (ios_jit_low_overlaps( b, size )) return 1;' in function(native, 'static int ios_swap_is_fexjit(')
-assert 'if (ios_jit_low_overlaps( p, host_page_size )) return 0;' in function(native, 'IOS_DC_INLINE int ios_dc_prepare(')
+if 'IOS_DC_INLINE int ios_dc_prepare(' in native:   # the decommit helpers (never called) are not upstream
+    assert 'if (ios_jit_low_overlaps( p, host_page_size )) return 0;' in function(native, 'IOS_DC_INLINE int ios_dc_prepare(')
 assert '!ios_jit_low_contains( (uintptr_t)block_begin )' in function(native, 'void ios_mono_bridge_capture(')
 floor = function(native, 'static inline ULONG_PTR ios_usable_va_floor_get(void)')
 assert 'if (ios_jit_low_size_global && sz)' in floor, 'the furniture floor follows the moved pool alias'

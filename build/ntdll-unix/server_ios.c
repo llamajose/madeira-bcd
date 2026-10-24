@@ -3047,9 +3047,9 @@ unsigned int server_call_unlocked( void *req_ptr )
 
     ios_srv_req_count++;
 #ifdef WINE_IOS
+    ios_bg_qos_check();   /* madeira-bcd: [bg-qos] */
     /* killed inside a section (ios_defer_section_abort): no more requests */
     if (ios_section_state() & IOS_SECTION_ABORT) return STATUS_THREAD_IS_TERMINATING;
-    ios_bg_qos_check();   /* madeira-bcd: [bg-qos] */
     if (__atomic_load_n( &g_madeira_srv_direct, __ATOMIC_RELAXED ) > 0 && ios_srv_try_direct( req, &ret ))
         return ret;   /* madeira-bcd: MADEIRA_SRV_DIRECT */
 #endif

@@ -2009,20 +2009,16 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
 {
     NTSTATUS status;
 #ifdef WINE_IOS
-    /* ml845: the engine's thread-naming exception is where a bogus "stack base"
-     * reaches its per-thread state. Watch the slot across this dispatch. */
-    if (rec && rec->ExceptionCode == 0x406D1388)
-    {
-        extern void ios_tlswatch_arm( const char * );
-        ios_tlswatch_arm( "raise 0x406D1388" );
-    }
     /* madeira-bcd: a 64-bit C++ throw carries the image base its ThrowInfo
      * RVAs are relative to (parameter 3, from RtlPcToFileHeader(ThrowInfo)).
      * When the ThrowInfo pointer is a JIT-pool alias of the image (native code
      * computing its own data address runs from the pool copy) no module owns
      * it, the base comes out 0 and __CxxFrameHandler4 faults reading 0+RVA
      * (Ghost of Tsushima: AV READ of 0x16694 in VCRUNTIME140_1 after a save).
-     * Map the pointer back to the PE image and fill in the base. */
+     * Map the pointer back to the PE image and fill in the base. Upstream's
+     * RtlPcToFileHeader patch (ios_patch_rtl_pc_to_file_header) fixes the base
+     * where it is computed; this second layer catches a throw that still
+     * arrives with base 0 or a pool-alias ThrowInfo. */
     if (rec && rec->ExceptionCode == 0xE06D7363 && rec->NumberParameters == 4 && rec->ExceptionInformation[2])
     {
         extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
@@ -2055,6 +2051,13 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
         else if (!how && InterlockedIncrement( &seen ) <= 4)
             ERR_(seh)( "[cxx-throw] ok ThrowInfo %p base %p (addr %p)\n",
                        (void *)info, (void *)base, rec->ExceptionAddress );
+    }
+    /* ml845: the engine's thread-naming exception is where a bogus "stack base"
+     * reaches its per-thread state. Watch the slot across this dispatch. */
+    if (rec && rec->ExceptionCode == 0x406D1388)
+    {
+        extern void ios_tlswatch_arm( const char * );
+        ios_tlswatch_arm( "raise 0x406D1388" );
     }
     /* madeira-bcd: Chromium's out-of-memory exit (SocialClubHelper.exe died of
      * it on the first launch of build 442, on four threads at once). The PE

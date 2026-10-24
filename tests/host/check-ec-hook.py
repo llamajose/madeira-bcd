@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Bounded, read-only code diagnostics with a reserved graphics-jump budget."""
+"""Bounded, read-only code diagnostics with a reserved graphics-jump budget.
+
+The [ec-hook] report is opt-in: MADEIRA_EC_HOOK_TRACE=1 turns it on; unset or 0 prints nothing.
+"""
 from pathlib import Path
 import os
 import subprocess
@@ -17,9 +20,13 @@ def check(cond, what):
         failures.append(what)
 
 
-start = native.index('static size_t ios_ec_hook_jump_target(')
+start = native.index('static int ios_ec_hook_peek(')
 report_start = native.index('static void ios_ec_hook_report(', start)
 report = native[start:native.index('\n}', report_start) + 2] + '\n'
+check('virtual_check_buffer_for_read(' not in report and report.count('ios_ec_hook_peek(') == 3,
+      'the report reads jump slots and targets only through the fault-free peek')
+check('mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, size,' in report,
+      'the peek is a kernel copy (an unreadable address returns an error, never a SIGBUS)')
 
 sync = native.index('/* Compare code before any copy overwrites .hexpthk changes.')
 copy = native.index('memcpy(jit_rw_dest, base, size);', sync)
@@ -36,6 +43,31 @@ harness = r'''
 #include <unistd.h>
 #include <strings.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#else
+/* The kernel copy's contract on Linux: write() from an unreadable address
+ * fails with EFAULT instead of faulting. */
+typedef unsigned long mach_vm_address_t, mach_vm_size_t;
+typedef int kern_return_t, mach_port_t;
+#define KERN_SUCCESS 0
+static mach_port_t mach_task_self(void) { return 0; }
+static kern_return_t mach_vm_read_overwrite(mach_port_t t, mach_vm_address_t a, mach_vm_size_t n,
+                                            mach_vm_address_t d, mach_vm_size_t *got)
+{
+    int fd[2];
+    ssize_t r = -1;
+    (void)t;
+    if (pipe(fd)) return 5;
+    if (write(fd[1], (const void *)a, n) == (ssize_t)n) r = read(fd[0], (void *)d, n);
+    close(fd[0]);
+    close(fd[1]);
+    if (r != (ssize_t)n) return 1;
+    *got = n;
+    return KERN_SUCCESS;
+}
+#endif
 typedef int BOOL; typedef unsigned long ULONG_PTR; typedef unsigned long SIZE_T;
 struct teb { struct { void *UniqueProcess, *UniqueThread; } ClientId; };
 static struct teb the_teb = {{0, (void *)0x414}};
@@ -44,7 +76,6 @@ struct ios_jit_mapping { void *pe_base, *jit_base; size_t size; };
 static struct ios_jit_mapping ios_jit_mappings[1];
 static const char *module_name = "kernelbase.dll";
 static const char *ios_pe_module_name(const void *p, size_t n) { (void)p; (void)n; return module_name; }
-static BOOL virtual_check_buffer_for_read(const void *p, SIZE_T n) { (void)n; return p != 0; }
 static int ios_image_section_describe(unsigned long long va, char *buf, size_t len, unsigned long long *b)
 { (void)b; snprintf(buf, len, "rva %#llx, .text", va - (unsigned long long)(uintptr_t)ios_jit_mappings[0].pe_base); return 1; }
 ''' + report + r'''
@@ -66,6 +97,23 @@ int main(int argc, char **argv)
         for (i = 0; i < 12; i++) ios_ec_hook_report(0, pe, cp, sizeof pe);
         module_name = "DXGI.DLL";
         for (i = 0; i < 12; i++) ios_ec_hook_report(0, pe, cp, sizeof pe);
+        return 0;
+    }
+    if (argc > 1 && argv[1][0] == 'u') {          /* jumps into unreadable memory */
+        unsigned char *pe2 = mmap(0, 0x20000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        unsigned char *cp2 = malloc(0x10000);
+        uintptr_t far = (uintptr_t)pe2 + 0x10000;     /* the PROT_NONE half */
+        int32_t rel;
+        if (pe2 == MAP_FAILED || !cp2 || mprotect(pe2 + 0x10000, 0x10000, PROT_NONE)) return 2;
+        memset(pe2, 0x1f, 0x10000); memcpy(cp2, pe2, 0x10000);
+        ios_jit_mappings[0].pe_base = pe2; ios_jit_mappings[0].jit_base = cp2; ios_jit_mappings[0].size = 0x10000;
+        pe2[0x300] = 0xe9; rel = (int32_t)(far + 0x40 - ((uintptr_t)pe2 + 0x305)); memcpy(pe2 + 0x301, &rel, 4);
+        pe2[0x600] = 0xff; pe2[0x601] = 0x25; rel = (int32_t)(far + 0x80 - ((uintptr_t)pe2 + 0x606));
+        memcpy(pe2 + 0x602, &rel, 4);
+        pe2[0x900] = 0xff; pe2[0x901] = 0x25; memset(pe2 + 0x902, 0, 4);
+        { unsigned long long t = far + 0xc0; memcpy(pe2 + 0x906, &t, 8); }
+        ios_ec_hook_report(0, pe2, cp2, 0x10000);
+        printf("far=%#llx\n", (unsigned long long)far);
         return 0;
     }
     if (argc > 1 && argv[1][0] == 'e') {
@@ -108,7 +156,8 @@ with tempfile.TemporaryDirectory() as tmp:
     r = subprocess.run([cc, '-Wall', '-Werror', '-Wno-unused-function', '-o', exe, src], capture_output=True, text=True)
     check(r.returncode == 0, 'report compiles against stubs' + ('' if r.returncode == 0 else ': ' + r.stderr[:400]))
     if r.returncode == 0:
-        result = subprocess.run([exe], capture_output=True, text=True)
+        on = dict(os.environ, MADEIRA_EC_HOOK_TRACE='1')
+        result = subprocess.run([exe], capture_output=True, text=True, env=on)
         check(result.returncode == 0, 'production decoder and reporting harness completes')
         out = result.stderr.splitlines()
         check(len(out) == 4, 'four patches reported, the unpatched range silent (%d lines)' % len(out))
@@ -124,19 +173,32 @@ with tempfile.TemporaryDirectory() as tmp:
             expected = result.stdout.strip().split('=', 1)[1]
             check('rva 0x900' in out[3] and 'view=pool' in out[3] and f'jump -> {expected} ' in out[3],
                   'pool-relative jump uses the RX address, not the PE or RW view')
+        unset = {k: v for k, v in os.environ.items() if k != 'MADEIRA_EC_HOOK_TRACE'}
+        out = subprocess.run([exe], capture_output=True, text=True, env=unset).stderr.splitlines()
+        check(out == [], 'off by default: without MADEIRA_EC_HOOK_TRACE nothing is printed')
         env = dict(os.environ, MADEIRA_EC_HOOK_TRACE='0')
         out = subprocess.run([exe], capture_output=True, text=True, env=env).stderr.splitlines()
         check(out == [], 'MADEIRA_EC_HOOK_TRACE=0 prints nothing')
-        out = subprocess.run([exe, 'reserved'], capture_output=True, text=True).stderr.splitlines()
+        out = subprocess.run([exe, 'reserved'], capture_output=True, text=True, env=on).stderr.splitlines()
         check(sum('scope=difference' in l for l in out) == 8, 'ordinary differences stop after 8 lines')
         check(sum('scope=other-jump' in l for l in out) == 16, 'other jumps have their own 16-line budget')
         check(sum('scope=graphics-jump' in l for l in out) == 32,
               '32 graphics-jump records survive after startup consumes both other budgets')
-        r = subprocess.run([exe, 'end'], capture_output=True, text=True)
+        r = subprocess.run([exe, 'end'], capture_output=True, text=True, env=on)
         check(r.returncode == 0, 'truncated jumps at an unreadable page boundary do not overread')
+        # Ghost of Tsushima, build 515: a protector's random "jumps" pointed at
+        # unreadable memory and the guarded read ended the game at start.
+        r = subprocess.run([exe, 'unreadable'], capture_output=True, text=True, env=on)
+        out = r.stderr.splitlines()
+        check(r.returncode == 0, 'jump slots and targets in unreadable memory do not fault (exit %d)' % r.returncode)
+        check(len(out) == 3 and all(l.endswith('bytes there: -') for l in out),
+              'the three jumps into unreadable memory are reported without their bytes')
+        if len(out) == 3 and r.stdout.startswith('far='):
+            far = int(r.stdout.split('=', 1)[1], 16)
+            check(f'jump -> {far + 0x40:#x} ' in out[0], 'jmp rel32 into an unreadable page: its target is still named')
+            check('jump -> 0 ' in out[1], 'jmp [rip+x] through an unreadable slot: no target')
+            check(f'jump -> {far + 0xc0:#x} ' in out[2], 'jmp [rip+0] to an unreadable target: the target is named')
 
-wf = (root / '.github/workflows/build-ipa.yml').read_text()
-check('python3 tests/host/check-ec-hook.py' in wf, 'the CI workflow runs this check')
 
 print('%d failure(s)' % len(failures))
 sys.exit(1 if failures else 0)

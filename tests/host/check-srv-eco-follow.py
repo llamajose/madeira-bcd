@@ -37,7 +37,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FD = (ROOT / "build/wineserver/fd_ios.c").read_text(encoding="utf-8")
 BRIDGE = (ROOT / "app/Madeira/WineProcessBridge.m").read_text(encoding="utf-8")
 CAT = (ROOT / "app/Madeira/ConfigCatalog.generated.swift").read_text(encoding="utf-8")
-CI = (ROOT / ".github/workflows/build-ipa.yml").read_text(encoding="utf-8")
+CI_FILE = ROOT / ".github/workflows/build-ipa.yml"   # the fork's CI only; upstream has no .github
+CI = CI_FILE.read_text(encoding="utf-8") if CI_FILE.exists() else None
 
 failures = []
 
@@ -176,7 +177,8 @@ check(re.search(r'key: "env.MADEIRA_SRV_ECO_FOLLOW", title: "[^"]+", kind: \.boo
       "the catalog documents env.MADEIRA_SRV_ECO_FOLLOW, default 0")
 check(re.search(r'key: "env.MADEIRA_SRV_IDLE_US", title: "[^"]+", kind: \.int, defaultValue: "1000"', CAT) is not None,
       "the catalog documents env.MADEIRA_SRV_IDLE_US, default 1000")
-check("python3 tests/host/check-srv-eco-follow.py" in CI, "CI runs this check")
+if CI is not None:
+    check("python3 tests/host/check-srv-eco-follow.py" in CI, "CI runs this check")
 
 print()
 if failures:

@@ -4070,8 +4070,8 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
                     ios_patch_rtl_pc_to_file_header_current( pLdrInitializeThunk );
                 }
                 /* madeira-bcd: and the [exec-req] leave fix (virtual_ios.c,
-                 * opt-in MADEIRA_EXECREQ_LEAVE=1; docs/gta5-child-crash.md
-                 * section 8): GTA V Enhanced runs in such a child. */
+                 * opt-in MADEIRA_EXECREQ_LEAVE=1):
+                 * GTA V Enhanced runs in such a child. */
                 {
                     extern int ios_patch_execreq_leave_current( const void *pe_addr );
                     ios_patch_execreq_leave_current( pLdrInitializeThunk );
