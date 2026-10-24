@@ -1054,6 +1054,7 @@ final class LibraryModel: ObservableObject {
         applyControllerMode()
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
+        ThermalPacing.shared.begin()
         if remember { var played = entry; played.lastPlayed = Date(); save(played) }
         launchDismissLogged = false
         DockStartScreen.shared.begin(dock, at: launchStarted)
@@ -1136,6 +1137,7 @@ final class LibraryModel: ObservableObject {
 
     func setFPS(_ mode: Int) {
         fpsMode = mode
+        ThermalPacing.shared.userChose()
         let applied = ProMotionIntent.supportedMode(mode)
         madeira_set_vsync_locked(applied)
         ProMotionIntent.apply(mode: applied)
@@ -1196,6 +1198,7 @@ final class LibraryModel: ObservableObject {
         LibraryController.shared.configure(enabled: enabled, ownsInput: enabled)
         MetalHostView.shared.isHidden = true
         ProMotionIntent.shared.setActive(false)
+        ThermalPacing.shared.end()
         fputs("[frontend] returned to library\n", stderr)
     }
 }
