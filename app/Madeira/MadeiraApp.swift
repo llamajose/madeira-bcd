@@ -22,6 +22,9 @@ struct MadeiraApp: App {
             if FileManager.default.fileExists(atPath: packs.path) { try? FileManager.default.removeItem(at: packs) }
         }
         UserDefaults.standard.removeObject(forKey: "madeira.packs.enabled")
+        // The new library grid builds its first page before any view's onAppear, so the account's cached library and
+        // playtime are read now: its cards carry their played lines from the first page.
+        if LibraryGridArm.enabled, SteamOwnedLibrary.enabled { SteamOwnedLibrary.shared.start() }
     }
 
     var body: some Scene {
@@ -29,6 +32,7 @@ struct MadeiraApp: App {
             // madeira-bcd FORK-ONLY: RootView (HomeView.swift) puts this fork's home
             // screen in front of ContentView when Settings › Interface asks for it.
             RootView()
+                .background(InteractionFrameRateInstaller())   // touch frame-rate request (New library grid)
                 .modifier(ClaimGamepadEvents())
                 .onAppear {
                     GamepadInput.shared.start()
