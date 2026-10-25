@@ -54,9 +54,15 @@ def check(cond, what):
 
 
 def body_of(src, signature):
-    start = src.index(signature)
-    while ';' in src[start:src.index('{', start)]:   # skip a forward declaration
-        start = src.index(signature, start + 1)
+    # The definition (a '{' follows), not a forward declaration (a ';' follows).
+    start = src.find(signature)
+    while start >= 0:
+        semi, brace = src.find(';', start), src.find('{', start)
+        if brace != -1 and (semi == -1 or brace < semi):
+            break
+        start = src.find(signature, start + 1)
+    if start < 0:
+        raise ValueError(signature)
     brace = src.index('{', start)
     depth = 0
     for i in range(brace, len(src)):

@@ -135,6 +135,19 @@ final class MetalBackedView: UIView {
         keyboardTarget?.layoutIfNeeded()
     }
     override var canBecomeFirstResponder: Bool { true }
+    override var keyCommands: [UIKeyCommand]? {
+        let command = UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(paste(_:)))
+        command.wantsPriorityOverSystemBehavior = true
+        return [command]
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) { return HardwareInput.shared.canPaste && UIPasteboard.general.hasStrings }
+        return super.canPerformAction(action, withSender: sender)
+    }
+    override func paste(_ sender: Any?) {
+        HardwareInput.shared.pasteClipboard()
+    }
+
     static func toggleKeyboard() {
         guard let v = keyboardTarget else { return }
         if v.isFirstResponder { v.resignFirstResponder() }
@@ -1114,40 +1127,15 @@ struct JoystickKeyView: View {
 extension MetalBackedView: UIKeyInput {
     var hasText: Bool { false }
 
-    // US-keyboard VK + shift for a character. Returns nil for chars we can't map.
     static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
-        if ch == "\n" || ch == "\r" { return (0x0D, false) }   // VK_RETURN
-        if ch == "\t" { return (0x09, false) }                 // VK_TAB
-        if ch == " " { return (0x20, false) }                  // VK_SPACE
-        if ch.isLetter, let up = ch.uppercased().first?.asciiValue, up >= 0x41, up <= 0x5A {
-            return (Int32(up), ch.isUppercase)                 // VK_A..VK_Z
-        }
-        if let a = ch.asciiValue, a >= 0x30, a <= 0x39 {
-            return (Int32(a), false)                           // VK_0..VK_9 (unshifted)
-        }
-        let table: [Character: (Int32, Bool)] = [
-            "!": (0x31, true), "@": (0x32, true), "#": (0x33, true), "$": (0x34, true),
-            "%": (0x35, true), "^": (0x36, true), "&": (0x37, true), "*": (0x38, true),
-            "(": (0x39, true), ")": (0x30, true),
-            "-": (0xBD, false), "_": (0xBD, true),
-            "=": (0xBB, false), "+": (0xBB, true),
-            "[": (0xDB, false), "{": (0xDB, true),
-            "]": (0xDD, false), "}": (0xDD, true),
-            "\\": (0xDC, false), "|": (0xDC, true),
-            ";": (0xBA, false), ":": (0xBA, true),
-            "'": (0xDE, false), "\"": (0xDE, true),
-            ",": (0xBC, false), "<": (0xBC, true),
-            ".": (0xBE, false), ">": (0xBE, true),
-            "/": (0xBF, false), "?": (0xBF, true),
-            "`": (0xC0, false), "~": (0xC0, true),
-        ]
-        return table[ch]
+        PasteText.key(for: ch)
     }
 
     func insertText(_ text: String) {
         // A hardware keyboard's presses reach Wine raw (HardwareInput); UIKit
         // also delivers them here as text, which would type every key twice.
         if HardwareInput.shared.handlesTyping { return }
+        HardwareInput.shared.cancelPaste()
         for ch in text {
             guard let (vk, shift) = MetalBackedView.vkForChar(ch) else { continue }
             if shift { winios_post_key(0x10, 1) }   // VK_SHIFT down
@@ -1159,6 +1147,7 @@ extension MetalBackedView: UIKeyInput {
 
     func deleteBackward() {
         if HardwareInput.shared.handlesTyping { return }
+        HardwareInput.shared.cancelPaste()
         winios_post_key(0x08, 1)   // VK_BACK down
         winios_post_key(0x08, 0)
     }
@@ -3081,12 +3070,13 @@ struct ContentView: View {
             }
             var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
             if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
-            // madeira.cfg pool: the JIT pool size in MB (256 to 1152) for every launch; wins over the size above.
-            if let txt = MadeiraConfig.get("pool"),
+            // madeira.cfg pool: the JIT pool size in MB (256 to 1152); wins over the size above. The game's own file wins over madeira.cfg, so a game can size the pool to fit a free run above its executable window and pair it with pool-low.
+            let gamePool = MadeiraConfig.gameValue("pool")
+            if let txt = gamePool ?? MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
                 poolSizeMB = mb
-                logStore.log("JIT pool overridden to \(mb)MB via madeira.cfg pool")
+                logStore.log("JIT pool overridden to \(mb)MB via \(gamePool != nil ? "the game's settings" : "madeira.cfg") pool")
             }
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off
@@ -3700,6 +3690,15 @@ struct ContentView: View {
             let options = await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
             let installFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
             let chosen = options.flatMap { SteamDirectStart.choose($0, installFolder: installFolder)?.launchIndex }
+            // madeira-bcd exe-window-mb: measure the game's own fixed-base exe now, so the
+            // JIT pool is placed above it (StikJITHelper.allocatePool reads this once).
+            if let need = StikJITHelper.fixedBaseWindowMB(in: installFolder) {
+                StikJITHelper.exeWindowAutoMB = need.mb
+                LogStore.shared.log("[exe-window] \(need.exe) is a fixed-base image ending \(need.mb)MB above 0x140000000: "
+                    + "the executable window is widened to \(need.mb)MB for this session (exe-window-mb in the game's file overrides)")
+            } else {
+                StikJITHelper.exeWindowAutoMB = 0
+            }
             let launchOption = chosen ?? 0
             LogStore.shared.log("[madeira-dock] launch option \(launchOption)\(chosen == nil ? " (none chosen: the default)" : "")")
             await SteamOwnedLibrary.shared.prepareDock()
