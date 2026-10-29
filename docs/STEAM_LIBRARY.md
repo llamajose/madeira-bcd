@@ -208,6 +208,45 @@ Any other session also pauses downloads and closes the connection
 (`runWineFullSequence`). Madeira does not start more than one session per app
 run (`docs/LIBRARY.md`).
 
+## From a PC on this network
+
+Settings › Steam › **PC on this network** takes the IPv4 address of a PC
+whose Steam client has the game installed and up to date. A download then
+asks that PC first, through Steam's own local network game transfers, and
+takes from the content servers only what the PC does not serve. Empty (the
+default) downloads from the content servers only. On the PC: the same Steam
+account, Settings › Downloads › Game file transfer over local network on, and
+no download or game running (Valve's client serves only while idle).
+
+The code is `app/Madeira/SwiftSteam/Content/SteamLANPeer.swift` and the
+`[steam-lan]` part of `DepotDownloader.install`. The messages and fields are
+Valve's (SteamDatabase protobufs: `steammessages_remoteclient_discovery`,
+`steammessages_contentsystem.steamclient`, `steammessages_clientlanp2p`):
+
+1. **Discovery.** A `CMsgRemoteClientBroadcastDiscovery` datagram goes
+   straight to the PC's UDP port 27036, not as a broadcast: iOS gives
+   sideloaded apps no multicast entitlement, which is why the address is
+   entered once. The PC answers with its status: remote client ID, host name
+   and signed-in accounts. This device's own client ID is random and kept
+   (`madeira.steam.lanClientID`).
+2. **Opening the PC's content server.** `ContentServerDirectory.RequestPeerContentServer`
+   on the app's Steam connection, with both client IDs, the account, the App
+   ID and the build, returns a TCP port (27040 on Windows), the depots the PC
+   has and an access token.
+3. **Chunks.** On that TCP connection, `k_EMsgClientPeerChunkRequest` (9902:
+   app, depot, chunk SHA-1, access token) and `k_EMsgClientPeerChunkResponse`
+   (9903), framed like every Steam TCP message (length, `VT01`, message type
+   with the protobuf flag, header length 0, body). Valve's client sends the
+   chunk decrypted and still compressed; it is decompressed, checked against
+   the manifest's Adler-32 and the chunk's SHA-1, and written like a chunk
+   from a content server.
+
+A chunk the PC fails to send is fetched from the content servers. After
+four failures in a row the PC is dropped for the rest of that download. Log:
+`[steam-lan] pc ...` (the PC's answer, `same-account=1` when its Steam is
+signed in to this account), `open ... port=... depots=...` (Steam opened it),
+`skip: ...` (why not), `off ...` and `done ... chunks= bytes= failures=`.
+
 ## Downloads in the background
 
 On iOS 26 and later, a download submits a `BGContinuedProcessingTask` when it

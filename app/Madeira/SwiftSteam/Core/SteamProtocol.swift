@@ -52,6 +52,8 @@ enum EMsg: UInt32 {
 enum SteamServiceMethod: String {
     case getManifestRequestCode = "ContentServerDirectory.GetManifestRequestCode#1"
     case getCDNAuthToken = "ContentServerDirectory.GetCDNAuthToken#1"
+    /// Opens a PC's Steam content server for this account on the local network (SteamLANPeer).
+    case requestPeerContentServer = "ContentServerDirectory.RequestPeerContentServer#1"
     /// The account's own playtime and last-played times.
     case getOwnedGames = "Player.GetOwnedGames#1"
     /// The account's Steam Cloud file list for one app.

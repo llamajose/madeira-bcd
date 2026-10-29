@@ -85,7 +85,7 @@ library_swift = [
     'SwiftSteam/Core/CMServerList.swift', 'SwiftSteam/Core/LicenseListBox.swift', 'SwiftSteam/Core/SteamCMSession.swift',
     'SwiftSteam/Core/SteamConnection.swift', 'SwiftSteam/Core/SteamMessageCodec.swift', 'SwiftSteam/Core/SteamProtocol.swift',
     'SwiftSteam/Core/SteamSession.swift', 'SwiftSteam/Content/ContentDecryptor.swift', 'SwiftSteam/Content/DepotDownloader.swift',
-    'SwiftSteam/Content/DepotManifest.swift', 'SwiftSteam/Library/SteamAppInfo.swift',
+    'SwiftSteam/Content/DepotManifest.swift', 'SwiftSteam/Content/SteamLANPeer.swift', 'SwiftSteam/Library/SteamAppInfo.swift',
     'SwiftSteam/Library/SteamLibraryFetcher.swift', 'SwiftSteam/Install/AppManifestWriter.swift']
 c_files = ['SwiftSteam/chunk_zip.c', 'SwiftSteam/chunk_zip.h', 'SwiftSteam/lzma_shim.c', 'SwiftSteam/lzma_shim.h',
            'SwiftSteam/zstd_edu.c', 'SwiftSteam/zstd_edu.h']

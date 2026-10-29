@@ -162,7 +162,15 @@ final class DepotDownloader {
             if available < remaining { throw SteamError.insufficientDiskSpace(needed: remaining, available: available) }
         }
 
-        // 3. Chunks.
+        // 3. Chunks: from a PC on this network first when one is set
+        // (SteamLANPeer), from the content servers for the rest.
+        let peer = await lanPeerSource(appID: app.appID, buildID: app.buildID, depots: Set(plans.map(\.depotID)))
+        defer {
+            if let peer {
+                peer.close()
+                SteamLog.event("[steam-lan] done app=\(app.appID) chunks=\(peer.chunks) bytes=\(peer.bytes) failures=\(peer.failures) used=\(peer.usable ? 1 : 0)")
+            }
+        }
         let started = Date()
         let resumedBytes = state.doneBytes
         var lastReport = Date.distantPast
@@ -183,7 +191,7 @@ final class DepotDownloader {
                     let verify = existing[item.file]
                     group.addTask {
                         if verify, Self.chunkAlreadyPresent(chunk, path: path) { return (item.key, UInt64(chunk.compressedSize)) }
-                        try await Self.fetchChunk(chunk, plan: plan, path: path, attempts: attempts, seed: item.file &+ item.chunk)
+                        try await Self.fetchChunk(chunk, plan: plan, peer: peer, path: path, attempts: attempts, seed: item.file &+ item.chunk)
                         return (item.key, UInt64(chunk.compressedSize))
                     }
                 }
@@ -389,8 +397,22 @@ final class DepotDownloader {
         return Data(digest) == chunk.sha
     }
 
-    private nonisolated static func fetchChunk(_ chunk: DepotManifest.ChunkEntry, plan: DepotPlan,
+    private nonisolated static func fetchChunk(_ chunk: DepotManifest.ChunkEntry, plan: DepotPlan, peer: SteamPeerChunkSource? = nil,
                                                path: String, attempts: Int, seed: Int) async throws {
+        if let peer, peer.serves(plan.depotID) {
+            do {
+                try await fetchChunkFromPeer(chunk, plan: plan, peer: peer, path: path)
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                SteamLog.trace("chunk from the PC failed: \(failureReason(error))")
+                if peer.recordFailure() {
+                    SteamLog.event("[steam-lan] off host=\(peer.host) after \(peer.failures) failures; content servers only")
+                }
+            }
+        }
         var lastError: Error = SteamError.chunkDownloadFailed("No content server responded.")
         for attempt in 0..<max(1, attempts) {
             try Task.checkCancellation()
@@ -418,6 +440,76 @@ final class DepotDownloader {
             }
         }
         throw lastError
+    }
+
+    /// One chunk from the PC's Steam client. Valve's client sends it decrypted
+    /// and still compressed (`encrypted` false); the bytes are checked against
+    /// the manifest's checksum and the chunk's SHA-1 before they are written.
+    private nonisolated static func fetchChunkFromPeer(_ chunk: DepotManifest.ChunkEntry, plan: DepotPlan,
+                                                       peer: SteamPeerChunkSource, path: String) async throws {
+        let response = try await peer.fetch(depotID: plan.depotID, sha: chunk.sha)
+        guard response.result == 1 else { throw SteamError.chunkDownloadFailed("The PC answered \(response.result).") }
+        let expected = Int(chunk.uncompressedSize)
+        let data: Data
+        if response.encrypted {
+            data = try ContentDecryptor.processChunk(encryptedData: response.data, depotKey: plan.key,
+                                                     expectedCRC: chunk.crc, expectedSize: expected)
+        } else {
+            let raw = response.compressed || response.data.count != expected
+                ? try ContentDecryptor.decompressChunk(compressedData: response.data, expectedSize: expected)
+                : response.data
+            if chunk.crc != 0, ContentDecryptor.adler32(raw) != chunk.crc { throw SteamError.checksumMismatch }
+            data = raw
+        }
+        guard data.count == expected, sha1(data) == chunk.sha else { throw SteamError.checksumMismatch }
+        try write(data, to: path, offset: chunk.offset)
+        peer.recordSuccess(bytes: response.data.count)
+    }
+
+    private nonisolated static func sha1(_ data: Data) -> Data {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        data.withUnsafeBytes { _ = CC_SHA1($0.baseAddress, CC_LONG(data.count), &digest) }
+        return Data(digest)
+    }
+
+    /// The PC set in Settings › Steam, asked for its status and opened by Steam
+    /// for this app. nil (content servers only) when none is set, it does not
+    /// answer, or Steam refuses.
+    private func lanPeerSource(appID: UInt32, buildID: UInt32, depots: Set<UInt32>) async -> SteamPeerChunkSource? {
+        let host = SteamLANSetting.host
+        guard !host.isEmpty else { return nil }
+        guard SteamLANSetting.isValidAddress(host) else {
+            SteamLog.event("[steam-lan] skip: '\(host)' is not an IPv4 address")
+            return nil
+        }
+        let localID = SteamLANSetting.localClientID
+        let status = await Task.detached(priority: .userInitiated) {
+            SteamLANPeer.discover(host: host, clientID: localID)
+        }.value
+        guard let status else {
+            SteamLog.event("[steam-lan] skip: no Steam client answered at \(host):\(SteamLANPeer.discoveryPort)")
+            return nil
+        }
+        do {
+            try await session.ensureConnected()
+            let steamID = session.steamID
+            SteamLog.event("[steam-lan] pc host=\(host) name=\(status.hostname) client=\(status.clientID) users=\(status.users.count) same-account=\(status.users.contains(steamID) ? 1 : 0)")
+            let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: status.clientID,
+                                                      appID: appID, buildID: buildID)
+            let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
+            let server = try SteamLANPeer.parsePeerServerResponse(reply)
+            guard server.port != 0, server.accessToken != 0 else {
+                SteamLog.event("[steam-lan] skip: Steam did not open the PC's content server app=\(appID) (bytes=\(reply.count))")
+                return nil
+            }
+            let served = server.depots.isEmpty ? depots : server.depots.intersection(depots)
+            SteamLog.event("[steam-lan] open app=\(appID) port=\(server.port) depots=\(served.sorted().map(String.init).joined(separator: ",")) pc-depots=\(server.depots.count)")
+            guard !served.isEmpty else { return nil }
+            return SteamPeerChunkSource(host: host, port: server.port, appID: appID, depots: served, accessToken: server.accessToken)
+        } catch {
+            SteamLog.event("[steam-lan] skip: request failed (\(Self.failureReason(error)))")
+            return nil
+        }
     }
 
     private nonisolated static func failureReason(_ error: Error) -> String {
