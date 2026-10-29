@@ -295,6 +295,37 @@ enum SteamLANPeer {
         return (apps, ip)
     }
 
+    /// One line for a RemoteClientSteamClient notification Steam pushed to
+    /// this device: who sent it and, for a relayed discovery packet, what it says.
+    static func describeRelayed(method: String, body: Data) -> String {
+        var steamID: UInt64 = 0, clientID: UInt64 = 0, payload = Data()
+        var decoder = ProtobufDecoder(body)
+        fields: while let tag = try? decoder.readTag() {
+            switch (tag.fieldNumber, tag.wireType) {
+            case (1, .fixed64): steamID = (try? decoder.readFixed64()) ?? 0
+            case (2, .fixed64): clientID = (try? decoder.readFixed64()) ?? 0
+            case (3, .lengthDelimited): payload = (try? decoder.readBytes()) ?? Data()
+            default: if (try? decoder.skip(wireType: tag.wireType)) == nil { break fields }
+            }
+        }
+        let name = method.replacingOccurrences(of: "RemoteClientSteamClient.", with: "")
+        var line = "\(name) bytes=\(body.count) from-client=\(clientID) same-account=\(steamID == 0 ? "?" : "1") payload=\(payload.count)"
+        if payload.count >= 16, Array(payload.prefix(8)) == discoveryMagic {
+            let headerLength = Int(read32([UInt8](payload), 8))
+            var type: UInt64 = 99
+            if headerLength >= 0, 12 + headerLength <= payload.count {
+                var h = ProtobufDecoder(payload.subdata(in: payload.startIndex + 12 ..< payload.startIndex + 12 + headerLength))
+                while let t = try? h.readTag() {
+                    if t.fieldNumber == 2, t.wireType == .varint { type = (try? h.readVarint()) ?? 99 }
+                    else if (try? h.skip(wireType: t.wireType)) == nil { break }
+                }
+            }
+            line += " discovery-type=\(type)"
+            if let status = parseStatus(payload) { line += " status host=\(status.hostname) client=\(status.clientID)" }
+        }
+        return line
+    }
+
     // MARK: RemoteClient service
 
     /// CRemoteClient_Online_Notification: this device as a remote client of `steamID`.

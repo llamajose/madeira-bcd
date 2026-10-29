@@ -670,6 +670,13 @@ class SteamSession {
             SteamLog.trace("ServiceMethodResponse not matched: jobTarget=\(message.header.jobidTarget), pending=\(Array(pendingJobs.keys))")
         }
 
+        // What Steam relays between this account's devices (SteamLANPeer):
+        // the other clients' discovery answers and connection packets.
+        if message.rawEMsg == EMsg.serviceMethod.rawValue, message.header.targetJobName.hasPrefix("RemoteClientSteamClient.") {
+            SteamLog.event("[steam-lan] relayed \(SteamLANPeer.describeRelayed(method: message.header.targetJobName, body: message.body))")
+            return
+        }
+
         // Dispatch to registered handlers
         if let handler = messageHandlers[message.rawEMsg] {
             handler(message)
