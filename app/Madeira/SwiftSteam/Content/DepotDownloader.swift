@@ -498,7 +498,14 @@ final class DepotDownloader {
         do {
             try await session.ensureConnected()
             let online = SteamLANPeer.onlineNotification(steamID: session.steamID, localClientID: localID, name: "Madeira")
-            _ = try? await session.callServiceMethod(method: .remoteClientNotifyOnline, body: online, timeout: 3)
+            // NotifyOnline returns NoResponse: sent as a notification, not a call.
+            do {
+                try await session.sendServiceNotification(method: .remoteClientNotifyOnline, body: online)
+                SteamLog.event("[steam-lan] RemoteClient.NotifyOnline sent client=\(localID)")
+            } catch {
+                SteamLog.event("[steam-lan] RemoteClient.NotifyOnline not sent (\(Self.failureReason(error)))")
+            }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             let reply = try await session.callServiceMethod(method: .remoteClientGetRecentClients, body: Data(), timeout: 10)
             recent = (try? SteamLANPeer.parseRecentClients(reply)) ?? []
             let listed = recent.prefix(8).map { "\($0.name.isEmpty ? "?" : $0.name)=\($0.clientID)\($0.online ? "*" : "")" }
@@ -524,12 +531,28 @@ final class DepotDownloader {
         do {
             try await session.ensureConnected()
             let steamID = session.steamID
-            let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: serverClientID,
-                                                      appID: appID, buildID: buildID)
-            let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
-            let server = try SteamLANPeer.parsePeerServerResponse(reply)
+            // What Steam knows of the PC: the apps it serves and its public IP.
+            if let info = try? await session.callServiceMethod(
+                method: .getPeerContentInfo,
+                body: SteamLANPeer.peerContentInfoRequest(localClientID: localID, steamID: steamID, serverClientID: serverClientID),
+                timeout: 10), let parsed = try? SteamLANPeer.parsePeerContentInfo(info) {
+                SteamLog.event("[steam-lan] pc info apps=\(parsed.apps.count) has-app=\(parsed.apps.contains(appID) ? 1 : 0) public-ip=\(parsed.publicIP.isEmpty ? "-" : "set") (bytes=\(info.count))")
+            }
+            // First as this device's client ID, then without one (Steam may
+            // not know this device as a client yet).
+            var server = SteamLANPeer.PeerServer()
+            var replyBytes = 0
+            for (variant, clientID) in [("client", localID), ("no-client", UInt64(0))] {
+                let body = SteamLANPeer.peerServerRequest(localClientID: clientID, steamID: steamID, serverClientID: serverClientID,
+                                                          appID: appID, buildID: buildID)
+                let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
+                server = try SteamLANPeer.parsePeerServerResponse(reply)
+                replyBytes = reply.count
+                SteamLog.event("[steam-lan] peer request \(variant): bytes=\(reply.count) port=\(server.port)")
+                if server.port != 0, server.accessToken != 0 { break }
+            }
             guard server.port != 0, server.accessToken != 0 else {
-                SteamLog.event("[steam-lan] skip: Steam did not open the PC's content server app=\(appID) (bytes=\(reply.count))")
+                SteamLog.event("[steam-lan] skip: Steam did not open the PC's content server app=\(appID) (bytes=\(replyBytes))")
                 return nil
             }
             let served = server.depots.isEmpty ? depots : server.depots.intersection(depots)

@@ -583,13 +583,25 @@ class SteamSession {
         }
 
         if response.header.eresult != 1 {
-            if method.rawValue.hasPrefix("RemoteClient.") || method == .requestPeerContentServer {
+            if method.rawValue.hasPrefix("RemoteClient.") || method == .requestPeerContentServer || method == .getPeerContentInfo {
                 SteamLog.event("[steam-lan] \(method.rawValue) eresult=\(response.header.eresult)")
             } else {
                 SteamLog.trace("\(method.rawValue) header eresult=\(response.header.eresult)")
             }
         }
         return response.body
+    }
+
+    /// A unified-service notification (a method that returns NoResponse):
+    /// no source job, so the CM neither answers nor rejects it as a call.
+    func sendServiceNotification(method: SteamServiceMethod, body: Data) async throws {
+        resetIdleTimer()
+        var header = CMsgProtoBufHeader()
+        header.steamid = steamID
+        header.clientSessionid = sessionID
+        header.targetJobName = method.rawValue
+        let data = SteamMessageCodec.encode(eMsg: .serviceMethodCallFromClient, header: header, body: body)
+        try await connection.send(data)
     }
 
     /// Send a message without waiting for response

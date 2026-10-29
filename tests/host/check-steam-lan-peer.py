@@ -95,6 +95,9 @@ func unhex(_ s: String) -> Data {
         case "peer-request":
             print(hex(SteamLANPeer.peerServerRequest(localClientID: 5, steamID: 76561199130358928,
                                                      serverClientID: 0x1234567890ABCDEF, appID: 1796470, buildID: 20000)))
+        case "peer-info":
+            let r = try! SteamLANPeer.parsePeerContentInfo(unhex(args[2]))
+            print("\(r.apps.sorted().map(String.init).joined(separator: ",")) \(r.publicIP)")
         case "fetch":
             let source = SteamPeerChunkSource(host: "127.0.0.1", port: UInt16(args[2])!, appID: UInt32(args[3])!,
                                               depots: [UInt32(args[4])!], accessToken: UInt64(args[6])!)
@@ -152,6 +155,9 @@ with tempfile.TemporaryDirectory() as tmp:
     require(run('peer-request') == (field(1, 0, 5) + field(2, 0, 76561199130358928) + field(3, 0, 0x1234567890ABCDEF) +
                                     field(4, 0, 1796470) + field(5, 0, 20000)).hex(),
             'the RequestPeerContentServer request carries both client IDs, the account, the app and the build')
+
+    require(run('peer-info', (field(1, 2, varint(361420) + varint(1796470)) + field(2, 2, b'73.2.58.169')).hex()) ==
+            '361420,1796470 73.2.58.169', 'GetPeerContentInfo answer: the PC\'s apps and public IP')
 
     # A scripted PC: answers one stale chunk first (another SHA), then the requested one.
     payload = b'PK\x03\x04' + bytes(range(64))

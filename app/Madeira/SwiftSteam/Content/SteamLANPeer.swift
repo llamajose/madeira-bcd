@@ -268,6 +268,33 @@ enum SteamLANPeer {
         return server
     }
 
+    /// CContentServerDirectory_GetPeerContentInfo_Request.
+    static func peerContentInfoRequest(localClientID: UInt64, steamID: UInt64, serverClientID: UInt64) -> Data {
+        var body = ProtobufEncoder()
+        body.writeUInt64(fieldNumber: 1, value: localClientID)    // remote_client_id
+        body.writeUInt64(fieldNumber: 2, value: steamID)          // steamid
+        body.writeUInt64(fieldNumber: 3, value: serverClientID)   // server_remote_client_id
+        return body.data
+    }
+
+    /// CContentServerDirectory_GetPeerContentInfo_Response: the apps the PC
+    /// serves and its public IP.
+    static func parsePeerContentInfo(_ data: Data) throws -> (apps: Set<UInt32>, publicIP: String) {
+        var apps = Set<UInt32>(), ip = ""
+        var decoder = ProtobufDecoder(data)
+        while let tag = try decoder.readTag() {
+            switch (tag.fieldNumber, tag.wireType) {
+            case (1, .varint): apps.insert(UInt32(truncatingIfNeeded: try decoder.readVarint()))
+            case (1, .lengthDelimited):
+                var packed = ProtobufDecoder(try decoder.readBytes())
+                while !packed.isAtEnd { apps.insert(UInt32(truncatingIfNeeded: try packed.readVarint())) }
+            case (2, .lengthDelimited): ip = try decoder.readString()
+            default: try decoder.skip(wireType: tag.wireType)
+            }
+        }
+        return (apps, ip)
+    }
+
     // MARK: RemoteClient service
 
     /// CRemoteClient_Online_Notification: this device as a remote client of `steamID`.

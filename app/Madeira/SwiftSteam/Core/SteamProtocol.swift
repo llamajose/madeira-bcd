@@ -54,6 +54,8 @@ enum SteamServiceMethod: String {
     case getCDNAuthToken = "ContentServerDirectory.GetCDNAuthToken#1"
     /// Opens a PC's Steam content server for this account on the local network (SteamLANPeer).
     case requestPeerContentServer = "ContentServerDirectory.RequestPeerContentServer#1"
+    /// Which apps a PC on this account serves, and its public IP (SteamLANPeer).
+    case getPeerContentInfo = "ContentServerDirectory.GetPeerContentInfo#1"
     /// Tells Steam this device is a remote client of the account, with its client ID (SteamLANPeer).
     case remoteClientNotifyOnline = "RemoteClient.NotifyOnline#1"
     /// The account's Steam clients and their remote client IDs (SteamLANPeer).
