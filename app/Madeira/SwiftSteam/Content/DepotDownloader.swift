@@ -488,6 +488,8 @@ final class DepotDownloader {
             return nil
         }
         let localID = SteamLANSetting.localClientID
+        let lan = CMsgClientLogon.localIPv4()
+        SteamLog.event("[steam-lan] this device lan-ip=\(lan.ip >> 24).\((lan.ip >> 16) & 0xFF).\((lan.ip >> 8) & 0xFF).\(lan.ip & 0xFF) iface=\(lan.interface)")
         let report = await Task.detached(priority: .userInitiated) {
             SteamLANPeer.discover(host: host, clientID: localID)
         }.value
