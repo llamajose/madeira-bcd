@@ -25,4 +25,11 @@ protocol SteamCMSession: AnyObject {
     func sendAndWaitPICS(eMsg: EMsg, body: Data, timeout: TimeInterval) async throws -> [SteamMessageCodec.IncomingMessage]
     /// Calls a unified-service method and returns the response body.
     func callServiceMethod(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> Data
+    /// Sends a unified-service notification (a method without a response).
+    func sendServiceNotification(method: SteamServiceMethod, body: Data) async throws
+}
+
+extension SteamCMSession {
+    /// Sessions that never send notifications (scripted ones in tests) need not implement it.
+    func sendServiceNotification(method: SteamServiceMethod, body: Data) async throws {}
 }
