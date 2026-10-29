@@ -54,6 +54,10 @@ enum SteamServiceMethod: String {
     case getCDNAuthToken = "ContentServerDirectory.GetCDNAuthToken#1"
     /// Opens a PC's Steam content server for this account on the local network (SteamLANPeer).
     case requestPeerContentServer = "ContentServerDirectory.RequestPeerContentServer#1"
+    /// Tells Steam this device is a remote client of the account, with its client ID (SteamLANPeer).
+    case remoteClientNotifyOnline = "RemoteClient.NotifyOnline#1"
+    /// The account's Steam clients and their remote client IDs (SteamLANPeer).
+    case remoteClientGetRecentClients = "RemoteClient.GetRecentClients#1"
     /// The account's own playtime and last-played times.
     case getOwnedGames = "Player.GetOwnedGames#1"
     /// The account's Steam Cloud file list for one app.

@@ -268,6 +268,52 @@ enum SteamLANPeer {
         return server
     }
 
+    // MARK: RemoteClient service
+
+    /// CRemoteClient_Online_Notification: this device as a remote client of `steamID`.
+    static func onlineNotification(steamID: UInt64, localClientID: UInt64, name: String) -> Data {
+        var details = ProtobufEncoder()
+        details.writeString(fieldNumber: 1, value: name)        // device_friendly_name
+        var body = ProtobufEncoder()
+        body.writeFixed64(fieldNumber: 1, value: steamID)       // steamid
+        body.writeFixed64(fieldNumber: 2, value: localClientID) // remote_client_id
+        body.writeSubmessage(fieldNumber: 3, value: details.data)
+        return body.data
+    }
+
+    struct RecentClient: Sendable, Equatable {
+        var clientID: UInt64 = 0
+        var name = ""
+        var online = false
+    }
+
+    /// CRemoteClient_GetRecentClients_Response.
+    static func parseRecentClients(_ data: Data) throws -> [RecentClient] {
+        var clients: [RecentClient] = []
+        var decoder = ProtobufDecoder(data)
+        while let tag = try decoder.readTag() {
+            guard tag.fieldNumber == 1, tag.wireType == .lengthDelimited else { try decoder.skip(wireType: tag.wireType); continue }
+            var client = RecentClient()
+            var c = ProtobufDecoder(try decoder.readBytes())
+            while let t = try c.readTag() {
+                switch (t.fieldNumber, t.wireType) {
+                case (1, .fixed64): client.clientID = try c.readFixed64()
+                case (1, .varint): client.clientID = try c.readVarint()
+                case (2, .lengthDelimited):
+                    var d = ProtobufDecoder(try c.readBytes())
+                    while let dt = try d.readTag() {
+                        if dt.fieldNumber == 1, dt.wireType == .lengthDelimited { client.name = try d.readString() }
+                        else { try d.skip(wireType: dt.wireType) }
+                    }
+                case (8, .varint): client.online = try c.readVarint() != 0
+                default: try c.skip(wireType: t.wireType)
+                }
+            }
+            clients.append(client)
+        }
+        return clients
+    }
+
     // MARK: TCP framing
 
     /// One Steam TCP frame around a protobuf message with an empty header.

@@ -491,6 +491,21 @@ final class DepotDownloader {
         let report = await Task.detached(priority: .userInitiated) {
             SteamLANPeer.discover(host: host, clientID: localID)
         }.value
+        // Steam's own list of this account's clients: logged, and the PC's
+        // ID when discovery cannot reach it. Before that, this device says it
+        // is one of them, as Valve's client does when it signs in.
+        var recent: [SteamLANPeer.RecentClient] = []
+        do {
+            try await session.ensureConnected()
+            let online = SteamLANPeer.onlineNotification(steamID: session.steamID, localClientID: localID, name: "Madeira")
+            _ = try? await session.callServiceMethod(method: .remoteClientNotifyOnline, body: online, timeout: 3)
+            let reply = try await session.callServiceMethod(method: .remoteClientGetRecentClients, body: Data(), timeout: 10)
+            recent = (try? SteamLANPeer.parseRecentClients(reply)) ?? []
+            let listed = recent.prefix(8).map { "\($0.name.isEmpty ? "?" : $0.name)=\($0.clientID)\($0.online ? "*" : "")" }
+            SteamLog.event("[steam-lan] recent clients=\(recent.count) self-listed=\(recent.contains { $0.clientID == localID } ? 1 : 0) \(listed.joined(separator: " "))")
+        } catch {
+            SteamLog.event("[steam-lan] recent clients: request failed (\(Self.failureReason(error)))")
+        }
         let serverClientID: UInt64
         if let status = report.status {
             serverClientID = status.clientID
@@ -499,6 +514,9 @@ final class DepotDownloader {
         } else if SteamLANSetting.peerClientID != 0 {
             serverClientID = SteamLANSetting.peerClientID
             SteamLog.event("[steam-lan] no discovery answer from \(host):\(SteamLANPeer.discoveryPort) (\(report.note)); using the saved client=\(serverClientID)")
+        } else if let pc = recent.first(where: { $0.online && $0.clientID != localID }) {
+            serverClientID = pc.clientID
+            SteamLog.event("[steam-lan] no discovery answer from \(host):\(SteamLANPeer.discoveryPort) (\(report.note)); using Steam's online client \(pc.name)=\(pc.clientID)")
         } else {
             SteamLog.event("[steam-lan] skip: no Steam client answered at \(host):\(SteamLANPeer.discoveryPort) (\(report.note))")
             return nil

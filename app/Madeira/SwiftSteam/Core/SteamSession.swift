@@ -583,7 +583,11 @@ class SteamSession {
         }
 
         if response.header.eresult != 1 {
-            SteamLog.trace("\(method.rawValue) header eresult=\(response.header.eresult)")
+            if method.rawValue.hasPrefix("RemoteClient.") || method == .requestPeerContentServer {
+                SteamLog.event("[steam-lan] \(method.rawValue) eresult=\(response.header.eresult)")
+            } else {
+                SteamLog.trace("\(method.rawValue) header eresult=\(response.header.eresult)")
+            }
         }
         return response.body
     }
