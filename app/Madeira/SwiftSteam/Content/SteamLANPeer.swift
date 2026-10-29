@@ -301,6 +301,8 @@ enum SteamLANPeer {
     static func onlineNotification(steamID: UInt64, localClientID: UInt64, name: String) -> Data {
         var details = ProtobufEncoder()
         details.writeString(fieldNumber: 1, value: name)        // device_friendly_name
+        details.writeInt32(fieldNumber: 2, value: -102)         // os_type: macOS, as at logon
+        details.writeUInt32(fieldNumber: 3, value: 1)           // gaming_device_type: standard PC
         var body = ProtobufEncoder()
         body.writeFixed64(fieldNumber: 1, value: steamID)       // steamid
         body.writeFixed64(fieldNumber: 2, value: localClientID) // remote_client_id

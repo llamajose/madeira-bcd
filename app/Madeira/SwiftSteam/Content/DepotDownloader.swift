@@ -551,6 +551,16 @@ final class DepotDownloader {
                 SteamLog.event("[steam-lan] peer request \(variant): bytes=\(reply.count) port=\(server.port)")
                 if server.port != 0, server.accessToken != 0 { break }
             }
+            if server.port == 0 || server.accessToken == 0 {
+                // Diagnostic: the same request to the account's other online
+                // clients, to tell a refusal of this device from one of the PC.
+                for other in recent.filter({ $0.online && $0.clientID != localID && $0.clientID != serverClientID }).prefix(2) {
+                    let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: other.clientID,
+                                                              appID: appID, buildID: buildID)
+                    let reply = (try? await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 10)) ?? Data()
+                    SteamLog.event("[steam-lan] probe \(other.name)=\(other.clientID): bytes=\(reply.count)")
+                }
+            }
             guard server.port != 0, server.accessToken != 0 else {
                 SteamLog.event("[steam-lan] skip: Steam did not open the PC's content server app=\(appID) (bytes=\(replyBytes))")
                 return nil
