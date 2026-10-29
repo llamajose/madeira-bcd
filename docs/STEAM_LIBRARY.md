@@ -228,7 +228,12 @@ Valve's (SteamDatabase protobufs: `steammessages_remoteclient_discovery`,
    sideloaded apps no multicast entitlement, which is why the address is
    entered once. The PC answers with its status: remote client ID, host name
    and signed-in accounts. This device's own client ID is random and kept
-   (`madeira.steam.lanClientID`).
+   (`madeira.steam.lanClientID`). The PC's client ID is kept from its answer
+   (`madeira.steam.lanPeerClientID`); when the PC does not answer, the kept or
+   hand-entered ID (Settings › Steam › PC's Steam client ID, the "Loaded
+   client id" line of Steam's `logs/remote_connections.txt` on the PC) is used
+   instead, and the log line says why discovery failed (`sent=`, `send-errno=`,
+   `received=`).
 2. **Opening the PC's content server.** `ContentServerDirectory.RequestPeerContentServer`
    on the app's Steam connection, with both client IDs, the account, the App
    ID and the build, returns a TCP port (27040 on Windows), the depots the PC

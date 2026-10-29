@@ -43,6 +43,18 @@ enum SteamLANSetting {
         }
     }
 
+    static let peerClientIDKey = "madeira.steam.lanPeerClientID"
+
+    /// The PC's Steam client ID: entered by hand (Steam's logs/remote_connections.txt,
+    /// "Loaded client id") or kept from its last discovery answer. 0 = unknown.
+    static var peerClientID: UInt64 {
+        get { UInt64(UserDefaults.standard.string(forKey: peerClientIDKey) ?? "") ?? 0 }
+        set {
+            if newValue == 0 { UserDefaults.standard.removeObject(forKey: peerClientIDKey) }
+            else { UserDefaults.standard.set(String(newValue), forKey: peerClientIDKey) }
+        }
+    }
+
     static func isValidAddress(_ text: String) -> Bool {
         var address = in_addr()
         return inet_pton(AF_INET, text, &address) == 1
@@ -131,20 +143,29 @@ enum SteamLANPeer {
         return status
     }
 
+    /// What one discovery round saw, for the log.
+    struct DiscoveryReport: Sendable {
+        var status: SteamLANPeerStatus?
+        /// Where the status came from (the PC may answer from another of its addresses).
+        var from = ""
+        var note = ""
+    }
+
     /// Ask the Steam client at `host` (an IPv4 address) for its status. Blocking;
     /// call it off the main actor. Tries a few times, `timeout` seconds each.
-    static func discover(host: String, clientID: UInt64, attempts: Int = 3, timeout: TimeInterval = 1.5) -> SteamLANPeerStatus? {
+    static func discover(host: String, clientID: UInt64, attempts: Int = 3, timeout: TimeInterval = 1.5) -> DiscoveryReport {
+        var report = DiscoveryReport()
         var target = sockaddr_in()
         target.sin_family = sa_family_t(AF_INET)
         target.sin_port = discoveryPort.bigEndian
-        guard inet_pton(AF_INET, host, &target.sin_addr) == 1 else { return nil }
+        guard inet_pton(AF_INET, host, &target.sin_addr) == 1 else { report.note = "bad address"; return report }
 
         #if canImport(Darwin)
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         #else
         let fd = socket(AF_INET, Int32(SOCK_DGRAM.rawValue), Int32(IPPROTO_UDP))
         #endif
-        guard fd >= 0 else { return nil }
+        guard fd >= 0 else { report.note = "socket errno=\(errno)"; return report }
         defer { close(fd) }
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
@@ -157,21 +178,25 @@ enum SteamLANPeer {
         let bound = withUnsafePointer(to: &local) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
+        var boundPort = Int(discoveryPort)
         if bound != 0 {
             local.sin_port = 0
             _ = withUnsafePointer(to: &local) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
             }
+            boundPort = 0
         }
         setTimeout(fd, timeout)
 
+        var sent = 0, sendErrno: Int32 = 0, datagrams = 0, others: [String] = []
         for attempt in 0..<max(1, attempts) {
             let packet = [UInt8](discoveryPacket(clientID: clientID, sequence: UInt32(attempt + 1)))
-            _ = withUnsafePointer(to: &target) {
+            let rc = withUnsafePointer(to: &target) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     sendto(fd, packet, packet.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
+            if rc == packet.count { sent += 1 } else { sendErrno = errno }
             let deadline = Date().addingTimeInterval(timeout)
             var buffer = [UInt8](repeating: 0, count: 2048)
             while Date() < deadline {
@@ -181,11 +206,25 @@ enum SteamLANPeer {
                     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buffer, buffer.count, 0, $0, &fromLength) }
                 }
                 guard n > 0 else { break }  // timeout
-                guard from.sin_addr.s_addr == target.sin_addr.s_addr else { continue }
-                if let status = parseStatus(Data(buffer[0..<n])), status.clientID != clientID { return status }
+                datagrams += 1
+                var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                var addr = from.sin_addr
+                inet_ntop(AF_INET, &addr, &text, socklen_t(INET_ADDRSTRLEN))
+                let source = String(cString: text)
+                // Any Steam client's status counts: the PC may answer from
+                // another of its addresses, or by broadcast.
+                if let status = parseStatus(Data(buffer[0..<n])), status.clientID != clientID {
+                    report.status = status
+                    report.from = source
+                    report.note = "sent=\(sent) received=\(datagrams) bound=\(boundPort)"
+                    return report
+                }
+                if others.count < 3 { others.append("\(source):\(n)") }
             }
         }
-        return nil
+        report.note = "sent=\(sent)/\(max(1, attempts)) send-errno=\(sendErrno) received=\(datagrams) bound=\(boundPort)" +
+            (others.isEmpty ? "" : " other=\(others.joined(separator: ","))")
+        return report
     }
 
     // MARK: RequestPeerContentServer

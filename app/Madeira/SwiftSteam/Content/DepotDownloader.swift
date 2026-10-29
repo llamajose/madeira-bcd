@@ -407,7 +407,7 @@ final class DepotDownloader {
                 throw CancellationError()
             } catch {
                 if Task.isCancelled { throw CancellationError() }
-                SteamLog.trace("chunk from the PC failed: \(failureReason(error))")
+                if peer.failures < 3 { SteamLog.event("[steam-lan] chunk failed: \(Self.peerFailure(error))") }
                 if peer.recordFailure() {
                     SteamLog.event("[steam-lan] off host=\(peer.host) after \(peer.failures) failures; content servers only")
                 }
@@ -466,6 +466,11 @@ final class DepotDownloader {
         peer.recordSuccess(bytes: response.data.count)
     }
 
+    private nonisolated static func peerFailure(_ error: Error) -> String {
+        if case SteamError.chunkDownloadFailed(let message) = error { return message }
+        return failureReason(error)
+    }
+
     private nonisolated static func sha1(_ data: Data) -> Data {
         var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
         data.withUnsafeBytes { _ = CC_SHA1($0.baseAddress, CC_LONG(data.count), &digest) }
@@ -483,18 +488,25 @@ final class DepotDownloader {
             return nil
         }
         let localID = SteamLANSetting.localClientID
-        let status = await Task.detached(priority: .userInitiated) {
+        let report = await Task.detached(priority: .userInitiated) {
             SteamLANPeer.discover(host: host, clientID: localID)
         }.value
-        guard let status else {
-            SteamLog.event("[steam-lan] skip: no Steam client answered at \(host):\(SteamLANPeer.discoveryPort)")
+        let serverClientID: UInt64
+        if let status = report.status {
+            serverClientID = status.clientID
+            SteamLANSetting.peerClientID = status.clientID
+            SteamLog.event("[steam-lan] pc host=\(host) from=\(report.from) name=\(status.hostname) client=\(status.clientID) users=\(status.users.count) same-account=\(status.users.contains(session.steamID) ? 1 : 0) \(report.note)")
+        } else if SteamLANSetting.peerClientID != 0 {
+            serverClientID = SteamLANSetting.peerClientID
+            SteamLog.event("[steam-lan] no discovery answer from \(host):\(SteamLANPeer.discoveryPort) (\(report.note)); using the saved client=\(serverClientID)")
+        } else {
+            SteamLog.event("[steam-lan] skip: no Steam client answered at \(host):\(SteamLANPeer.discoveryPort) (\(report.note))")
             return nil
         }
         do {
             try await session.ensureConnected()
             let steamID = session.steamID
-            SteamLog.event("[steam-lan] pc host=\(host) name=\(status.hostname) client=\(status.clientID) users=\(status.users.count) same-account=\(status.users.contains(steamID) ? 1 : 0)")
-            let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: status.clientID,
+            let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: serverClientID,
                                                       appID: appID, buildID: buildID)
             let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
             let server = try SteamLANPeer.parsePeerServerResponse(reply)
