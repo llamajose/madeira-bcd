@@ -1934,6 +1934,31 @@ jobs:
             echo "::warning::no GC64 LuaJIT: LOVE games that need low memory will not start"
           fi
 
+      # Inputs for a local app-only build on the Mac: every built file the Xcode
+      # project consumes (git-ignored or modified under app/, plus FEX's
+      # build-ios libraries and generated headers), so a Swift-only change can
+      # skip the native build chains. Extract over a checkout of the same commit.
+      - name: Pack prebuilt app inputs
+        shell: bash
+        run: |
+          mkdir -p build-out
+          { git ls-files -o app; git ls-files -m app
+            find FEX/build-ios -type f \( -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' \) 2>/dev/null
+          } | sort -u > prebuilt.list
+          echo "files: $(wc -l < prebuilt.list)"
+          tar -cf - -T prebuilt.list | gzip -1 > build-out/madeira-prebuilt.tar.gz
+          echo "commit $(git rev-parse HEAD)" > build-out/madeira-prebuilt.txt
+          ls -la build-out/madeira-prebuilt.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: madeira-prebuilt
+          path: |
+            build-out/madeira-prebuilt.tar.gz
+            build-out/madeira-prebuilt.txt
+          retention-days: 14
+          compression-level: 0
+
       - name: Archive (unsigned)
         shell: bash
         run: |
