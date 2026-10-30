@@ -556,13 +556,13 @@ final class DepotDownloader {
                 timeout: 10), let parsed = try? SteamLANPeer.parsePeerContentInfo(info) {
                 SteamLog.event("[steam-lan] pc info apps=\(parsed.apps.count) has-app=\(parsed.apps.contains(appID) ? 1 : 0) public-ip=\(parsed.publicIP.isEmpty ? "-" : "set") (bytes=\(info.count))")
             }
-            // First as this device's client ID, then without one (Steam may
-            // not know this device as a client yet).
+            // The PC answers "Content Version" to the build it has; try the
+            // build this device has now (none for a new install) as well.
             var server = SteamLANPeer.PeerServer()
             var replyBytes = 0
-            for (variant, clientID) in [("client", localID), ("no-client", UInt64(0))] {
-                let body = SteamLANPeer.peerServerRequest(localClientID: clientID, steamID: steamID, serverClientID: serverClientID,
-                                                          appID: appID, buildID: buildID)
+            for (variant, build) in [("current-0", UInt32(0)), ("target-build", buildID)] {
+                let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: serverClientID,
+                                                          appID: appID, buildID: build)
                 let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
                 server = try SteamLANPeer.parsePeerServerResponse(reply)
                 replyBytes = reply.count
