@@ -1943,7 +1943,7 @@ jobs:
         run: |
           mkdir -p build-out
           { git ls-files -o app; git ls-files -m app
-            find FEX/build-ios -type f \( -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' \) 2>/dev/null
+            find FEX/build-ios -type f \( -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.inl' \) 2>/dev/null
           } | sort -u > prebuilt.list
           echo "files: $(wc -l < prebuilt.list)"
           tar -cf - -T prebuilt.list | gzip -1 > build-out/madeira-prebuilt.tar.gz
