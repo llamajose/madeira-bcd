@@ -691,10 +691,10 @@ struct SteamSettingsSection: View {
     @State private var confirmSignOut = false
     /// Settings › Steam › Game language (SteamLanguage); "" follows the device.
     @State private var language = SteamLanguage.chosen ?? ""
-    /// Settings › Steam › PC on this network (SteamLANSetting); "" is off.
+    /// Settings › Steam › Downloads from PCs on this network (SteamLANSetting).
+    @State private var lanOn = SteamLANSetting.enabled
+    /// A fixed PC address; "" finds the PC through Steam.
     @State private var lanHost = SteamLANSetting.host
-    /// The PC's Steam client ID, when discovery does not reach it; "" = from discovery.
-    @State private var lanClient = SteamLANSetting.peerClientID == 0 ? "" : String(SteamLANSetting.peerClientID)
 
     /// Shown when Steam sign-in or Madeira Dock is available.
     static var shown: Bool { SteamSignIn.isEnabled || MadeiraDock.enabled }
@@ -716,28 +716,20 @@ struct SteamSettingsSection: View {
             // Off: no Steam Cloud checks, transfers or prompts before Play (docs/STEAM_CLOUD.md).
             if SteamOwnedLibrary.enabled {
                 Toggle("Steam Cloud saves", isOn: $cloud.on)
-                LabeledContent("PC on this network") {
-                    TextField("IP address", text: $lanHost)
-                        .keyboardType(.decimalPad)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .multilineTextAlignment(.trailing)
-                        .foregroundStyle(lanHost.isEmpty || SteamLANSetting.isValidAddress(lanHost) ? Color.primary : Color.red)
-                }
-                .onChange(of: lanHost) { _, value in
-                    let trimmed = value.trimmingCharacters(in: .whitespaces)
-                    if trimmed.isEmpty || SteamLANSetting.isValidAddress(trimmed) { SteamLANSetting.host = trimmed }
-                }
-                if !lanHost.isEmpty {
-                    LabeledContent("PC's Steam client ID") {
-                        TextField("Found automatically", text: $lanClient)
-                            .keyboardType(.numberPad)
+                Toggle("Downloads from PCs on this network", isOn: $lanOn)
+                    .onChange(of: lanOn) { _, value in SteamLANSetting.enabled = value }
+                if lanOn {
+                    LabeledContent("PC address") {
+                        TextField("Automatic", text: $lanHost)
+                            .keyboardType(.decimalPad)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
                             .multilineTextAlignment(.trailing)
+                            .foregroundStyle(lanHost.isEmpty || SteamLANSetting.isValidAddress(lanHost) ? Color.primary : Color.red)
                     }
-                    .onChange(of: lanClient) { _, value in
-                        let digits = value.filter(\.isNumber)
-                        if digits.isEmpty { SteamLANSetting.peerClientID = 0 }
-                        else if let id = UInt64(digits) { SteamLANSetting.peerClientID = id }
+                    .onChange(of: lanHost) { _, value in
+                        let trimmed = value.trimmingCharacters(in: .whitespaces)
+                        if trimmed.isEmpty || SteamLANSetting.isValidAddress(trimmed) { SteamLANSetting.host = trimmed }
                     }
                 }
             }
@@ -753,7 +745,7 @@ struct SteamSettingsSection: View {
         } header: {
             Text("Steam")
         } footer: {
-            Text("Game language: the language Steam downloads install, and the one Steam tells the game to use. A game without it gets English. Installed games keep their language until you choose Download in their page.\n\nPC on this network: the IP address of a PC whose Steam has the game installed and up to date. Downloads then come from that PC first, through Steam's local network game transfers (Steam on the PC: same account, Settings › Downloads › Game file transfer over local network on, no download or game running). Anything the PC does not have comes from Steam's servers. Leave it empty to download from Steam only. PC's Steam client ID is found automatically; if the PC does not answer, enter the number after \"Loaded client id\" in Steam\\logs\\remote_connections.txt on the PC.\n\nMadeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it.")
+            Text("Game language: the language Steam downloads install, and the one Steam tells the game to use. A game without it gets English. Installed games keep their language until you choose Download in their page.\n\nDownloads from PCs on this network: a game's download comes first from a PC on the same network whose Steam has it installed and up to date, through Steam's local network game transfers (Steam on the PC: same account, Settings › Downloads › Game file transfer over local network on, no download or game running). Anything the PC does not have comes from Steam's servers. Madeira finds the PC through Steam and shows up in the account's devices as \"Madeira\". PC address: only when the PC is not found; its IP address on this network.\n\nMadeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it.")
         }
         .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { signIn.signOut() }

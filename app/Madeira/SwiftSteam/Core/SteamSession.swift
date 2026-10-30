@@ -604,6 +604,23 @@ class SteamSession {
         try await connection.send(data)
     }
 
+    /// A packet another client of this account sent through Steam: a status
+    /// is kept for SteamLANPeer; a discovery is answered with this device's
+    /// status, once it has one.
+    private func handleRelayed(method: String, body: Data) {
+        guard method.hasPrefix("RemoteClientSteamClient.NotifySteamBroadcastPacket"),
+              let packet = SteamLANPeer.relayedPacket(body) else { return }
+        let relay = SteamLANRelay.shared
+        if let status = SteamLANPeer.parseStatus(packet.payload) {
+            if relay.record(status) {
+                SteamLog.event("[steam-lan] relayed status host=\(status.hostname) client=\(status.clientID) addresses=\(status.addresses.count)")
+            }
+        } else if SteamLANPeer.packetType([UInt8](packet.payload)) == 0, let own = relay.ownStatus, packet.clientID != own.clientID {
+            let reply = SteamLANPeer.steamBroadcast(steamID: steamID, clientID: own.clientID, payload: own.status)
+            Task { try? await self.sendServiceNotification(method: .remoteClientSendSteamBroadcastPacket, body: reply) }
+        }
+    }
+
     /// Send a message without waiting for response
     func sendMessage(eMsg: EMsg, body: Data) async throws {
         let data = SteamMessageCodec.encodeClientMessage(
@@ -673,7 +690,7 @@ class SteamSession {
         // What Steam relays between this account's devices (SteamLANPeer):
         // the other clients' discovery answers and connection packets.
         if message.rawEMsg == EMsg.serviceMethod.rawValue, message.header.targetJobName.hasPrefix("RemoteClientSteamClient.") {
-            SteamLog.event("[steam-lan] relayed \(SteamLANPeer.describeRelayed(method: message.header.targetJobName, body: message.body))")
+            handleRelayed(method: message.header.targetJobName, body: message.body)
             return
         }
 

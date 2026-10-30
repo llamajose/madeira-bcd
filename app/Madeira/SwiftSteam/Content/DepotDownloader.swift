@@ -164,11 +164,13 @@ final class DepotDownloader {
 
         // 3. Chunks: from a PC on this network first when one is set
         // (SteamLANPeer), from the content servers for the rest.
-        let peer = await lanPeerSource(appID: app.appID, buildID: app.buildID, depots: Set(plans.map(\.depotID)))
+        let peer = await lanPeerSource(appID: app.appID, depots: Set(plans.map(\.depotID)))
+        let peerStarted = Date()
         defer {
             if let peer {
                 peer.close()
-                SteamLog.event("[steam-lan] done app=\(app.appID) chunks=\(peer.chunks) bytes=\(peer.bytes) failures=\(peer.failures) used=\(peer.usable ? 1 : 0)")
+                let seconds = max(Date().timeIntervalSince(peerStarted), 0.001)
+                SteamLog.event("[steam-lan] done app=\(app.appID) chunks=\(peer.chunks) bytes=\(peer.bytes) seconds=\(Int(seconds)) mbit/s=\(Int(Double(peer.bytes) * 8 / seconds / 1_000_000)) failures=\(peer.failures) used=\(peer.usable ? 1 : 0)")
             }
         }
         let started = Date()
@@ -180,7 +182,8 @@ final class DepotDownloader {
             let work = prepared.pending[index]
             let paths = prepared.paths[index]
             let existing = prepared.existing[index]
-            let maximum = maxConcurrentChunks, attempts = attemptsPerChunk
+            // A PC answers many requests on one connection at once.
+            let maximum = peer?.usable == true ? 16 : maxConcurrentChunks, attempts = attemptsPerChunk
             try await withThrowingTaskGroup(of: (UInt64, UInt64).self) { group in
                 var next = 0
                 func enqueue() {
@@ -477,120 +480,103 @@ final class DepotDownloader {
         return Data(digest)
     }
 
-    /// The PC set in Settings › Steam, asked for its status and opened by Steam
-    /// for this app. nil (content servers only) when none is set, it does not
-    /// answer, or Steam refuses.
     /// This run's instance ID in this device's remote-client status.
     private static let lanInstanceID = UInt64.random(in: 1...UInt64.max)
 
-    private func lanPeerSource(appID: UInt32, buildID: UInt32, depots: Set<UInt32>) async -> SteamPeerChunkSource? {
-        let host = SteamLANSetting.host
-        guard !host.isEmpty else { return nil }
-        guard SteamLANSetting.isValidAddress(host) else {
-            SteamLog.event("[steam-lan] skip: '\(host)' is not an IPv4 address")
-            return nil
-        }
+    /// A PC of this account on this network whose Steam client has the app,
+    /// opened by Steam for it (SteamLANPeer). nil (content servers only) when
+    /// the feature is off, no such PC answers, or Steam refuses.
+    private func lanPeerSource(appID: UInt32, depots: Set<UInt32>) async -> SteamPeerChunkSource? {
+        guard SteamLANSetting.enabled else { return nil }
         let localID = SteamLANSetting.localClientID
         let lan = CMsgClientLogon.localIPv4()
-        SteamLog.event("[steam-lan] this device lan-ip=\(lan.ip >> 24).\((lan.ip >> 16) & 0xFF).\((lan.ip >> 8) & 0xFF).\(lan.ip & 0xFF) iface=\(lan.interface)")
-        let lanText = lan.ip == 0 ? "" : "\(lan.ip >> 24).\((lan.ip >> 16) & 0xFF).\((lan.ip >> 8) & 0xFF).\(lan.ip & 0xFF)"
-        let ownStatus = SteamLANPeer.statusPacket(clientID: localID, instanceID: Self.lanInstanceID, steamID: session.steamID,
-                                                  hostname: "Madeira", lanIP: lanText)
-        let report = await Task.detached(priority: .userInitiated) {
-            SteamLANPeer.discover(host: host, clientID: localID, status: ownStatus)
-        }.value
-        // Steam's own list of this account's clients: logged, and the PC's
-        // ID when discovery cannot reach it. Before that, this device says it
-        // is one of them, as Valve's client does when it signs in.
-        var recent: [SteamLANPeer.RecentClient] = []
-        do {
-            try await session.ensureConnected()
-            let online = SteamLANPeer.onlineNotification(steamID: session.steamID, localClientID: localID, name: "Madeira")
-            // NotifyOnline returns NoResponse: sent as a notification, not a call.
-            do {
-                try await session.sendServiceNotification(method: .remoteClientNotifyOnline, body: online)
-                SteamLog.event("[steam-lan] RemoteClient.NotifyOnline sent client=\(localID)")
-            } catch {
-                SteamLog.event("[steam-lan] RemoteClient.NotifyOnline not sent (\(Self.failureReason(error)))")
-            }
-            // This device's status, relayed by Steam to the account's other
-            // clients, as a Steam client answers their discovery.
-            do {
-                try await session.sendServiceNotification(
-                    method: .remoteClientSendSteamBroadcastPacket,
-                    body: SteamLANPeer.steamBroadcast(steamID: session.steamID, clientID: localID, payload: ownStatus))
-                SteamLog.event("[steam-lan] status relayed bytes=\(ownStatus.count)")
-            } catch {
-                SteamLog.event("[steam-lan] status not relayed (\(Self.failureReason(error)))")
-            }
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            let reply = try await session.callServiceMethod(method: .remoteClientGetRecentClients, body: Data(), timeout: 10)
-            recent = (try? SteamLANPeer.parseRecentClients(reply)) ?? []
-            let listed = recent.prefix(8).map { "\($0.name.isEmpty ? "?" : $0.name)=\($0.clientID)\($0.online ? "*" : "")" }
-            SteamLog.event("[steam-lan] recent clients=\(recent.count) self-listed=\(recent.contains { $0.clientID == localID } ? 1 : 0) \(listed.joined(separator: " "))")
-        } catch {
-            SteamLog.event("[steam-lan] recent clients: request failed (\(Self.failureReason(error)))")
-        }
-        let serverClientID: UInt64
-        if let status = report.status {
-            serverClientID = status.clientID
-            SteamLANSetting.peerClientID = status.clientID
-            SteamLog.event("[steam-lan] pc host=\(host) from=\(report.from) name=\(status.hostname) client=\(status.clientID) users=\(status.users.count) same-account=\(status.users.contains(session.steamID) ? 1 : 0) \(report.note)")
-        } else if SteamLANSetting.peerClientID != 0 {
-            serverClientID = SteamLANSetting.peerClientID
-            SteamLog.event("[steam-lan] no discovery answer from \(host):\(SteamLANPeer.discoveryPort) (\(report.note)); using the saved client=\(serverClientID)")
-        } else if let pc = recent.first(where: { $0.online && $0.clientID != localID }) {
-            serverClientID = pc.clientID
-            SteamLog.event("[steam-lan] no discovery answer from \(host):\(SteamLANPeer.discoveryPort) (\(report.note)); using Steam's online client \(pc.name)=\(pc.clientID)")
-        } else {
-            SteamLog.event("[steam-lan] skip: no Steam client answered at \(host):\(SteamLANPeer.discoveryPort) (\(report.note))")
+        guard lan.ip != 0 else {
+            SteamLog.event("[steam-lan] skip: no local network address")
             return nil
         }
+        let lanText = Self.dotted(lan.ip)
         do {
             try await session.ensureConnected()
             let steamID = session.steamID
-            // What Steam knows of the PC: the apps it serves and its public IP.
-            if let info = try? await session.callServiceMethod(
-                method: .getPeerContentInfo,
-                body: SteamLANPeer.peerContentInfoRequest(localClientID: localID, steamID: steamID, serverClientID: serverClientID),
-                timeout: 10), let parsed = try? SteamLANPeer.parsePeerContentInfo(info) {
-                SteamLog.event("[steam-lan] pc info apps=\(parsed.apps.count) has-app=\(parsed.apps.contains(appID) ? 1 : 0) public-ip=\(parsed.publicIP.isEmpty ? "-" : "set") (bytes=\(info.count))")
-            }
-            // The PC answers "Content Version" to the build it has; try the
-            // build this device has now (none for a new install) as well.
-            var server = SteamLANPeer.PeerServer()
-            var replyBytes = 0
-            for (variant, build) in [("current-0", UInt32(0)), ("target-build", buildID)] {
-                let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: serverClientID,
-                                                          appID: appID, buildID: build)
-                let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
-                server = try SteamLANPeer.parsePeerServerResponse(reply)
-                replyBytes = reply.count
-                SteamLog.event("[steam-lan] peer request \(variant): bytes=\(reply.count) port=\(server.port)")
-                if server.port != 0, server.accessToken != 0 { break }
-            }
-            if server.port == 0 || server.accessToken == 0 {
-                // Diagnostic: the same request to the account's other online
-                // clients, to tell a refusal of this device from one of the PC.
-                for other in recent.filter({ $0.online && $0.clientID != localID && $0.clientID != serverClientID }).prefix(2) {
-                    let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: other.clientID,
-                                                              appID: appID, buildID: buildID)
-                    let reply = (try? await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 10)) ?? Data()
-                    SteamLog.event("[steam-lan] probe \(other.name)=\(other.clientID): bytes=\(reply.count)")
+            let ownStatus = SteamLANPeer.statusPacket(clientID: localID, instanceID: Self.lanInstanceID, steamID: steamID,
+                                                      hostname: "Madeira", lanIP: lanText)
+            let relay = SteamLANRelay.shared
+            relay.setOwn(clientID: localID, status: ownStatus)
+            // Join the account's remote clients, as Valve's client does at sign-in;
+            // the others answer through Steam with their statuses (SteamSession).
+            try await session.sendServiceNotification(
+                method: .remoteClientNotifyOnline,
+                body: SteamLANPeer.onlineNotification(steamID: steamID, localClientID: localID, name: "Madeira"))
+            try await session.sendServiceNotification(
+                method: .remoteClientSendSteamBroadcastPacket,
+                body: SteamLANPeer.steamBroadcast(steamID: steamID, clientID: localID, payload: ownStatus))
+
+            // Candidates: the address set in Settings, then the account's PCs on
+            // this network (the last one used first).
+            var candidates: [(name: String, hosts: [String])] = []
+            let fixed = SteamLANSetting.host
+            if !fixed.isEmpty { candidates.append(("set in Settings", [fixed])) }
+            for _ in 0..<6 {
+                let found = relay.recent(excluding: localID).filter { $0.users.isEmpty || $0.users.contains(steamID) }
+                if found.contains(where: { $0.addresses.contains { Self.sameNetwork($0, lan.ip) } }) || !fixed.isEmpty {
+                    let last = SteamLANSetting.peerClientID
+                    for status in found.filter({ $0.clientID == last }) + found.filter({ $0.clientID != last }) {
+                        let hosts = status.addresses.filter { Self.sameNetwork($0, lan.ip) }
+                        if !hosts.isEmpty { candidates.append((status.hostname, hosts)) }
+                    }
+                    break
                 }
+                try? await Task.sleep(nanoseconds: 500_000_000)
             }
-            guard server.port != 0, server.accessToken != 0 else {
-                SteamLog.event("[steam-lan] skip: Steam did not open the PC's content server app=\(appID) (bytes=\(replyBytes))")
+            guard !candidates.isEmpty else {
+                SteamLog.event("[steam-lan] skip: no PC of this account on this network (\(lanText))")
                 return nil
             }
-            let served = server.depots.isEmpty ? depots : server.depots.intersection(depots)
-            SteamLog.event("[steam-lan] open app=\(appID) port=\(server.port) depots=\(served.sorted().map(String.init).joined(separator: ",")) pc-depots=\(server.depots.count)")
-            guard !served.isEmpty else { return nil }
-            return SteamPeerChunkSource(host: host, port: server.port, appID: appID, depots: served, accessToken: server.accessToken)
+
+            for candidate in candidates {
+                for host in candidate.hosts {
+                    let report = await Task.detached(priority: .userInitiated) {
+                        SteamLANPeer.discover(host: host, clientID: localID, status: ownStatus)
+                    }.value
+                    guard let status = report.status else {
+                        SteamLog.event("[steam-lan] no answer from \(candidate.name) at \(host) (\(report.note))")
+                        continue
+                    }
+                    // current_build_id is the build this device has: none yet. The
+                    // PC denies its own build ("Content Version").
+                    let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: status.clientID,
+                                                              appID: appID, buildID: 0)
+                    let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
+                    let server = try SteamLANPeer.parsePeerServerResponse(reply)
+                    let served = server.depots.isEmpty ? depots : server.depots.intersection(depots)
+                    guard server.port != 0, server.accessToken != 0, !served.isEmpty else {
+                        SteamLog.event("[steam-lan] \(status.hostname) did not open app=\(appID) (bytes=\(reply.count) depots=\(served.count))")
+                        break
+                    }
+                    SteamLANSetting.peerClientID = status.clientID
+                    let address = report.from.isEmpty ? host : report.from
+                    SteamLog.event("[steam-lan] open app=\(appID) pc=\(status.hostname) at \(address):\(server.port) depots=\(served.sorted().map(String.init).joined(separator: ","))")
+                    return SteamPeerChunkSource(host: address, port: server.port, appID: appID, depots: served, accessToken: server.accessToken)
+                }
+            }
+            SteamLog.event("[steam-lan] skip: no PC on this network opened app=\(appID)")
+            return nil
         } catch {
             SteamLog.event("[steam-lan] skip: request failed (\(Self.failureReason(error)))")
             return nil
         }
+    }
+
+    private nonisolated static func dotted(_ ip: UInt32) -> String {
+        "\(ip >> 24).\((ip >> 16) & 0xFF).\((ip >> 8) & 0xFF).\(ip & 0xFF)"
+    }
+
+    /// `address` is in this device's /24 (home networks): the PC's LAN address
+    /// among its VPN and virtual adapters.
+    private nonisolated static func sameNetwork(_ address: String, _ local: UInt32) -> Bool {
+        var parsed = in_addr()
+        guard inet_pton(AF_INET, address, &parsed) == 1 else { return false }
+        return UInt32(bigEndian: parsed.s_addr) >> 8 == local >> 8
     }
 
     private nonisolated static func failureReason(_ error: Error) -> String {

@@ -59,7 +59,8 @@ SHA = bytes.fromhex('d5162b89908a62ce1af865def28c19e6d09208d1')
 MAGIC = bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0x4C, 0x5F, 0xA0])  # as llama-pc sends it
 status_header = field(1, 0, 0x1234567890ABCDEF) + field(2, 0, 1)
 status_body = (field(1, 0, 8) + field(4, 2, b'llama-pc') +
-               field(9, 2, field(1, 1, 76561199130358928) + field(2, 0, 7)) + field(16, 0, 1))
+               field(9, 2, field(1, 1, 76561199130358928) + field(2, 0, 7)) + field(16, 0, 1) +
+               field(20, 2, b'100.92.53.69') + field(20, 2, b'192.168.8.145'))
 STATUS = MAGIC + struct.pack('<I', len(status_header)) + status_header + struct.pack('<I', len(status_body)) + status_body
 
 # RequestPeerContentServer answers: depots unpacked, then packed.
@@ -85,8 +86,15 @@ func unhex(_ s: String) -> Data {
                                                 sha: unhex(args[4]), accessToken: UInt64(args[5])!)))
         case "status":
             if let s = SteamLANPeer.parseStatus(unhex(args[2])) {
-                print("\(s.clientID) \(s.hostname) \(s.users.map(String.init).joined(separator: ","))")
+                print("\(s.clientID) \(s.hostname) \(s.users.map(String.init).joined(separator: ",")) \(s.addresses.joined(separator: ","))")
             } else { print("nil") }
+        case "own-status":
+            print(hex(SteamLANPeer.statusPacket(clientID: 5, instanceID: 7, steamID: 76561199130358928,
+                                                hostname: "Madeira", lanIP: "192.168.8.113")))
+        case "type":
+            print(SteamLANPeer.packetType([UInt8](unhex(args[2]))).map(String.init) ?? "nil")
+        case "relayed":
+            if let r = SteamLANPeer.relayedPacket(unhex(args[2])) { print("\(r.clientID) \(hex(r.payload))") } else { print("nil") }
         case "discovery":
             print(hex(SteamLANPeer.discoveryPacket(clientID: UInt64(args[2])!, sequence: 1)))
         case "peer":
@@ -140,8 +148,16 @@ with tempfile.TemporaryDirectory() as tmp:
 
     require(run('request', APP, DEPOT, SHA.hex(), TOKEN) == CAPTURED_REQUEST.hex(),
             'the chunk request is byte-for-byte what Valve\'s client sent')
-    require(run('status', STATUS.hex()) == f'{0x1234567890ABCDEF} llama-pc 76561199130358928',
-            'a PC\'s status answer gives its client ID, host name and account')
+    require(run('status', STATUS.hex()) == f'{0x1234567890ABCDEF} llama-pc 76561199130358928 100.92.53.69,192.168.8.145',
+            'a PC\'s status answer gives its client ID, host name, account and addresses')
+    own = run('own-status')
+    require(own.startswith(MAGIC.hex()) and run('status', own) == '5 Madeira 76561199130358928 192.168.8.113',
+            'this device\'s status parses back as a status with its client ID, name, account and address')
+    require(run('type', own) == '1' and run('type', (MAGIC + struct.pack('<I', 4) + field(1, 0, 9) + field(2, 0, 0)).hex()) == '0',
+            'packet types: status 1, discovery 0')
+    relayed_body = field(1, 1, 76561199130358928) + field(2, 1, 0x1234567890ABCDEF) + field(3, 2, STATUS)
+    require(run('relayed', relayed_body.hex()) == f'{0x1234567890ABCDEF} {STATUS.hex()}',
+            'a relayed broadcast gives the sender\'s client ID and its packet')
     require(run('status', (MAGIC + struct.pack('<I', 4) + field(1, 0, 9) + field(2, 0, 0) + struct.pack('<I', 0)).hex()) == 'nil',
             'a discovery request (not a status) is not taken for a PC')
     disc = bytes.fromhex(run('discovery', 42))

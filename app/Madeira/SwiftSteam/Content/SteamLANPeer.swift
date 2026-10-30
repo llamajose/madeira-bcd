@@ -8,16 +8,21 @@
 // The message types and fields are Valve's (steammessages_remoteclient_discovery,
 // steammessages_contentsystem and steammessages_clientlanp2p protobufs).
 //
-// 1. Discovery: one CMsgRemoteClientBroadcastDiscovery sent straight to the
+// 1. This device joins the account's remote clients: RemoteClient.NotifyOnline
+//    and its status (CMsgRemoteClientBroadcastStatus) relayed to the other
+//    clients with RemoteClient.SendSteamBroadcastPacket. Their statuses come
+//    back the same way (SteamLANRelay), with the PC's addresses and client ID.
+// 2. Discovery: one CMsgRemoteClientBroadcastDiscovery sent straight to the
 //    PC's UDP port 27036 (no broadcast: iOS gives sideloaded apps no multicast
-//    entitlement). The PC answers with its status: its remote client ID, host
-//    name and signed-in users.
-// 2. ContentServerDirectory.RequestPeerContentServer (DepotDownloader, over the
+//    entitlement). The PC answers with its status and asks for this device's,
+//    which is answered; the PC then counts it as one of the account's devices.
+// 3. ContentServerDirectory.RequestPeerContentServer (DepotDownloader, over the
 //    app's CM connection) asks Steam to open that PC's content server for the
 //    app: a TCP port, the depots it has and an access token.
-// 3. Chunks: k_EMsgClientPeerChunkRequest / k_EMsgClientPeerChunkResponse on
+// 4. Chunks: k_EMsgClientPeerChunkRequest / k_EMsgClientPeerChunkResponse on
 //    that TCP connection, framed like every Steam TCP message (length, "VT01",
-//    message type with the protobuf flag, header length 0, body).
+//    message type with the protobuf flag, header length 0, body), several
+//    requests in flight at once and answers matched by chunk SHA-1.
 
 import Foundation
 #if canImport(Darwin)
@@ -26,14 +31,24 @@ import Darwin
 import Glibc
 #endif
 
-/// Settings › Steam › "PC on this network": the IPv4 address of a PC whose
-/// Steam client should supply downloads, and this device's own client ID for
-/// Steam's local network messages (random, kept for the install).
+/// Settings › Steam › "Downloads from PCs on this network": on/off, an
+/// optional fixed PC address (found through Steam when empty), and this
+/// device's own client ID for Steam's local network messages (random, kept).
 enum SteamLANSetting {
+    static let enabledKey = "madeira.steam.lanEnabled"
     static let hostKey = "madeira.steam.lanPeerHost"
     static let clientIDKey = "madeira.steam.lanClientID"
 
-    /// The PC's address, "" when the feature is off.
+    /// Off until turned on; on for an install that already had a PC address.
+    static var enabled: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: enabledKey) == nil { return !host.isEmpty }
+            return UserDefaults.standard.bool(forKey: enabledKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
+    }
+
+    /// A fixed PC address, "" to find the PC through Steam.
     static var host: String {
         get { (UserDefaults.standard.string(forKey: hostKey) ?? "").trimmingCharacters(in: .whitespaces) }
         set {
@@ -45,8 +60,7 @@ enum SteamLANSetting {
 
     static let peerClientIDKey = "madeira.steam.lanPeerClientID"
 
-    /// The PC's Steam client ID: entered by hand (Steam's logs/remote_connections.txt,
-    /// "Loaded client id") or kept from its last discovery answer. 0 = unknown.
+    /// The last PC that served a download (its Steam client ID), tried first. 0 = none.
     static var peerClientID: UInt64 {
         get { UInt64(UserDefaults.standard.string(forKey: peerClientIDKey) ?? "") ?? 0 }
         set {
@@ -75,6 +89,37 @@ struct SteamLANPeerStatus: Sendable, Equatable {
     var clientID: UInt64
     var hostname: String
     var users: [UInt64]
+    /// Its IP addresses (ip_addresses), LAN ones among VPN and virtual adapters.
+    var addresses: [String] = []
+}
+
+/// What Steam relays between this account's clients while Madeira is signed in:
+/// their statuses (kept for a few minutes), and this device's own status to
+/// answer their discovery with.
+final class SteamLANRelay: @unchecked Sendable {
+    static let shared = SteamLANRelay()
+    private let lock = NSLock()
+    private var statuses: [UInt64: (status: SteamLANPeerStatus, seen: Date)] = [:]
+    private var own: (clientID: UInt64, status: Data)?
+
+    /// Returns true for a client not seen before or with new addresses.
+    @discardableResult func record(_ status: SteamLANPeerStatus) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let changed = statuses[status.clientID]?.status.addresses != status.addresses
+        statuses[status.clientID] = (status, Date())
+        return changed
+    }
+
+    /// Statuses of the account's other clients seen in the last `maximumAge` seconds.
+    func recent(excluding clientID: UInt64, maximumAge: TimeInterval = 300) -> [SteamLANPeerStatus] {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        return statuses.values.filter { $0.status.clientID != clientID && now.timeIntervalSince($0.seen) <= maximumAge }
+            .sorted { $0.seen > $1.seen }.map(\.status)
+    }
+
+    func setOwn(clientID: UInt64, status: Data) { lock.lock(); own = (clientID, status); lock.unlock() }
+    var ownStatus: (clientID: UInt64, status: Data)? { lock.lock(); defer { lock.unlock() }; return own }
 }
 
 enum SteamLANPeer {
@@ -177,6 +222,7 @@ enum SteamLANPeer {
         while let tag = try? fields.readTag() {
             switch tag.fieldNumber {
             case 4: status.hostname = (try? fields.readString()) ?? ""
+            case 20: if let address = try? fields.readString() { status.addresses.append(address) }
             case 9:
                 guard let user = try? fields.readBytes() else { return status }
                 var u = ProtobufDecoder(user)
@@ -368,37 +414,19 @@ enum SteamLANPeer {
         return (apps, ip)
     }
 
-    /// One line for a RemoteClientSteamClient notification Steam pushed to
-    /// this device: who sent it and, for a relayed discovery packet, what it says.
-    static func describeRelayed(method: String, body: Data) -> String {
-        var steamID: UInt64 = 0, clientID: UInt64 = 0, payload = Data()
+    /// The sender's client ID and packet in a CRemoteClient_SteamBroadcast_Notification
+    /// Steam pushed to this device (RemoteClientSteamClient.NotifySteamBroadcastPacket).
+    static func relayedPacket(_ body: Data) -> (clientID: UInt64, payload: Data)? {
+        var clientID: UInt64 = 0, payload = Data()
         var decoder = ProtobufDecoder(body)
         fields: while let tag = try? decoder.readTag() {
             switch (tag.fieldNumber, tag.wireType) {
-            case (1, .fixed64): steamID = (try? decoder.readFixed64()) ?? 0
             case (2, .fixed64): clientID = (try? decoder.readFixed64()) ?? 0
             case (3, .lengthDelimited): payload = (try? decoder.readBytes()) ?? Data()
             default: if (try? decoder.skip(wireType: tag.wireType)) == nil { break fields }
             }
         }
-        let name = method.replacingOccurrences(of: "RemoteClientSteamClient.", with: "")
-        var line = "\(name) bytes=\(body.count) from-client=\(clientID) same-account=\(steamID == 0 ? "?" : "1") payload=\(payload.count)"
-        if payload.count >= 16, Array(payload.prefix(8)) == discoveryMagic {
-            let headerLength = Int(read32([UInt8](payload), 8))
-            var type: UInt64 = 99
-            if headerLength >= 0, 12 + headerLength <= payload.count {
-                var h = ProtobufDecoder(payload.subdata(in: payload.startIndex + 12 ..< payload.startIndex + 12 + headerLength))
-                while let t = try? h.readTag() {
-                    if t.fieldNumber == 2, t.wireType == .varint { type = (try? h.readVarint()) ?? 99 }
-                    else if (try? h.skip(wireType: t.wireType)) == nil { break }
-                }
-            }
-            line += " discovery-type=\(type)"
-            if let status = parseStatus(payload) { line += " status host=\(status.hostname) client=\(status.clientID)" }
-        } else if !payload.isEmpty {
-            line += " head=" + payload.prefix(48).map { String(format: "%02x", $0) }.joined()
-        }
-        return line
+        return payload.isEmpty ? nil : (clientID, payload)
     }
 
     /// CRemoteClient_SteamBroadcast_Notification: a discovery-format packet
@@ -540,15 +568,27 @@ final class SteamPeerChunkSource: @unchecked Sendable {
     let appID: UInt32
     let depots: Set<UInt32>
     private let accessToken: UInt64
-    private let queue = DispatchQueue(label: "madeira.steam.lan-peer")
+    /// Connects and sends, in request order.
+    private let writeQueue = DispatchQueue(label: "madeira.steam.lan-peer")
     private let lock = NSLock()
-    private var fd: Int32 = -1
+    private var connection: Connection?
     private var failuresInARow = 0
     private var disabled = false
     private(set) var chunks = 0
     private(set) var bytes: UInt64 = 0
     private(set) var failures = 0
     static let maximumFailuresInARow = 4
+    /// Seconds without any answer while requests are waiting before the
+    /// connection counts as broken.
+    static let answerTimeout: TimeInterval = 15
+
+    /// One TCP connection to the PC: the requests waiting on it, by chunk SHA-1.
+    private final class Connection {
+        let fd: Int32
+        var waiting: [Data: [CheckedContinuation<SteamLANPeer.ChunkResponse, Error>]] = [:]
+        var closed = false
+        init(fd: Int32) { self.fd = fd }
+    }
 
     init(host: String, port: UInt16, appID: UInt32, depots: Set<UInt32>, accessToken: UInt64) {
         self.host = host; self.port = port; self.appID = appID; self.depots = depots; self.accessToken = accessToken
@@ -559,11 +599,26 @@ final class SteamPeerChunkSource: @unchecked Sendable {
     func serves(_ depotID: UInt32) -> Bool { usable && (depots.isEmpty || depots.contains(depotID)) }
 
     /// The chunk's bytes as the PC sends them (see `ChunkResponse.encrypted` / `.compressed`).
+    /// Callers may wait on several at once: the requests share one connection.
     func fetch(depotID: UInt32, sha: Data) async throws -> SteamLANPeer.ChunkResponse {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SteamLANPeer.ChunkResponse, Error>) in
-            queue.async {
-                do { continuation.resume(returning: try self.fetchBlocking(depotID: depotID, sha: sha)) }
-                catch { continuation.resume(throwing: error) }
+        guard usable else { throw SteamError.chunkDownloadFailed("The PC on this network is no longer used.") }
+        let request = [UInt8](SteamLANPeer.chunkRequest(appID: appID, depotID: depotID, sha: sha, accessToken: accessToken))
+        return try await withCheckedThrowingContinuation { continuation in
+            writeQueue.async {
+                let link: Connection
+                do { link = try self.currentConnection() } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                self.lock.lock()
+                let open = !link.closed
+                if open { link.waiting[sha, default: []].append(continuation) }
+                self.lock.unlock()
+                guard open else {
+                    continuation.resume(throwing: SteamError.chunkDownloadFailed("The PC closed the connection."))
+                    return
+                }
+                do { try Self.sendAll(link.fd, request) } catch { self.fail(link, error) }
             }
         }
     }
@@ -580,39 +635,84 @@ final class SteamPeerChunkSource: @unchecked Sendable {
         return false
     }
 
-    func close() { queue.sync { self.disconnect() } }
+    func close() {
+        writeQueue.sync {
+            lock.lock(); let link = connection; lock.unlock()
+            if let link { fail(link, SteamError.chunkDownloadFailed("The download from the PC ended.")) }
+        }
+    }
 
-    // MARK: On the queue
+    // MARK: Connection
 
-    private func fetchBlocking(depotID: UInt32, sha: Data) throws -> SteamLANPeer.ChunkResponse {
-        guard usable else { throw SteamError.chunkDownloadFailed("The PC on this network is no longer used.") }
-        if fd < 0 { try connect() }
-        let request = [UInt8](SteamLANPeer.chunkRequest(appID: appID, depotID: depotID, sha: sha, accessToken: accessToken))
-        do {
-            try sendAll(request)
-            while true {
-                let header = try receive(8)
+    /// On writeQueue: the open connection, connecting (and starting its reader) when there is none.
+    private func currentConnection() throws -> Connection {
+        lock.lock()
+        if let link = connection, !link.closed { lock.unlock(); return link }
+        lock.unlock()
+        let link = Connection(fd: try connect())
+        lock.lock(); connection = link; lock.unlock()
+        let reader = Thread { [weak self] in self?.read(link) }
+        reader.name = "madeira.steam.lan-peer.read"
+        reader.start()
+        return link
+    }
+
+    /// Ends `link` and fails every request waiting on it.
+    private func fail(_ link: Connection, _ error: Error) {
+        lock.lock()
+        let waiting = link.closed ? [:] : link.waiting
+        if !link.closed {
+            link.closed = true
+            link.waiting = [:]
+            shutdown(link.fd, Int32(SHUT_RDWR))
+        }
+        if connection === link { connection = nil }
+        lock.unlock()
+        for continuation in waiting.values.joined() { continuation.resume(throwing: error) }
+    }
+
+    /// The reader thread: answers in any order, each to the oldest request for its SHA-1.
+    private func read(_ link: Connection) {
+        var idleSince = Date()
+        defer { Darwin_or_Glibc_close(link.fd) }
+        while true {
+            do {
+                guard let header = try Self.receive(link.fd, 8, allowIdle: true) else {
+                    // Receive timeout with nothing read: fine while nothing waits.
+                    lock.lock(); let closed = link.closed, idle = link.waiting.isEmpty; lock.unlock()
+                    if closed { return }
+                    if idle { idleSince = Date(); continue }
+                    if Date().timeIntervalSince(idleSince) < Self.answerTimeout { continue }
+                    throw SteamError.chunkDownloadFailed("The PC stopped answering.")
+                }
+                idleSince = Date()
                 guard Array(header[4..<8]) == SteamLANPeer.tcpMagic else { throw SteamError.chunkDownloadFailed("Unexpected data from the PC.") }
                 let length = Int(SteamLANPeer.read32(header, 0))
                 guard length >= 8, length <= ContentDecryptor.maximumChunkBytes + 4096 else {
                     throw SteamError.chunkDownloadFailed("Unexpected message size from the PC.")
                 }
-                let payload = try receive(length)
+                guard let payload = try Self.receive(link.fd, length, allowIdle: false) else { continue }
                 let eMsg = SteamLANPeer.read32(payload, 0) & 0x7FFF_FFFF
                 let headerLength = Int(SteamLANPeer.read32(payload, 4))
                 guard 8 + headerLength <= payload.count else { throw SteamError.chunkDownloadFailed("Unexpected message from the PC.") }
                 guard eMsg == SteamLANPeer.peerChunkResponse else { continue }
                 let response = try SteamLANPeer.parseChunkResponse(Data(payload[(8 + headerLength)...]))
-                guard response.sha == sha else { continue }  // an answer to an earlier, abandoned request
-                return response
+                lock.lock()
+                var continuation: CheckedContinuation<SteamLANPeer.ChunkResponse, Error>?
+                if var queue = link.waiting[response.sha], !queue.isEmpty {
+                    continuation = queue.removeFirst()
+                    link.waiting[response.sha] = queue.isEmpty ? nil : queue
+                }
+                lock.unlock()
+                continuation?.resume(returning: response)  // none: an answer to an abandoned request
+            } catch {
+                fail(link, error)
+                return
             }
-        } catch {
-            disconnect()
-            throw error
         }
     }
 
-    private func connect() throws {
+    private func connect() throws -> Int32 {
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = port.bigEndian
@@ -628,7 +728,9 @@ final class SteamPeerChunkSource: @unchecked Sendable {
         #if canImport(Darwin)
         setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
         #endif
-        SteamLANPeer.setTimeout(s, 15)
+        var buffer: Int32 = 4 * 1024 * 1024
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buffer, socklen_t(MemoryLayout<Int32>.size))
+        SteamLANPeer.setTimeout(s, 2)
         let rc = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Glibc_or_Darwin_connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
@@ -637,14 +739,10 @@ final class SteamPeerChunkSource: @unchecked Sendable {
             Darwin_or_Glibc_close(s)
             throw SteamError.chunkDownloadFailed("Cannot reach the PC (errno \(code)).")
         }
-        fd = s
+        return s
     }
 
-    private func disconnect() {
-        if fd >= 0 { Darwin_or_Glibc_close(fd); fd = -1 }
-    }
-
-    private func sendAll(_ bytes: [UInt8]) throws {
+    private static func sendAll(_ fd: Int32, _ bytes: [UInt8]) throws {
         var sent = 0
         while sent < bytes.count {
             let n = bytes.withUnsafeBytes { raw -> Int in
@@ -654,16 +752,26 @@ final class SteamPeerChunkSource: @unchecked Sendable {
                 return send(fd, raw.baseAddress! + sent, raw.count - sent, Int32(MSG_NOSIGNAL))
                 #endif
             }
+            if n < 0, errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { continue }
             guard n > 0 else { throw SteamError.chunkDownloadFailed("The PC closed the connection (errno \(errno)).") }
             sent += n
         }
     }
 
-    private func receive(_ count: Int) throws -> [UInt8] {
+    /// `count` bytes, or nil when `allowIdle` and the receive timeout passed before any arrived.
+    private static func receive(_ fd: Int32, _ count: Int, allowIdle: Bool) throws -> [UInt8]? {
         var buffer = [UInt8](repeating: 0, count: count)
         var got = 0
+        var stalls = 0
         while got < count {
             let n = buffer.withUnsafeMutableBytes { recv(fd, $0.baseAddress! + got, count - got, 0) }
+            if n < 0, errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+                if got == 0, allowIdle { return nil }
+                stalls += 1
+                // Inside a message: the 2 s receive timeout, up to answerTimeout in all.
+                if Double(stalls) * 2 >= answerTimeout { throw SteamError.chunkDownloadFailed("The PC stopped mid-answer.") }
+                continue
+            }
             guard n > 0 else { throw SteamError.chunkDownloadFailed("The PC closed the connection (errno \(errno)).") }
             got += n
         }
