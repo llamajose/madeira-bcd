@@ -497,7 +497,10 @@ final class DepotDownloader {
     }
 
     private func lanPeerSource(appID: UInt32, currentBuild: UInt32, depots: Set<UInt32>) async -> SteamPeerChunkSource? {
-        guard SteamLANSetting.enabled else { return nil }
+        guard SteamLANSetting.enabled else {
+            SteamLog.event("[steam-lan] off (Settings › Steam › Downloads from PCs on this network)")
+            return nil
+        }
         let localID = SteamLANSetting.localClientID
         let lan = CMsgClientLogon.localIPv4()
         guard lan.ip != 0 else {
