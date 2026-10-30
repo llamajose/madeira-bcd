@@ -60,6 +60,8 @@ enum SteamServiceMethod: String {
     case remoteClientNotifyOnline = "RemoteClient.NotifyOnline#1"
     /// The account's Steam clients and their remote client IDs (SteamLANPeer).
     case remoteClientGetRecentClients = "RemoteClient.GetRecentClients#1"
+    /// Relays a discovery-format packet to the account's other clients (SteamLANPeer).
+    case remoteClientSendSteamBroadcastPacket = "RemoteClient.SendSteamBroadcastPacket#1"
     /// The account's own playtime and last-played times.
     case getOwnedGames = "Player.GetOwnedGames#1"
     /// The account's Steam Cloud file list for one app.

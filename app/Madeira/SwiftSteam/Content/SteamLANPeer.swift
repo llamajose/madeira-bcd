@@ -103,6 +103,51 @@ enum SteamLANPeer {
         return packet
     }
 
+    /// This device's status (ERemoteClientBroadcastMsg 1), as a Steam client
+    /// sends it in answer to a discovery: header client_id, msg_type 1 and
+    /// instance_id, as llama-pc's (captured 2026-10-29); body
+    /// CMsgRemoteClientBroadcastStatus.
+    static func statusPacket(clientID: UInt64, instanceID: UInt64, steamID: UInt64, hostname: String, lanIP: String) -> Data {
+        var header = ProtobufEncoder()
+        header.writeUInt64(fieldNumber: 1, value: clientID)     // client_id
+        header.writeUInt64(fieldNumber: 2, value: 1)            // msg_type = Status
+        header.writeUInt64(fieldNumber: 3, value: instanceID)   // instance_id
+        var user = ProtobufEncoder()
+        user.writeFixed64(fieldNumber: 1, value: steamID)       // steamid
+        user.writeUInt32(fieldNumber: 2, value: 1)              // auth_key_id
+        var body = ProtobufEncoder()
+        body.writeInt32(fieldNumber: 1, value: 8)               // version
+        body.writeInt32(fieldNumber: 2, value: 6)               // min_version
+        body.writeUInt32(fieldNumber: 3, value: UInt32(discoveryPort)) // connect_port
+        body.writeString(fieldNumber: 4, value: hostname)
+        body.writeInt32(fieldNumber: 7, value: -102)            // ostype: macOS, as at logon
+        body.writeBool(fieldNumber: 8, value: true)             // is64bit
+        body.writeSubmessage(fieldNumber: 9, value: user.data)  // users
+        body.writeInt32(fieldNumber: 11, value: 1)              // euniverse: public
+        body.writeUInt32(fieldNumber: 12, value: UInt32(Date().timeIntervalSince1970)) // timestamp
+        if !lanIP.isEmpty { body.writeString(fieldNumber: 20, value: lanIP) } // ip_addresses
+        body.writeUInt32(fieldNumber: 23, value: 2)             // supported_services, as llama-pc
+        body.writeUInt32(fieldNumber: 31, value: 1)             // gaming_device_type
+        var packet = Data(discoveryMagic)
+        append32(&packet, UInt32(header.data.count)); packet.append(header.data)
+        append32(&packet, UInt32(body.data.count)); packet.append(body.data)
+        return packet
+    }
+
+    /// The msg_type in a discovery-format packet's header, or nil.
+    static func packetType(_ bytes: [UInt8]) -> UInt64? {
+        guard bytes.count >= 12, Array(bytes[0..<8]) == discoveryMagic else { return nil }
+        let headerLength = Int(read32(bytes, 8))
+        guard headerLength >= 0, 12 + headerLength <= bytes.count else { return nil }
+        var type: UInt64 = 0
+        var h = ProtobufDecoder(Data(bytes[12..<(12 + headerLength)]))
+        while let t = try? h.readTag() {
+            if t.fieldNumber == 2, t.wireType == .varint { type = (try? h.readVarint()) ?? 0 }
+            else if (try? h.skip(wireType: t.wireType)) == nil { return nil }
+        }
+        return type
+    }
+
     /// The status a Steam client answers with (ERemoteClientBroadcastMsg 1), or nil.
     static func parseStatus(_ packet: Data) -> SteamLANPeerStatus? {
         let bytes = [UInt8](packet)
@@ -155,7 +200,8 @@ enum SteamLANPeer {
 
     /// Ask the Steam client at `host` (an IPv4 address) for its status. Blocking;
     /// call it off the main actor. Tries a few times, `timeout` seconds each.
-    static func discover(host: String, clientID: UInt64, attempts: Int = 3, timeout: TimeInterval = 1.5) -> DiscoveryReport {
+    static func discover(host: String, clientID: UInt64, status ownStatus: Data? = nil,
+                         attempts: Int = 3, timeout: TimeInterval = 1.5) -> DiscoveryReport {
         var report = DiscoveryReport()
         var target = sockaddr_in()
         target.sin_family = sa_family_t(AF_INET)
@@ -190,8 +236,9 @@ enum SteamLANPeer {
         }
         setTimeout(fd, timeout)
 
-        var sent = 0, sendErrno: Int32 = 0, datagrams = 0, others: [String] = []
+        var sent = 0, sendErrno: Int32 = 0, datagrams = 0, answered = 0, others: [String] = []
         for attempt in 0..<max(1, attempts) {
+            if report.status != nil { break }
             let packet = [UInt8](discoveryPacket(clientID: clientID, sequence: UInt32(attempt + 1)))
             let rc = withUnsafePointer(to: &target) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -213,18 +260,42 @@ enum SteamLANPeer {
                 var addr = from.sin_addr
                 inet_ntop(AF_INET, &addr, &text, socklen_t(INET_ADDRSTRLEN))
                 let source = String(cString: text)
+                // The PC asks for this device's status (a discovery of its own):
+                // answer it, as a Steam client does.
+                if let own = ownStatus, packetType(Array(buffer[0..<n])) == 0 {
+                    let reply = [UInt8](own)
+                    _ = withUnsafePointer(to: &from) {
+                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            sendto(fd, reply, reply.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                    answered += 1
+                    continue
+                }
                 // Any Steam client's status counts: the PC may answer from
                 // another of its addresses, or by broadcast.
-                if let status = parseStatus(Data(buffer[0..<n])), status.clientID != clientID {
+                if report.status == nil, let status = parseStatus(Data(buffer[0..<n])), status.clientID != clientID {
                     report.status = status
                     report.from = source
+                    // Tell the PC about this device too, then stay a moment to
+                    // answer the discovery it sends back.
+                    if let own = ownStatus {
+                        let reply = [UInt8](own)
+                        _ = withUnsafePointer(to: &from) {
+                            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                sendto(fd, reply, reply.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                            }
+                        }
+                        answered += 1
+                        continue
+                    }
                     report.note = "sent=\(sent) received=\(datagrams) bound=\(boundPort)"
                     return report
                 }
                 if others.count < 3 { others.append("\(source):\(n)") }
             }
         }
-        report.note = "sent=\(sent)/\(max(1, attempts)) send-errno=\(sendErrno) received=\(datagrams) bound=\(boundPort)" +
+        report.note = "sent=\(sent)/\(max(1, attempts)) send-errno=\(sendErrno) received=\(datagrams) answered=\(answered) bound=\(boundPort)" +
             (others.isEmpty ? "" : " other=\(others.joined(separator: ","))")
         return report
     }
@@ -328,6 +399,16 @@ enum SteamLANPeer {
             line += " head=" + payload.prefix(48).map { String(format: "%02x", $0) }.joined()
         }
         return line
+    }
+
+    /// CRemoteClient_SteamBroadcast_Notification: a discovery-format packet
+    /// Steam relays to the account's other clients.
+    static func steamBroadcast(steamID: UInt64, clientID: UInt64, payload: Data) -> Data {
+        var body = ProtobufEncoder()
+        body.writeFixed64(fieldNumber: 1, value: steamID)
+        body.writeFixed64(fieldNumber: 2, value: clientID)
+        body.writeBytes(fieldNumber: 3, value: payload)
+        return body.data
     }
 
     // MARK: RemoteClient service

@@ -480,6 +480,9 @@ final class DepotDownloader {
     /// The PC set in Settings › Steam, asked for its status and opened by Steam
     /// for this app. nil (content servers only) when none is set, it does not
     /// answer, or Steam refuses.
+    /// This run's instance ID in this device's remote-client status.
+    private static let lanInstanceID = UInt64.random(in: 1...UInt64.max)
+
     private func lanPeerSource(appID: UInt32, buildID: UInt32, depots: Set<UInt32>) async -> SteamPeerChunkSource? {
         let host = SteamLANSetting.host
         guard !host.isEmpty else { return nil }
@@ -490,8 +493,11 @@ final class DepotDownloader {
         let localID = SteamLANSetting.localClientID
         let lan = CMsgClientLogon.localIPv4()
         SteamLog.event("[steam-lan] this device lan-ip=\(lan.ip >> 24).\((lan.ip >> 16) & 0xFF).\((lan.ip >> 8) & 0xFF).\(lan.ip & 0xFF) iface=\(lan.interface)")
+        let lanText = lan.ip == 0 ? "" : "\(lan.ip >> 24).\((lan.ip >> 16) & 0xFF).\((lan.ip >> 8) & 0xFF).\(lan.ip & 0xFF)"
+        let ownStatus = SteamLANPeer.statusPacket(clientID: localID, instanceID: Self.lanInstanceID, steamID: session.steamID,
+                                                  hostname: "Madeira", lanIP: lanText)
         let report = await Task.detached(priority: .userInitiated) {
-            SteamLANPeer.discover(host: host, clientID: localID)
+            SteamLANPeer.discover(host: host, clientID: localID, status: ownStatus)
         }.value
         // Steam's own list of this account's clients: logged, and the PC's
         // ID when discovery cannot reach it. Before that, this device says it
@@ -506,6 +512,16 @@ final class DepotDownloader {
                 SteamLog.event("[steam-lan] RemoteClient.NotifyOnline sent client=\(localID)")
             } catch {
                 SteamLog.event("[steam-lan] RemoteClient.NotifyOnline not sent (\(Self.failureReason(error)))")
+            }
+            // This device's status, relayed by Steam to the account's other
+            // clients, as a Steam client answers their discovery.
+            do {
+                try await session.sendServiceNotification(
+                    method: .remoteClientSendSteamBroadcastPacket,
+                    body: SteamLANPeer.steamBroadcast(steamID: session.steamID, clientID: localID, payload: ownStatus))
+                SteamLog.event("[steam-lan] status relayed bytes=\(ownStatus.count)")
+            } catch {
+                SteamLog.event("[steam-lan] status not relayed (\(Self.failureReason(error)))")
             }
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             let reply = try await session.callServiceMethod(method: .remoteClientGetRecentClients, body: Data(), timeout: 10)
