@@ -121,6 +121,11 @@ jobs:
       - name: Check generated settings catalog
         run: python3 tests/host/check-config-catalog.py
 
+      # Steam local network game transfers (docs/STEAM_LIBRARY.md, "From a PC on
+      # this network"): the messages against a captured Steam-to-Steam transfer.
+      - name: Check Steam local network transfer messages
+        run: python3 tests/host/check-steam-lan-peer.py
+
       # madeira-bcd: the games' built-in recommended settings and where the app
       # applies them (GameRecommendations.swift; owner's decision 2026-10-09).
       - name: Check built-in recommended game settings
@@ -1934,11 +1939,12 @@ jobs:
             echo "::warning::no GC64 LuaJIT: LOVE games that need low memory will not start"
           fi
 
-      # Inputs for a local app-only build on the Mac: every built file the Xcode
+      # madeira-bcd FORK-ONLY (never in a pull request to upstream): inputs for
+      # a local app-only build on the owner's Mac: every built file the Xcode
       # project consumes (git-ignored or modified under app/, plus FEX's
       # build-ios libraries and generated headers), so a Swift-only change can
       # skip the native build chains. Extract over a checkout of the same commit.
-      - name: Pack prebuilt app inputs
+      - name: Pack prebuilt app inputs (fork-only)
         shell: bash
         run: |
           mkdir -p build-out
@@ -1950,7 +1956,7 @@ jobs:
           echo "commit $(git rev-parse HEAD)" > build-out/madeira-prebuilt.txt
           ls -la build-out/madeira-prebuilt.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4  # madeira-bcd FORK-ONLY
         with:
           name: madeira-prebuilt
           path: |

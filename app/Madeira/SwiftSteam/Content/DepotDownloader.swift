@@ -164,7 +164,9 @@ final class DepotDownloader {
 
         // 3. Chunks: from a PC on this network first when one is set
         // (SteamLANPeer), from the content servers for the rest.
-        let peer = await lanPeerSource(appID: app.appID, depots: Set(plans.map(\.depotID)))
+        let installedBuild = Self.installedBuild(appID: app.appID, steamApps: steamApps)
+        let peer = await lanPeerSource(appID: app.appID, currentBuild: installedBuild == app.buildID ? 0 : installedBuild,
+                                       depots: Set(plans.map(\.depotID)))
         let peerStarted = Date()
         defer {
             if let peer {
@@ -486,7 +488,15 @@ final class DepotDownloader {
     /// A PC of this account on this network whose Steam client has the app,
     /// opened by Steam for it (SteamLANPeer). nil (content servers only) when
     /// the feature is off, no such PC answers, or Steam refuses.
-    private func lanPeerSource(appID: UInt32, depots: Set<UInt32>) async -> SteamPeerChunkSource? {
+    /// The build an earlier install recorded in `appmanifest_<appid>.acf`, 0 when none.
+    private nonisolated static func installedBuild(appID: UInt32, steamApps: URL) -> UInt32 {
+        let url = steamApps.appendingPathComponent("appmanifest_\(appID).acf")
+        guard let text = try? String(contentsOf: url, encoding: .utf8),
+              let range = text.range(of: #""buildid"\s+"([0-9]+)""#, options: .regularExpression) else { return 0 }
+        return UInt32(String(text[range].filter(\.isNumber))) ?? 0
+    }
+
+    private func lanPeerSource(appID: UInt32, currentBuild: UInt32, depots: Set<UInt32>) async -> SteamPeerChunkSource? {
         guard SteamLANSetting.enabled else { return nil }
         let localID = SteamLANSetting.localClientID
         let lan = CMsgClientLogon.localIPv4()
@@ -554,10 +564,11 @@ final class DepotDownloader {
                         SteamLog.event("[steam-lan] no answer from \(candidate.name) at \(host) (\(report.note))")
                         continue
                     }
-                    // current_build_id is the build this device has: none yet. The
-                    // PC denies its own build ("Content Version").
+                    // current_build_id is the build this device has (0: none, or
+                    // a resumed install of the same build). The PC denies its own
+                    // build ("Content Version").
                     let body = SteamLANPeer.peerServerRequest(localClientID: localID, steamID: steamID, serverClientID: status.clientID,
-                                                              appID: appID, buildID: 0)
+                                                              appID: appID, buildID: currentBuild)
                     let reply = try await session.callServiceMethod(method: .requestPeerContentServer, body: body, timeout: 15)
                     let server = try SteamLANPeer.parsePeerServerResponse(reply)
                     let served = server.depots.isEmpty ? depots : server.depots.intersection(depots)
