@@ -80,7 +80,9 @@ struct SteamLANPeerStatus: Sendable, Equatable {
 enum SteamLANPeer {
     static let discoveryPort: UInt16 = 27036
     /// 0xFFFFFFFFA05F4C21, little-endian, at the start of every discovery datagram.
-    static let discoveryMagic: [UInt8] = [0x21, 0x4C, 0x5F, 0xA0, 0xFF, 0xFF, 0xFF, 0xFF]
+    /// On the wire FF FF FF FF 21 4C 5F A0, as a PC's Steam client sends its
+    /// status (captured on llama-pc, 2026-10-29); the reversed order is ignored.
+    static let discoveryMagic: [UInt8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0x4C, 0x5F, 0xA0]
     static let peerChunkRequest: UInt32 = 9902   // k_EMsgClientPeerChunkRequest
     static let peerChunkResponse: UInt32 = 9903  // k_EMsgClientPeerChunkResponse
     static let tcpMagic: [UInt8] = Array("VT01".utf8)
@@ -322,6 +324,8 @@ enum SteamLANPeer {
             }
             line += " discovery-type=\(type)"
             if let status = parseStatus(payload) { line += " status host=\(status.hostname) client=\(status.clientID)" }
+        } else if !payload.isEmpty {
+            line += " head=" + payload.prefix(48).map { String(format: "%02x", $0) }.joined()
         }
         return line
     }

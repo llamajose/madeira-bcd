@@ -56,7 +56,7 @@ APP, DEPOT, TOKEN = 1796470, 1796471, 1792925733377421794
 SHA = bytes.fromhex('d5162b89908a62ce1af865def28c19e6d09208d1')
 
 # A status answer as a PC's Steam client sends it (ERemoteClientBroadcastMsg 1).
-MAGIC = bytes([0x21, 0x4C, 0x5F, 0xA0, 0xFF, 0xFF, 0xFF, 0xFF])
+MAGIC = bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0x4C, 0x5F, 0xA0])  # as llama-pc sends it
 status_header = field(1, 0, 0x1234567890ABCDEF) + field(2, 0, 1)
 status_body = (field(1, 0, 8) + field(4, 2, b'llama-pc') +
                field(9, 2, field(1, 1, 76561199130358928) + field(2, 0, 7)) + field(16, 0, 1))
