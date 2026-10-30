@@ -510,6 +510,12 @@ final class DepotDownloader {
             try await session.sendServiceNotification(
                 method: .remoteClientSendSteamBroadcastPacket,
                 body: SteamLANPeer.steamBroadcast(steamID: steamID, clientID: localID, payload: ownStatus))
+            // A discovery through Steam: the account's PCs answer with their
+            // statuses the same way, addresses included.
+            try await session.sendServiceNotification(
+                method: .remoteClientSendSteamBroadcastPacket,
+                body: SteamLANPeer.steamBroadcast(steamID: steamID, clientID: localID,
+                                                  payload: SteamLANPeer.discoveryPacket(clientID: localID, sequence: 1)))
 
             // Candidates: the address set in Settings, then the account's PCs on
             // this network (the last one used first).
@@ -528,10 +534,16 @@ final class DepotDownloader {
                 }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
+            let lastHost = SteamLANSetting.lastHost
+            if !lastHost.isEmpty, lastHost != fixed, Self.sameNetwork(lastHost, lan.ip),
+               !candidates.contains(where: { $0.hosts.contains(lastHost) }) {
+                candidates.append(("last used", [lastHost]))
+            }
             guard !candidates.isEmpty else {
                 SteamLog.event("[steam-lan] skip: no PC of this account on this network (\(lanText))")
                 return nil
             }
+            SteamLog.event("[steam-lan] candidates: " + candidates.map { "\($0.name)=\($0.hosts.joined(separator: ","))" }.joined(separator: " "))
 
             for candidate in candidates {
                 for host in candidate.hosts {
@@ -555,6 +567,7 @@ final class DepotDownloader {
                     }
                     SteamLANSetting.peerClientID = status.clientID
                     let address = report.from.isEmpty ? host : report.from
+                    SteamLANSetting.lastHost = address
                     SteamLog.event("[steam-lan] open app=\(appID) pc=\(status.hostname) at \(address):\(server.port) depots=\(served.sorted().map(String.init).joined(separator: ","))")
                     return SteamPeerChunkSource(host: address, port: server.port, appID: appID, depots: served, accessToken: server.accessToken)
                 }

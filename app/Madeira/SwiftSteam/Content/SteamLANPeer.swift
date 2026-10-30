@@ -39,13 +39,24 @@ enum SteamLANSetting {
     static let hostKey = "madeira.steam.lanPeerHost"
     static let clientIDKey = "madeira.steam.lanClientID"
 
-    /// Off until turned on; on for an install that already had a PC address.
+    /// Off until turned on; on for an install that already had a PC address
+    /// (decided once, so clearing the address later does not turn it off).
     static var enabled: Bool {
         get {
-            if UserDefaults.standard.object(forKey: enabledKey) == nil { return !host.isEmpty }
+            if UserDefaults.standard.object(forKey: enabledKey) == nil {
+                UserDefaults.standard.set(!host.isEmpty, forKey: enabledKey)
+            }
             return UserDefaults.standard.bool(forKey: enabledKey)
         }
         set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
+    }
+
+    static let lastHostKey = "madeira.steam.lanLastHost"
+
+    /// The address of the last PC that served a download, tried when Steam relays no PC.
+    static var lastHost: String {
+        get { UserDefaults.standard.string(forKey: lastHostKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: lastHostKey) }
     }
 
     /// A fixed PC address, "" to find the PC through Steam.
