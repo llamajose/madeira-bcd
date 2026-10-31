@@ -20,6 +20,13 @@ struct SteamDownloadProgress: Equatable, Sendable {
     /// previous attempt.
     var doneBytes: UInt64 = 0
     var bytesPerSecond: Double = 0
+    /// Where chunks come from: the PC on this network (its host name) while
+    /// it serves this download, nil for Steam's content servers only.
+    var pcName: String?
+    /// The PC stopped answering; the rest comes from Steam's servers.
+    var pcDropped = false
+    /// Bytes the PC has sent so far in this run.
+    var pcBytes: UInt64 = 0
 
     var fraction: Double { totalBytes > 0 ? min(1, Double(doneBytes) / Double(totalBytes)) : 0 }
 }
@@ -168,6 +175,7 @@ final class DepotDownloader {
         let peer = await lanPeerSource(appID: app.appID, currentBuild: installedBuild == app.buildID ? 0 : installedBuild,
                                        depots: Set(plans.map(\.depotID)))
         let peerStarted = Date()
+        state.pcName = peer?.name
         defer {
             if let peer {
                 peer.close()
@@ -209,6 +217,10 @@ final class DepotDownloader {
                         lastReport = now
                         let elapsed = now.timeIntervalSince(started)
                         if elapsed > 1 { state.bytesPerSecond = Double(state.doneBytes - resumedBytes) / elapsed }
+                        if let peer {
+                            state.pcBytes = peer.bytes
+                            state.pcDropped = !peer.usable
+                        }
                         report(state)
                     }
                     enqueue()
@@ -583,7 +595,8 @@ final class DepotDownloader {
                     let address = report.from.isEmpty ? host : report.from
                     SteamLANSetting.lastHost = address
                     SteamLog.event("[steam-lan] open app=\(appID) pc=\(status.hostname) at \(address):\(server.port) depots=\(served.sorted().map(String.init).joined(separator: ","))")
-                    return SteamPeerChunkSource(host: address, port: server.port, appID: appID, depots: served, accessToken: server.accessToken)
+                    return SteamPeerChunkSource(host: address, port: server.port, appID: appID, depots: served, accessToken: server.accessToken,
+                                                name: status.hostname)
                 }
             }
             SteamLog.event("[steam-lan] skip: no PC on this network opened app=\(appID)")

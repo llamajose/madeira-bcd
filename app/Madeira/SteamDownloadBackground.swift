@@ -80,6 +80,7 @@ import UserNotifications
     /// A download became active (always a user action or its queue).
     func downloadStarted(appID: Int, name: String) {
         currentName = name
+        lastSource = ""
         requestNotificationPermission()
         if #available(iOS 26.0, *), Self.continuedEnabled { submitContinued() }
         if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
@@ -93,8 +94,15 @@ import UserNotifications
             let total = Int64(clamping: max(progress.totalBytes, 1))
             if task.progress.totalUnitCount != total { task.progress.totalUnitCount = total }
             task.progress.completedUnitCount = Int64(clamping: min(progress.doneBytes, progress.totalBytes))
+            let source = progress.pcName.map { progress.pcDropped ? "From Steam's servers" : "From \($0) on this network" } ?? "From Steam's servers"
+            if source != lastSource, progress.phase == .downloading {
+                lastSource = source
+                task.updateTitle("Downloading \(currentName)", subtitle: source)
+            }
         }
     }
+    /// The subtitle last shown in iOS's progress UI.
+    private var lastSource = ""
 
     enum Outcome { case completed, failed(String), paused }
 

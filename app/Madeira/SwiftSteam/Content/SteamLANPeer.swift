@@ -601,8 +601,12 @@ final class SteamPeerChunkSource: @unchecked Sendable {
         init(fd: Int32) { self.fd = fd }
     }
 
-    init(host: String, port: UInt16, appID: UInt32, depots: Set<UInt32>, accessToken: UInt64) {
+    /// The PC's host name, for the download's status.
+    let name: String
+
+    init(host: String, port: UInt16, appID: UInt32, depots: Set<UInt32>, accessToken: UInt64, name: String = "") {
         self.host = host; self.port = port; self.appID = appID; self.depots = depots; self.accessToken = accessToken
+        self.name = name.isEmpty ? host : name
     }
 
     var usable: Bool { lock.lock(); defer { lock.unlock() }; return !disabled }
