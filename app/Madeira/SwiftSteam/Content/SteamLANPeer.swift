@@ -592,6 +592,8 @@ final class SteamPeerChunkSource: @unchecked Sendable {
     /// Seconds without any answer while requests are waiting before the
     /// connection counts as broken.
     static let answerTimeout: TimeInterval = 15
+    /// Seconds to wait for the PC to accept the TCP connection.
+    static let connectTimeout: TimeInterval = 4
 
     /// One TCP connection to the PC: the requests waiting on it, by chunk SHA-1.
     private final class Connection {
@@ -620,8 +622,15 @@ final class SteamPeerChunkSource: @unchecked Sendable {
         let request = [UInt8](SteamLANPeer.chunkRequest(appID: appID, depotID: depotID, sha: sha, accessToken: accessToken))
         return try await withCheckedThrowingContinuation { continuation in
             writeQueue.async {
+                guard self.usable else {
+                    continuation.resume(throwing: SteamError.chunkDownloadFailed("The PC on this network is no longer used."))
+                    return
+                }
                 let link: Connection
                 do { link = try self.currentConnection() } catch {
+                    // The PC cannot be reached at all: every other request goes
+                    // to Steam's servers instead of trying again.
+                    self.lock.lock(); self.disabled = true; self.lock.unlock()
                     continuation.resume(throwing: error)
                     return
                 }
@@ -746,14 +755,34 @@ final class SteamPeerChunkSource: @unchecked Sendable {
         var buffer: Int32 = 4 * 1024 * 1024
         setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buffer, socklen_t(MemoryLayout<Int32>.size))
         SteamLANPeer.setTimeout(s, 2)
-        let rc = withUnsafePointer(to: &address) {
+        // Non-blocking connect with a short limit: a firewall that drops the
+        // SYN would otherwise hold every waiting request for the system's
+        // TCP connect timeout (over a minute).
+        let flags = fcntl(s, F_GETFL, 0)
+        _ = fcntl(s, F_SETFL, flags | O_NONBLOCK)
+        var rc = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Glibc_or_Darwin_connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
-        guard rc == 0 else {
-            let code = errno
-            Darwin_or_Glibc_close(s)
-            throw SteamError.chunkDownloadFailed("Cannot reach the PC (errno \(code)).")
+        var code = rc == 0 ? 0 : errno
+        if rc != 0, code == EINPROGRESS {
+            var waiter = pollfd(fd: s, events: Int16(POLLOUT), revents: 0)
+            rc = poll(&waiter, 1, Int32(Self.connectTimeout * 1000))
+            if rc == 1 {
+                var error: Int32 = 0
+                var length = socklen_t(MemoryLayout<Int32>.size)
+                getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &length)
+                code = error
+            } else {
+                code = ETIMEDOUT
+            }
         }
+        guard code == 0 else {
+            Darwin_or_Glibc_close(s)
+            throw SteamError.chunkDownloadFailed(code == ETIMEDOUT
+                ? "The PC did not accept the connection (a firewall on the PC?)."
+                : "Cannot reach the PC (errno \(code)).")
+        }
+        _ = fcntl(s, F_SETFL, flags)
         return s
     }
 
